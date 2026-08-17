@@ -10,6 +10,8 @@ license.workspace = true
 [[bin]]
 name = "ot-commissioner-rs"
 path = "src/main.rs"
+# Its normalized rustdoc name collides with the library crate in workspace docs.
+doc = false
 
 [dependencies]
 ot-commissioner-rs.workspace = true

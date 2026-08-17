@@ -19,9 +19,12 @@ It implements the non-CCM feature set of the C++
 (full matrix in [docs/PARITY.md](docs/PARITY.md)), so it is a complete
 commissioner rather than a partial reimplementation.
 
-This is a cargo workspace of three crates: the `ot-commissioner-rs` library
-(this crate), its `thread-dtls` DTLS 1.2 profile, and the `ot-commissioner-cli`
-REPL binary.
+This cargo workspace contains four crates:
+
+- [`ot-commissioner-rs`](crates/ot-commissioner-rs), the commissioner library.
+- [`thread-dtls`](crates/thread-dtls), its runtime-neutral DTLS 1.2 profile.
+- [`ot-commissioner-cli`](crates/ot-commissioner-cli), the interactive REPL.
+- [`ot-netdiag`](crates/ot-netdiag), the network-diagnostic topology mapper.
 
 ## Why
 
@@ -134,10 +137,11 @@ process.
 - **Coverage gates (CI-enforced).** Minimum 80% line, 80% region, and 75%
   function coverage via `cargo-llvm-cov`.
 - **Mutation testing.** `cargo-mutants` runs against the high-risk protocol
-  files (EC J-PAKE, DTLS session and server handshake, CoAP, diagnostic and
-  notification parsers, the commissioner client, and joiner sessions);
-  surviving mutants are triaged and documented as equivalent,
-  intrinsic-timeout, or explicitly deferred rather than left silent.
+  files (EC J-PAKE, DTLS drivers and handshakes, CoAP, diagnostic and
+  notification parsers, the commissioner client, and joiner sessions).
+  Intentional exclusions are limited to equivalent transformations,
+  intrinsically unobservable behavior, and uncontracted diagnostic output;
+  each exclusion is documented rather than left silent.
 - **Fuzzing.** 13 coverage-guided libFuzzer targets cover every wire parser
   (TLV, dataset, CoAP, DTLS record/handshake/hello, EC J-PAKE key-exchange and
   KKPP, UDP_RX decapsulation, network-diagnostic data, JOIN_FIN), run weekly
@@ -189,9 +193,8 @@ model):
   PSKc.
 - **Documented mutation exclusions.** Remaining exclusions are limited to
   equivalent transformations, behavior that is intrinsically unobservable in
-  safe Rust, intentionally uncontracted diagnostic output, and mutations whose
-  detected failure mode is non-termination. Each is catalogued in
-  [docs/MUTATION_SURVIVORS.md](docs/MUTATION_SURVIVORS.md).
+  safe Rust, and intentionally uncontracted diagnostic output. Each is
+  catalogued in [docs/MUTATION_SURVIVORS.md](docs/MUTATION_SURVIVORS.md).
 - **Side-channel scope.** Constant-time primitives are used, but the crate is
   not hardened against power, EM, or microarchitectural side channels.
 - **Pre-1.0 API.** Public APIs may change before 1.0.

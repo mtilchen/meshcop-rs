@@ -2,9 +2,8 @@
 #
 # The CI mutation gate fails on any missed mutant, so every exclusion here
 # must be justified: only provably equivalent mutants, effects that cannot be
-# observed in safe Rust, intentionally uncontracted diagnostics, or broken
-# behavior whose whole-suite mutation result is non-termination belong here.
-# Document the reason above each entry.
+# observed in safe Rust, or intentionally uncontracted diagnostics belong here.
+# Timed-out mutants fail the gate too. Document the reason above each entry.
 
 # Mutants in thread-dtls are killed largely by ot-commissioner-rs's commissioner
 # tests; run the whole workspace's tests against every mutant.
@@ -52,13 +51,4 @@ exclude_re = [
     # shifted left by 8) with bits 0-7 (`chunk[1]`) — disjoint bit ranges,
     # so `|` and `^` agree.
     'replace \| with \^ in decode_child_table',
-
-    # Untestable without non-termination: a dedicated unit test does fail this
-    # stub by assertion, but the session receive loops legitimately retry on
-    # an empty record batch (a zero-length datagram must be ignored, not
-    # treated as an error), so under the stub every sibling receive test spins
-    # on an always-ready future that never yields, and the test binary as a
-    # whole can only time out. Catching it would mean erroring on empty
-    # datagrams in production or inserting artificial yields.
-    'replace recv_records -> Result<Vec<DtlsRecord>> with Ok\(vec!\[\]\)',
 ]
