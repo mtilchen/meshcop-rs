@@ -56,13 +56,13 @@ Document surviving mutants in the review notes when they are intentionally defer
 
 ## Current Project Context
 
-- This project is `ot-commissioner-rs`, a pure Rust Thread MeshCoP commissioner implementation.
+- This project is Mesh Five-O (`mesh50`), a pure Rust Thread MeshCoP commissioner implementation.
 - The preferred production path is pure Rust with minimal external dependencies.
 - OpenSSL, mbedTLS, OpenThread `ot-commissioner`, and CXX may be used as references or parity harnesses, but should not become required runtime dependencies without explicit review.
 - The local live test border agent is `192.168.4.48:49156`.
 - Live tests that compare the active dataset must use `ESP_MATTER_TEST_THREAD_DATASET_HEX` without printing or otherwise leaking secret dataset fields.
 - Example apps and live tests should resign commissioner sessions before exit when they are only inspecting data.
-- Mutating live operations must remain explicitly gated with `OT_COMMISSIONER_MUTATE_OK=1`.
+- Mutating live operations must remain explicitly gated with `MESH50_MUTATE_OK=1`.
 
 ## Tooling Preferences
 

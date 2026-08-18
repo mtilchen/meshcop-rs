@@ -1,6 +1,6 @@
 # Security Policy
 
-`ot-commissioner-rs` is a Thread MeshCoP commissioner. It handles highly
+Mesh Five-O is a Thread MeshCoP commissioner. It handles highly
 sensitive material — the commissioner credential (PSKc), joiner credentials
 (PSKd), the Thread network key and full operational datasets, EC J-PAKE private
 scalars, and derived DTLS session keys. We take reports about it seriously and
@@ -24,7 +24,7 @@ issue, pull request, or discussion for a security problem.
 Preferred channel: GitHub **private vulnerability reporting**
 (repository → *Security* → *Report a vulnerability*).
 
-Fallback: email the maintainer at `matt@tilchen.net` with `[ot-commissioner-rs
+Fallback: email the maintainer at `matt@tilchen.net` with `[Mesh Five-O
 security]` in the subject. PGP can be arranged on request.
 
 Please include enough to reproduce: affected version/commit, a minimal input or
@@ -73,7 +73,7 @@ There is no paid bug-bounty program for this project.
   malformed input must return an error rather than panic, hang, over-read, or
   leak.
 - **Safe-by-default operations.** Mutating live operations are gated behind
-  `OT_COMMISSIONER_MUTATE_OK=1`, and read-only example/inspection paths resign
+  `MESH50_MUTATE_OK=1`, and read-only example/inspection paths resign
   the commissioner session before exit.
 
 ### In scope (threats we defend against)
@@ -109,6 +109,6 @@ We are explicit about what this library does **not** claim to protect against:
 - Do not log datasets, PSKc, or PSKd. Rely on the redaction defaults; only
   export or print raw secrets in controlled debugging contexts, and treat
   borrowed raw views and returned owned values as exposed secret material.
-- Keep live, mutating operations behind `OT_COMMISSIONER_MUTATE_OK=1`.
+- Keep live, mutating operations behind `MESH50_MUTATE_OK=1`.
 - Live border-router tests are `#[ignore]` by default and must not print or
   otherwise leak datasets, PSKc, or network keys.

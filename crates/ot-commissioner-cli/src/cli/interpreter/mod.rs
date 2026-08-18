@@ -2,7 +2,7 @@
 //! `ot-commissioner` CLI command surface, backed by the pure-Rust library.
 //!
 //! Commands that exercise the non-CCM commissioner protocol are fully wired
-//! to [`ot_commissioner_rs::commissioner`]. Commands outside that scope (CCM
+//! to [`mesh50::commissioner`]. Commands outside that scope (CCM
 //! token flows, the persistent network registry, mDNS discovery, and
 //! multi-network `--nwk`/`--dom` job execution) are present with their exact
 //! usage and report `[failed]` with an explanatory message.
@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde_json::json;
 use zeroize::Zeroizing;
 
-use ot_commissioner_rs::{
+use mesh50::{
     commissioner::{
         Commissioner, CommissionerDatasetFlags, CommissionerEvent, CommissionerState, DatasetFlags,
         ResultCode, StaticJoinerHandler,
@@ -86,17 +86,15 @@ impl Interpreter {
     /// An accepted response re-arms the absolute deadline. Pending, rejected,
     /// and failed exchanges disconnect the unusable session so the application
     /// cannot continue without keep-alives.
-    pub(super) async fn handle_scheduled_keepalive(&mut self) -> ot_commissioner_rs::Result<()> {
+    pub(super) async fn handle_scheduled_keepalive(&mut self) -> mesh50::Result<()> {
         self.keepalive_deadline = None;
         let (result, deferred_events, callback_result) = {
-            let commissioner =
-                self.commissioner
-                    .as_mut()
-                    .ok_or(ot_commissioner_rs::Error::InvalidState(
-                        "commissioner is not started",
-                    ))?;
+            let commissioner = self
+                .commissioner
+                .as_mut()
+                .ok_or(mesh50::Error::InvalidState("commissioner is not started"))?;
             if commissioner.state() != CommissionerState::Active {
-                return Err(ot_commissioner_rs::Error::InvalidState(
+                return Err(mesh50::Error::InvalidState(
                     "commissioner session is not active",
                 ));
             }
@@ -114,7 +112,7 @@ impl Interpreter {
                     Ok(Some(event)) => event,
                     Ok(None) => {
                         commissioner.disconnect();
-                        return Err(ot_commissioner_rs::Error::InvalidState(
+                        return Err(mesh50::Error::InvalidState(
                             "keep-alive response event was not queued",
                         ));
                     }
@@ -140,7 +138,7 @@ impl Interpreter {
             if let Some(commissioner) = self.commissioner.as_mut() {
                 commissioner.disconnect();
             }
-            return Err(ot_commissioner_rs::Error::InvalidState(
+            return Err(mesh50::Error::InvalidState(
                 "keep-alive result and callback did not match",
             ));
         }
@@ -153,7 +151,7 @@ impl Interpreter {
                 if let Some(commissioner) = self.commissioner.as_mut() {
                     commissioner.disconnect();
                 }
-                Err(ot_commissioner_rs::Error::InvalidState(
+                Err(mesh50::Error::InvalidState(
                     "scheduled keep-alive response is pending",
                 ))
             }
@@ -161,7 +159,7 @@ impl Interpreter {
                 if let Some(commissioner) = self.commissioner.as_mut() {
                     commissioner.disconnect();
                 }
-                Err(ot_commissioner_rs::Error::InvalidState(
+                Err(mesh50::Error::InvalidState(
                     "scheduled keep-alive was rejected",
                 ))
             }
@@ -178,10 +176,7 @@ impl Interpreter {
             });
     }
 
-    async fn refresh_keepalive_before_command(
-        &mut self,
-        tokens: &Tokens,
-    ) -> ot_commissioner_rs::Result<()> {
+    async fn refresh_keepalive_before_command(&mut self, tokens: &Tokens) -> mesh50::Result<()> {
         if !command_may_wait_for_commissioner(tokens) {
             return Ok(());
         }

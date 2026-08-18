@@ -1,14 +1,14 @@
-# ot-commissioner-rs
+# Mesh Five-O
 
-[![Quality](https://github.com/mtilchen/ot-commissioner-rs/actions/workflows/quality.yml/badge.svg)](https://github.com/mtilchen/ot-commissioner-rs/actions/workflows/quality.yml)
-[![Interop](https://github.com/mtilchen/ot-commissioner-rs/actions/workflows/interop.yml/badge.svg)](https://github.com/mtilchen/ot-commissioner-rs/actions/workflows/interop.yml)
-[![Fuzz](https://github.com/mtilchen/ot-commissioner-rs/actions/workflows/fuzz.yml/badge.svg)](https://github.com/mtilchen/ot-commissioner-rs/actions/workflows/fuzz.yml)
+[![Quality](https://github.com/mtilchen/mesh50/actions/workflows/quality.yml/badge.svg)](https://github.com/mtilchen/mesh50/actions/workflows/quality.yml)
+[![Interop](https://github.com/mtilchen/mesh50/actions/workflows/interop.yml/badge.svg)](https://github.com/mtilchen/mesh50/actions/workflows/interop.yml)
+[![Fuzz](https://github.com/mtilchen/mesh50/actions/workflows/fuzz.yml/badge.svg)](https://github.com/mtilchen/mesh50/actions/workflows/fuzz.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust: 1.85+](https://img.shields.io/badge/rustc-1.85%2B-blue.svg)](#minimum-supported-rust-version)
 [![Edition 2024](https://img.shields.io/badge/edition-2024-blue.svg)](Cargo.toml)
 [![unsafe: none](https://img.shields.io/badge/unsafe-none-brightgreen.svg)](#security-and-quality)
 
-**A pure-Rust Thread MeshCoP commissioner.** Commission Thread devices and
+**Mesh Five-O is a pure-Rust Thread MeshCoP commissioner.** Commission Thread devices and
 manage a network's operational state from Rust — establish the authenticated
 DTLS session, petition the border agent, drive management commands and
 diagnostics through the mesh, and onboard joiners end to end — with **no
@@ -19,12 +19,18 @@ It implements the non-CCM feature set of the C++
 (full matrix in [docs/PARITY.md](docs/PARITY.md)), so it is a complete
 commissioner rather than a partial reimplementation.
 
-This cargo workspace contains four crates:
+The name is a nod to “five-o” — the cops — and therefore to MeshCoP, the
+Mesh Commissioning Protocol implemented here.
 
-- [`ot-commissioner-rs`](crates/ot-commissioner-rs), the commissioner library.
-- [`thread-dtls`](crates/thread-dtls), its runtime-neutral DTLS 1.2 profile.
-- [`ot-commissioner-cli`](crates/ot-commissioner-cli), the interactive REPL.
-- [`ot-netdiag`](crates/ot-netdiag), the network-diagnostic topology mapper.
+This Cargo workspace contains four crates:
+
+- [`mesh50`](crates/mesh50), the Mesh Five-O commissioner library.
+- [`mesh50-dtls`](crates/mesh50-dtls), Mesh Five-O's runtime-neutral DTLS 1.2
+  profile.
+- [`ot-commissioner-cli`](crates/ot-commissioner-cli), the faithful CLI port,
+  which retains its existing `ot-commissioner-rs` executable name.
+- [`mesh50-netdiag`](crates/mesh50-netdiag), Mesh Five-O's network-diagnostic
+  topology mapper.
 
 ## Why
 
@@ -63,13 +69,13 @@ This cargo workspace contains four crates:
 ## Example
 
 ```rust
-use ot_commissioner_rs::{
+use mesh50::{
     commissioner::{Commissioner, CommissionerConfig, DatasetFlags},
     dataset::Dataset,
 };
 
 #[tokio::main]
-async fn main() -> ot_commissioner_rs::Result<()> {
+async fn main() -> mesh50::Result<()> {
     // The commissioner authenticates with a PSKc. Derive it from an operational
     // dataset (the usual case — dataset hex is what Thread tooling hands you):
     let dataset_hex = std::env::var("THREAD_DATASET_HEX").expect("dataset hex");
@@ -93,12 +99,12 @@ async fn main() -> ot_commissioner_rs::Result<()> {
 }
 ```
 
-The `ot-netdiag` crate provides a network-diagnostic topology mapper; run it
-with `cargo run -p ot-netdiag -- --help`. The
-[`examples/`](crates/ot-commissioner-rs/examples) directory also has read-only
+Mesh Five-O's `mesh50-netdiag` crate provides a network-diagnostic topology
+mapper; run it with `cargo run -p mesh50-netdiag -- --help`. The
+[`examples/`](crates/mesh50/examples) directory also has read-only
 live probes and a small `commissionerctl`. These tools redact dataset secrets
 by default and resign read-only sessions before exiting; mutating operations
-are gated behind `OT_COMMISSIONER_MUTATE_OK=1` so routine inspection cannot
+are gated behind `MESH50_MUTATE_OK=1` so routine inspection cannot
 disturb a live network.
 
 ## Security and Quality
@@ -224,6 +230,7 @@ dual licensed as above, without any additional terms or conditions.
 ## Disclaimer
 
 This is an independent, personal open-source project. It is not endorsed by,
-affiliated with, or sponsored by the Thread Group or the author's employer.
-"Thread" is a trademark of the Thread Group, used here only descriptively to
-identify the protocol this software implements.
+affiliated with, or sponsored by the Thread Group, Google, Google Nest, or the
+author's employer. THREAD, OPENTHREAD, and related marks are trademarks of the
+Thread Group. They are used here only to identify the protocol Mesh Five-O
+implements and the software with which it interoperates.

@@ -1,6 +1,6 @@
 # Interoperability
 
-What `ot-commissioner-rs` has been verified to interoperate with, and — just as
+What Mesh Five-O has been verified to interoperate with, and — just as
 importantly — at what level of assurance. The rows are deliberately separated by
 **how** each was verified, because "passes on every CI run" and "the author ran
 it once against a device on the bench" are very different claims:
@@ -18,7 +18,7 @@ it once against a device on the bench" are very different claims:
 | Peer | Roles exercised | Assurance | Where |
 | --- | --- | --- | --- |
 | **OpenThread** `v2026.06.0` — posix `ot-daemon` (border agent + leader) + simulated RCP | Commissioner **and** joiner, end to end | Continuous (every PR/push + weekly) | [interop.yml](../.github/workflows/interop.yml), [tools/ci/interop.sh](../tools/ci/interop.sh) |
-| **Physical Thread border router** (Espressif ESP-Matter) | Commissioner session + dataset/commissioner-dataset reads | Manual, author-run, point-in-time | [tests/live_border_router.rs](../crates/ot-commissioner-rs/tests/live_border_router.rs) |
+| **Physical Thread border router** (Espressif ESP-Matter) | Commissioner session + dataset/commissioner-dataset reads | Manual, author-run, point-in-time | [tests/live_border_router.rs](../crates/mesh50/tests/live_border_router.rs) |
 | **mbedTLS / OpenSSL / Thread spec / OpenThread** | Crypto primitives + key schedule | Vector (every build) | [VECTORS.md](VECTORS.md) |
 
 ## OpenThread — continuous, full role coverage
@@ -41,13 +41,13 @@ on loopback:
 
 A weekly scheduled run catches drift against OpenThread even when this repo is
 quiet. Reproduce locally on Linux with `tools/ci/interop.sh`. The pinned
-OpenThread ref is the one-line `OT_INTEROP_OPENTHREAD_REF` in that script.
+OpenThread ref is the one-line `MESH50_INTEROP_OPENTHREAD_REF` in that script.
 
 ## Physical border router — manual, read-only
 
-[`tests/live_border_router.rs`](../crates/ot-commissioner-rs/tests/live_border_router.rs) holds `#[ignore]` tests that run against a real
+[`tests/live_border_router.rs`](../crates/mesh50/tests/live_border_router.rs) holds `#[ignore]` tests that run against a real
 Thread border agent (an Espressif ESP-Matter border router on the author's
-bench), selected via `OT_COMMISSIONER_BORDER_AGENT` with the network dataset in
+bench), selected via `MESH50_BORDER_AGENT` with the network dataset in
 `ESP_MATTER_TEST_THREAD_DATASET_HEX`. They have been run by hand and exercise the
 full DTLS + EC J-PAKE handshake, petition, keep-alive, active-dataset read and
 comparison, commissioner-dataset read, border-agent locator, and clean resign.
@@ -63,7 +63,7 @@ Scope and caveats:
   commissioning end to end is covered against OpenThread (above), not against
   this hardware.
 - The tests never print PSKc, network keys, or dataset values; mutating live
-  operations are additionally gated behind `OT_COMMISSIONER_MUTATE_OK=1`.
+  operations are additionally gated behind `MESH50_MUTATE_OK=1`.
 
 ## Cross-implementation vectors — every build
 

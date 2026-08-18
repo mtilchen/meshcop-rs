@@ -1,9 +1,7 @@
 use super::*;
-use ot_commissioner_rs::commissioner::harness::{
-    ScriptedExchange, ScriptedMeshcopTransport, ScriptedResponse,
-};
-use ot_commissioner_rs::commissioner::{CommissionerConfig, JoinerHandler};
-use ot_commissioner_rs::meshcop::CommissionerOperation;
+use mesh50::commissioner::harness::{ScriptedExchange, ScriptedMeshcopTransport, ScriptedResponse};
+use mesh50::commissioner::{CommissionerConfig, JoinerHandler};
+use mesh50::meshcop::CommissionerOperation;
 
 /// Dispatches one offline command line (no border-agent session) and
 /// returns the rendered `[done]`/`[failed]` output.
@@ -101,34 +99,31 @@ async fn active_interpreter_with_config(
 fn full_dataset_bytes() -> Vec<u8> {
     let mut dataset = Dataset::default();
     dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_ACTIVE_TIMESTAMP,
+        mesh50::dataset::TLV_ACTIVE_TIMESTAMP,
         (1u64 << 16).to_be_bytes().to_vec(),
     );
-    dataset.set_raw(ot_commissioner_rs::dataset::TLV_CHANNEL, vec![0, 0, 19]);
+    dataset.set_raw(mesh50::dataset::TLV_CHANNEL, vec![0, 0, 19]);
     dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_CHANNEL_MASK,
+        mesh50::dataset::TLV_CHANNEL_MASK,
         vec![0, 4, 0x00, 0x1f, 0xff, 0xc0],
     );
     dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_EXTENDED_PAN_ID,
+        mesh50::dataset::TLV_EXTENDED_PAN_ID,
         vec![0xa6, 0x39, 0x13, 0x57, 0xb4, 0x75, 0x1d, 0x8a],
     );
     dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_MESH_LOCAL_PREFIX,
+        mesh50::dataset::TLV_MESH_LOCAL_PREFIX,
         vec![0xfd, 0x00, 0x0d, 0xb8, 0, 0, 0, 0],
     );
-    dataset.set_raw(ot_commissioner_rs::dataset::TLV_NETWORK_KEY, vec![0x42; 16]);
+    dataset.set_raw(mesh50::dataset::TLV_NETWORK_KEY, vec![0x42; 16]);
+    dataset.set_raw(mesh50::dataset::TLV_NETWORK_NAME, b"cli-net".to_vec());
     dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_NETWORK_NAME,
-        b"cli-net".to_vec(),
-    );
-    dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_PAN_ID,
+        mesh50::dataset::TLV_PAN_ID,
         0xfaceu16.to_be_bytes().to_vec(),
     );
-    dataset.set_raw(ot_commissioner_rs::dataset::TLV_PSKC, vec![0x24; 16]);
+    dataset.set_raw(mesh50::dataset::TLV_PSKC, vec![0x24; 16]);
     dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_SECURITY_POLICY,
+        mesh50::dataset::TLV_SECURITY_POLICY,
         vec![0x02, 0xa0, 0xff, 0xf8],
     );
     dataset.to_bytes().unwrap()
@@ -511,7 +506,7 @@ async fn scheduled_keepalive_uses_the_configured_cadence_and_rearms() {
             .next_event()
             .await
             .unwrap_err(),
-        ot_commissioner_rs::Error::InvalidState("DTLS session is not established")
+        mesh50::Error::InvalidState("DTLS session is not established")
     ));
 }
 
@@ -696,7 +691,7 @@ async fn rejected_scheduled_keepalive_disarms_the_timer() {
 
     assert!(matches!(
         interpreter.handle_scheduled_keepalive().await.unwrap_err(),
-        ot_commissioner_rs::Error::InvalidState("scheduled keep-alive was rejected")
+        mesh50::Error::InvalidState("scheduled keep-alive was rejected")
     ));
     assert_eq!(interpreter.keepalive_deadline(), None);
     assert_eq!(
@@ -720,7 +715,7 @@ async fn pending_scheduled_keepalive_disconnects_and_disarms() {
 
     assert!(matches!(
         interpreter.handle_scheduled_keepalive().await.unwrap_err(),
-        ot_commissioner_rs::Error::InvalidState("scheduled keep-alive response is pending")
+        mesh50::Error::InvalidState("scheduled keep-alive response is pending")
     ));
     assert_eq!(interpreter.keepalive_deadline(), None);
     assert_eq!(
@@ -738,9 +733,7 @@ async fn failed_scheduled_keepalive_disconnects_and_disarms() {
 
     assert!(matches!(
         interpreter.handle_scheduled_keepalive().await.unwrap_err(),
-        ot_commissioner_rs::Error::InvalidState(
-            "scripted MeshCoP exchange did not produce a response"
-        )
+        mesh50::Error::InvalidState("scripted MeshCoP exchange did not produce a response")
     ));
     assert_eq!(interpreter.keepalive_deadline(), None);
     assert_eq!(
@@ -756,7 +749,7 @@ async fn borderagent_get_locator_renders_present_and_missing() {
             (
                 CommissionerOperation::GetCommissionerDataset,
                 vec![ScriptedResponse::content(vec![
-                    ot_commissioner_rs::meshcop::TLV_BORDER_AGENT_LOCATOR,
+                    mesh50::meshcop::TLV_BORDER_AGENT_LOCATOR,
                     2,
                     0x4c,
                     0x00,
@@ -823,7 +816,7 @@ async fn joiner_commands_drive_steering_and_port_exchanges() {
             (
                 CommissionerOperation::GetCommissionerDataset,
                 vec![ScriptedResponse::content(vec![
-                    ot_commissioner_rs::meshcop::TLV_JOINER_UDP_PORT,
+                    mesh50::meshcop::TLV_JOINER_UDP_PORT,
                     2,
                     0x03,
                     0xea,
@@ -903,10 +896,10 @@ async fn joiner_commands_drive_steering_and_port_exchanges() {
 async fn commdataset_get_and_set_round_trip_json() {
     let mut comm_dataset = Dataset::default();
     comm_dataset.set_raw(
-        ot_commissioner_rs::meshcop::TLV_BORDER_AGENT_LOCATOR,
+        mesh50::meshcop::TLV_BORDER_AGENT_LOCATOR,
         0x1234u16.to_be_bytes().to_vec(),
     );
-    comm_dataset.set_raw(ot_commissioner_rs::meshcop::TLV_STEERING_DATA, vec![0xff]);
+    comm_dataset.set_raw(mesh50::meshcop::TLV_STEERING_DATA, vec![0xff]);
     let mut interpreter = active_interpreter(
         [
             (
@@ -969,24 +962,18 @@ async fn bbrdataset_get_renders_raw_tlvs() {
 async fn opdataset_get_projects_every_field_like_the_cpp_cli() {
     let full = full_dataset_bytes();
     let mut pending_dataset = Dataset::default();
+    pending_dataset.set_raw(mesh50::dataset::TLV_NETWORK_NAME, b"cli-net".to_vec());
     pending_dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_NETWORK_NAME,
-        b"cli-net".to_vec(),
-    );
-    pending_dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_PENDING_TIMESTAMP,
+        mesh50::dataset::TLV_PENDING_TIMESTAMP,
         (2u64 << 16).to_be_bytes().to_vec(),
     );
     pending_dataset.set_raw(
-        ot_commissioner_rs::dataset::TLV_DELAY_TIMER,
+        mesh50::dataset::TLV_DELAY_TIMER,
         60000u32.to_be_bytes().to_vec(),
     );
     let minimal = {
         let mut d = Dataset::default();
-        d.set_raw(
-            ot_commissioner_rs::dataset::TLV_NETWORK_NAME,
-            b"min".to_vec(),
-        );
+        d.set_raw(mesh50::dataset::TLV_NETWORK_NAME, b"min".to_vec());
         d.to_bytes().unwrap()
     };
 
@@ -1087,7 +1074,7 @@ async fn opdataset_set_builds_field_and_json_updates() {
     // bump it) and then issues the MGMT_ACTIVE_SET.
     let mut with_timestamp = Dataset::default();
     with_timestamp.set_raw(
-        ot_commissioner_rs::dataset::TLV_ACTIVE_TIMESTAMP,
+        mesh50::dataset::TLV_ACTIVE_TIMESTAMP,
         (7u64 << 16).to_be_bytes().to_vec(),
     );
     let timestamp_bytes = with_timestamp.to_bytes().unwrap();
@@ -1186,7 +1173,7 @@ async fn managed_commands_mlr_and_announce_route_through_the_proxy() {
             (
                 CommissionerOperation::RegisterMulticastListener,
                 vec![ScriptedResponse::content(vec![
-                    ot_commissioner_rs::meshcop::THREAD_TLV_STATUS,
+                    mesh50::meshcop::THREAD_TLV_STATUS,
                     1,
                     0,
                 ])],
@@ -1380,7 +1367,7 @@ async fn protocol_errors_surface_as_failed_output() {
             (
                 CommissionerOperation::GetActiveDataset,
                 vec![ScriptedResponse::Coded {
-                    code: ot_commissioner_rs::meshcop::CoapCode(0x84),
+                    code: mesh50::meshcop::CoapCode(0x84),
                     payload: Vec::new(),
                 }],
             ),

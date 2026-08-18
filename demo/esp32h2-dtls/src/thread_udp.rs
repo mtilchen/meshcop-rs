@@ -9,7 +9,7 @@ use embedded_io_async::ErrorKind;
 use embedded_nal_async::UnconnectedUdp;
 use openthread::{OtError, UdpSocket};
 
-/// Maximum DTLS datagram accepted by the `thread-dtls` embedded driver.
+/// Maximum DTLS datagram accepted by the `mesh50-dtls` embedded driver.
 pub(crate) const UDP_RX_BUFFER_SIZE: usize = 4_096;
 
 /// An unconnected UDP transport backed by an OpenThread native UDP socket.
@@ -35,7 +35,7 @@ impl<'a> ThreadUdp<'a> {
 pub(crate) enum ThreadUdpError {
     /// OpenThread rejected a native UDP operation.
     OpenThread(OtError),
-    /// `thread-dtls` supplied an IPv4 address to this IPv6-only transport.
+    /// `mesh50-dtls` supplied an IPv4 address to this IPv6-only transport.
     Ipv4Unsupported,
     /// A send requested a local port different from the bound socket.
     LocalPortMismatch { requested: u16, bound: u16 },

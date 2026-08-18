@@ -130,7 +130,7 @@ int main(int argc, char **argv)
 {
     const char *bind_port = argc > 1 ? argv[1] : "49157";
     const int ciphersuites[] = { MBEDTLS_TLS_ECJPAKE_WITH_AES_128_CCM_8, 0 };
-    const char *pers = "ot-commissioner-rs-mbedtls-server";
+    const char *pers = "mesh50-mbedtls-server";
     unsigned char pskc[16];
     unsigned char client_ip[16] = { 0 };
     unsigned char buf[2048];

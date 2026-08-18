@@ -10,13 +10,13 @@
 # device); intended for CI but runnable on any Linux box.
 #
 # Env overrides:
-#   OT_INTEROP_OPENTHREAD_REF  git ref of openthread/openthread to test against
-#   OT_INTEROP_RUNTIME_DIR     scratch directory (default /tmp/ot-rs-interop)
+#   MESH50_INTEROP_OPENTHREAD_REF  git ref of openthread/openthread to test against
+#   MESH50_INTEROP_RUNTIME_DIR     scratch directory (default /tmp/mesh50-interop)
 
 set -euo pipefail
 
-openthread_ref="${OT_INTEROP_OPENTHREAD_REF:-v2026.06.0}"
-runtime_dir="${OT_INTEROP_RUNTIME_DIR:-/tmp/ot-rs-interop}"
+openthread_ref="${MESH50_INTEROP_OPENTHREAD_REF:-v2026.06.0}"
+runtime_dir="${MESH50_INTEROP_RUNTIME_DIR:-/tmp/mesh50-interop}"
 openthread_dir="${runtime_dir}/openthread"
 daemon_log="${runtime_dir}/ot-daemon.log"
 
@@ -147,10 +147,10 @@ run_interop_test() {
     echo "Border agent on port ${ba_port}; commissioning..."
     # Serial test threads: both tests petition the same border agent, and a
     # border agent serves one active commissioner at a time.
-    OT_COMMISSIONER_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
-        OT_COMMISSIONER_INTEROP_DATASET_HEX="${dataset_hex}" \
-        OT_COMMISSIONER_INTEROP_JOINER_CLI="${ot_cli_ftd}" \
-        cargo test -p ot-commissioner-rs --test interop_openthread --all-features -- \
+    MESH50_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
+        MESH50_INTEROP_DATASET_HEX="${dataset_hex}" \
+        MESH50_INTEROP_JOINER_CLI="${ot_cli_ftd}" \
+        cargo test -p mesh50 --test interop_openthread --all-features -- \
         --ignored --nocapture --test-threads=1
 }
 

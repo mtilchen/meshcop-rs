@@ -5,7 +5,7 @@
 # observed in safe Rust, or intentionally uncontracted diagnostics belong here.
 # Timed-out mutants fail the gate too. Document the reason above each entry.
 
-# Mutants in thread-dtls are killed largely by ot-commissioner-rs's commissioner
+# Mutants in `mesh50-dtls` are killed largely by Mesh Five-O's commissioner
 # tests; run the whole workspace's tests against every mutant.
 test_workspace = true
 

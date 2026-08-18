@@ -1,4 +1,4 @@
-# cargo-deny configuration for ot-commissioner-rs.
+# cargo-deny configuration for Mesh Five-O.
 #
 # Gates the dependency graph on four axes: known security advisories, license
 # policy, dependency bans/duplicates, and crate sources. Run locally with

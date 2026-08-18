@@ -1,4 +1,4 @@
-# Coverage-guided fuzz harnesses for ot-commissioner-rs wire parsers.
+# Coverage-guided fuzz harnesses for Mesh Five-O wire parsers.
 #
 # This crate is intentionally isolated from the main crate's workspace: it
 # requires a nightly toolchain (libfuzzer needs sanitizer codegen) and must
@@ -10,7 +10,7 @@
 # attacker-controlled wire bytes.
 
 [package]
-name = "ot-commissioner-rs-fuzz"
+name = "mesh50-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -21,11 +21,11 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.ot-commissioner-rs]
-path = "../crates/ot-commissioner-rs"
+[dependencies.mesh50]
+path = "../crates/mesh50"
 
-[dependencies.thread-dtls]
-path = "../crates/thread-dtls"
+[dependencies.mesh50-dtls]
+path = "../crates/mesh50-dtls"
 
 # Keep this crate out of the parent package's build graph.
 [workspace]
