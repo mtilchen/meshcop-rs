@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use ot_commissioner_rs::meshcop::{CoapMessage, parse_udp_rx};
+use meshcop::meshcop::{parse_udp_rx, CoapMessage};
 
 // UDP_RX.ntf decapsulation: outer CoAP decode, IPv6 Address and UDP
 // Encapsulation TLV extraction, and decode of the proxied inner datagram.

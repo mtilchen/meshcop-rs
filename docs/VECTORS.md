@@ -36,7 +36,7 @@ border agent (and a simulated joiner) on every change.
 - **Regenerate:** the value is a published spec constant (PBKDF2 over
   AES-CMAC-PRF-128, 16384 iterations). Independently reproduced by OpenThread's
   `Commissioner` test suite; there is no one-line CLI equivalent.
-- **Test:** `crates/ot-commissioner-rs/src/crypto/pskc.rs` → `generates_thread_pskc_test_vector`.
+- **Test:** `crates/meshcop/src/crypto/pskc.rs` → `generates_thread_pskc_test_vector`.
 
 ---
 
@@ -57,7 +57,7 @@ border agent (and a simulated joiner) on every change.
     -kdfopt seed:label \
     -kdfopt hexseed:1112131415161718191a1b1c1d1e1f20 TLS1-PRF | xxd -p -c64
   ```
-- **Test:** `crates/thread-dtls/src/tests/keys.rs` → `tls12_prf_matches_openssl_tls1_prf_vector`.
+- **Test:** `crates/meshcop-dtls/src/tests/keys.rs` → `tls12_prf_matches_openssl_tls1_prf_vector`.
 
 ---
 
@@ -81,7 +81,7 @@ border agent (and a simulated joiner) on every change.
     -kdfopt hexsecret:$(printf '11%.0s' {1..48}) \
     -kdfopt seed:'client finished' -kdfopt hexseed:$th TLS1-PRF | xxd -p -c12
   ```
-- **Test:** `crates/thread-dtls/src/tests/keys.rs` → `finished_verify_data_matches_openssl_tls1_prf_vector`.
+- **Test:** `crates/meshcop-dtls/src/tests/keys.rs` → `finished_verify_data_matches_openssl_tls1_prf_vector`.
 
 ---
 
@@ -106,7 +106,7 @@ border agent (and a simulated joiner) on every change.
 - **Regenerate:** feed the client/server round messages to
   `tools/mbedtls_ecjpake_verify_round_two.c` (built against mbedTLS); it parses
   and validates the round-two messages and derives the premaster secret.
-- **Test:** `crates/thread-dtls/src/ecjpake/tests.rs` →
+- **Test:** `crates/meshcop-dtls/src/ecjpake/tests.rs` →
   `mbedtls_reference_handshake_derives_expected_premaster_secret`.
 
 ---
@@ -146,7 +146,7 @@ border agent (and a simulated joiner) on every change.
        -kdfopt hexseed:$sr$cr TLS1-PRF | xxd -p -c80)
   printf '%s' "$kb" | xxd -r -p | openssl dgst -sha256 -binary | xxd -p -c32 | cut -c1-32  # KEK
   ```
-- **Test:** `crates/thread-dtls/src/tests/keys.rs` →
+- **Test:** `crates/meshcop-dtls/src/tests/keys.rs` →
   `key_schedule_chain_matches_openssl_tls1_prf_vectors`.
 
 ---
@@ -167,7 +167,7 @@ border agent (and a simulated joiner) on every change.
   # or, from the EUI-64 directly:
   python3 -c 'import hashlib; d=hashlib.sha256(bytes.fromhex("18b4300000000002")).digest()[:8]; print((bytes([d[0]|2])+d[1:]).hex())'
   ```
-- **Test:** `crates/ot-commissioner-rs/src/crypto/pskc.rs` → `compute_joiner_id_matches_openthread`.
+- **Test:** `crates/meshcop/src/crypto/pskc.rs` → `compute_joiner_id_matches_openthread`.
 
 ---
 
@@ -209,7 +209,7 @@ border agent (and a simulated joiner) on every change.
       return out.hex()
   print(steering(bytes.fromhex("d65e64fa83f81cf7")))   # ...0012
   ```
-- **Tests:** `crates/ot-commissioner-rs/src/crypto/pskc.rs` →
+- **Tests:** `crates/meshcop/src/crypto/pskc.rs` →
   `compute_bloom_filter_matches_spec_for_openthread_joiner`,
   `compute_bloom_filter_sets_two_crc_indexed_bits`.
 
@@ -239,7 +239,7 @@ border agent (and a simulated joiner) on every change.
   aad = bytes.fromhex("0001") + (7).to_bytes(6, "big") + bytes([23]) + bytes.fromhex("fefd") + len(pt).to_bytes(2, "big")
   print((nonce[4:] + AESCCM(key, tag_length=8).encrypt(nonce, pt, aad)).hex())
   ```
-- **Test:** `crates/thread-dtls/src/tests/keys.rs` →
+- **Test:** `crates/meshcop-dtls/src/tests/keys.rs` →
   `record_protection_matches_openssl_aes_ccm_8_vector`.
 
 ---

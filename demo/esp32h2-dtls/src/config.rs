@@ -13,9 +13,9 @@ pub(crate) const DEMO_PORT: u16 = 49_191;
 /// Demo-only Active Operational Dataset, encoded as Thread TLVs.
 ///
 /// Generated with:
-/// `cargo run -p ot-commissioner-rs --example generate_esp32h2_demo_dataset`
+/// `cargo run -p meshcop --example generate_esp32h2_demo_dataset`
 ///
-/// The dataset includes the network name `thread-dtls-demo`, channel 15,
+/// The dataset includes the network name `meshcop-dtls-demo`, channel 15,
 /// PAN ID `0xd71d`, an extended PAN ID, mesh-local prefix, Network Key, PSKc,
 /// Active Timestamp, and Security Policy. Its keys are public demo credentials.
 pub(crate) const ACTIVE_DATASET_TLV_HEX: &str = concat!(

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use thread_dtls::ecjpake::{RoundTwo, THREAD_CLIENT_ID, THREAD_SERVER_ID};
+use meshcop_dtls::ecjpake::{RoundTwo, THREAD_CLIENT_ID, THREAD_SERVER_ID};
 
 // EC J-PAKE round-two key-exchange decoding. The server form carries secp256r1
 // ECParameters (expect_curve_params = true); the client form does not. Both must

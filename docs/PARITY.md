@@ -1,6 +1,6 @@
 # Feature parity with the C++ `ot-commissioner`
 
-This document tracks `ot-commissioner-rs` against the OpenThread C++
+This document tracks MeshCoP for Rust against the OpenThread C++
 reference (`github.com/openthread/ot-commissioner`, `include/commissioner`
 public API), excluding CCM (Commercial Commissioning Mode) per project scope.
 "C++" below refers to that reference implementation.
@@ -28,7 +28,7 @@ public API), excluding CCM (Commercial Commissioning Mode) per project scope.
 | `GeneratePSKc` | `crypto::generate_pskc` | ✅ |
 | `ComputeJoinerId` | `crypto::compute_joiner_id` | ✅ |
 | `AddJoiner` (steering data) | `crypto::add_joiner_to_steering_data` | ✅ |
-| `GetVersion` | `ot_commissioner_rs::version()` | ✅ |
+| `GetVersion` | `meshcop::version()` | ✅ |
 | `CancelRequests` | not needed: requests are `async` and cancelled by dropping futures | ✅ (idiom) |
 
 ## CommissionerHandler callbacks
@@ -43,7 +43,7 @@ public API), excluding CCM (Commercial Commissioning Mode) per project scope.
 | `OnEnergyReport` | `CommissionerEvent::EnergyReport` |
 | `OnDiagGetAnswerMessage` | `CommissionerEvent::DiagnosticAnswer` (`meshcop::NetDiagData`) |
 | `OnDatasetChanged` | `CommissionerEvent::DatasetChanged` (also clears the cached mesh-local prefix, like the C++ proxy) |
-| `OnLog` | `OT_COMMISSIONER_TRACE` stderr tracing |
+| `OnLog` | `MESHCOP_TRACE` stderr tracing |
 
 ## Joiner commissioning
 

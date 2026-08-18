@@ -129,7 +129,7 @@ impl Interpreter {
             Ok(dataset) => dataset,
             Err(err) => return CommandValue::failed(err.to_string()),
         };
-        let result = (|| -> ot_commissioner_rs::Result<Option<String>> {
+        let result = (|| -> meshcop::Result<Option<String>> {
             Ok(match field {
                 "activetimestamp" => dataset
                     .active_timestamp()?
@@ -179,8 +179,8 @@ impl Interpreter {
                     let number = parse_u64(tokens.get(4).map(String::as_str).unwrap_or(""))
                         .ok_or("invalid channel")?;
                     dataset.set_raw(
-                        ot_commissioner_rs::dataset::TLV_CHANNEL,
-                        ot_commissioner_rs::dataset::Channel {
+                        meshcop::dataset::TLV_CHANNEL,
+                        meshcop::dataset::Channel {
                             page: page as u8,
                             channel: number as u16,
                         }
@@ -189,17 +189,17 @@ impl Interpreter {
                     );
                 }
                 "xpanid" => dataset.set_raw(
-                    ot_commissioner_rs::dataset::TLV_EXTENDED_PAN_ID,
+                    meshcop::dataset::TLV_EXTENDED_PAN_ID,
                     hex::decode(tokens.get(3).map(String::as_str).unwrap_or("").trim())
                         .map_err(|e| e.to_string())?,
                 ),
                 "networkmasterkey" => dataset.set_raw(
-                    ot_commissioner_rs::dataset::TLV_NETWORK_KEY,
+                    meshcop::dataset::TLV_NETWORK_KEY,
                     hex::decode(tokens.get(3).map(String::as_str).unwrap_or("").trim())
                         .map_err(|e| e.to_string())?,
                 ),
                 "networkname" => dataset.set_raw(
-                    ot_commissioner_rs::dataset::TLV_NETWORK_NAME,
+                    meshcop::dataset::TLV_NETWORK_NAME,
                     tokens
                         .get(3)
                         .map(String::as_str)
@@ -210,18 +210,15 @@ impl Interpreter {
                 "panid" => {
                     let panid = json::parse_panid(tokens.get(3).map(String::as_str).unwrap_or(""))
                         .map_err(|e| e.to_string())?;
-                    dataset.set_raw(
-                        ot_commissioner_rs::dataset::TLV_PAN_ID,
-                        panid.to_be_bytes().to_vec(),
-                    );
+                    dataset.set_raw(meshcop::dataset::TLV_PAN_ID, panid.to_be_bytes().to_vec());
                 }
                 "pskc" => dataset.set_raw(
-                    ot_commissioner_rs::dataset::TLV_PSKC,
+                    meshcop::dataset::TLV_PSKC,
                     hex::decode(tokens.get(3).map(String::as_str).unwrap_or("").trim())
                         .map_err(|e| e.to_string())?,
                 ),
                 "meshlocalprefix" => dataset.set_raw(
-                    ot_commissioner_rs::dataset::TLV_MESH_LOCAL_PREFIX,
+                    meshcop::dataset::TLV_MESH_LOCAL_PREFIX,
                     json::parse_mesh_local_prefix(tokens.get(3).map(String::as_str).unwrap_or(""))
                         .map_err(|e| e.to_string())?
                         .to_vec(),
@@ -240,13 +237,10 @@ impl Interpreter {
                         [] => return Err("flags must not be empty".to_string()),
                     };
                     dataset.set_raw(
-                        ot_commissioner_rs::dataset::TLV_SECURITY_POLICY,
-                        ot_commissioner_rs::dataset::SecurityPolicy {
+                        meshcop::dataset::TLV_SECURITY_POLICY,
+                        meshcop::dataset::SecurityPolicy {
                             rotation_time: rotation,
-                            flags:
-                                ot_commissioner_rs::dataset::SecurityPolicyFlags::from_bits_retain(
-                                    flags,
-                                ),
+                            flags: meshcop::dataset::SecurityPolicyFlags::from_bits_retain(flags),
                         }
                         .to_value()
                         .to_vec(),
@@ -274,8 +268,8 @@ impl Interpreter {
                     Err(err) => return CommandValue::failed(err.to_string()),
                 };
                 dataset.set_raw(
-                    ot_commissioner_rs::dataset::TLV_ACTIVE_TIMESTAMP,
-                    ot_commissioner_rs::dataset::Timestamp::from_components(seconds, 0, false)
+                    meshcop::dataset::TLV_ACTIVE_TIMESTAMP,
+                    meshcop::dataset::Timestamp::from_components(seconds, 0, false)
                         .to_value()
                         .to_vec(),
                 );

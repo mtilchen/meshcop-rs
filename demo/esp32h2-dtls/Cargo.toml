@@ -29,7 +29,7 @@ esp-rtos = { version = "=0.3.0", features = ["embassy", "esp-alloc", "esp-radio"
 openthread = { git = "https://github.com/esp-rs/openthread.git", rev = "e4d27b39f01563c98fd1e88ab2fa9799a1ae26fe", features = ["esp-radio", "isupper", "udp"] }
 rand_core = { version = "=0.6.4", default-features = false }
 static_cell = { version = "=2.1.1" }
-thread-dtls = { path = "../../crates/thread-dtls", default-features = false, features = ["embedded"] }
+meshcop-dtls = { path = "../../crates/meshcop-dtls", default-features = false, features = ["embedded"] }
 tinyrlibc = { version = "=0.5.1", default-features = false, features = ["strtoul", "utoa"] }
 
 [profile.dev]

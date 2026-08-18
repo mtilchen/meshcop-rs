@@ -2,8 +2,8 @@
 //!
 //! This module reimplements the interactive command surface, prompt, colored
 //! `[done]`/`[failed]` output, startup logo, and usage banner of the C++
-//! `ot-commissioner` CLI on top of the pure-Rust
-//! [`ot_commissioner_rs::commissioner`] API. It is driven by the
+//! `ot-commissioner` CLI using the [`meshcop::commissioner`] API from MeshCoP
+//! for Rust. It is driven by the
 //! `ot-commissioner-rs` binary (`src/main.rs`).
 //!
 //! Commands that exercise the non-CCM commissioner protocol are fully wired to
@@ -125,7 +125,7 @@ pub fn parse_invocation(args: &[String]) -> CliInvocation {
 /// file is given, as the C++ CLI does) and runs the REPL until `exit`/`quit`
 /// or end-of-input. On a configuration-load failure it prints the C++-style
 /// startup error and returns it.
-pub async fn run(config_path: Option<&Path>) -> ot_commissioner_rs::Result<()> {
+pub async fn run(config_path: Option<&Path>) -> meshcop::Result<()> {
     let config = match config_path {
         Some(path) => match config::CliConfig::load(path) {
             Ok(config) => config,

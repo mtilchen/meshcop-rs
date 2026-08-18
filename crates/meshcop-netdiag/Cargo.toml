@@ -1,0 +1,19 @@
+[package]
+name = "meshcop-netdiag"
+description = "Thread network topology and diagnostics for MeshCoP for Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "meshcop-netdiag"
+path = "src/main.rs"
+
+[dependencies]
+meshcop.workspace = true
+argh.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

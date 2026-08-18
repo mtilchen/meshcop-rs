@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use ot_commissioner_rs::dataset::Dataset;
+use meshcop::dataset::Dataset;
 
 // Operational dataset decoding: every typed accessor must validate fuzzed wire
 // bytes without panicking.

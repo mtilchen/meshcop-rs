@@ -6,7 +6,7 @@ use std::{path::Path, time::Duration};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use ot_commissioner_rs::{
+use meshcop::{
     commissioner::CommissionerConfig,
     crypto::Pskc,
     error::{Error, Result},

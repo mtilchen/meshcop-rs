@@ -1,6 +1,6 @@
 //! The `ot-commissioner-rs` interactive CLI binary: a faithful reimplementation
-//! of the C++ `ot-commissioner` command-line REPL on top of the pure-Rust
-//! commissioner library. The full command surface lives in [`crate::cli`].
+//! of the C++ `ot-commissioner` command-line REPL on top of MeshCoP for Rust.
+//! The full command surface lives in [`crate::cli`].
 //!
 //! ```text
 //! ot-commissioner-rs -h|--help

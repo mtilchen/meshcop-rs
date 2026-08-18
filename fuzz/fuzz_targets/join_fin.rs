@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use ot_commissioner_rs::commissioner::JoinerFinalizeInfo;
+use meshcop::commissioner::JoinerFinalizeInfo;
 
 // JOIN_FIN.req payload parsing: TLV extraction plus UTF-8 validation of the
 // vendor identification fields. Must never panic on attacker-controlled

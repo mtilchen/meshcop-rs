@@ -58,8 +58,8 @@ impl CommandValue {
     }
 }
 
-impl From<ot_commissioner_rs::Result<()>> for CommandValue {
-    fn from(result: ot_commissioner_rs::Result<()>) -> Self {
+impl From<meshcop::Result<()>> for CommandValue {
+    fn from(result: meshcop::Result<()>) -> Self {
         match result {
             Ok(()) => CommandValue::done(),
             Err(err) => CommandValue::failed(err.to_string()),
@@ -96,7 +96,7 @@ mod tests {
     fn from_result_maps_ok_to_done_and_err_to_failed() {
         let ok: CommandValue = Ok(()).into();
         assert_eq!(ok.rendered().as_str(), "[done]");
-        let err: CommandValue = Err(ot_commissioner_rs::Error::Unsupported("nope")).into();
+        let err: CommandValue = Err(meshcop::Error::Unsupported("nope")).into();
         assert_eq!(
             err.rendered().as_str(),
             "unsupported operation: nope\n[failed]"

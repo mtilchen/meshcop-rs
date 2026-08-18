@@ -1,8 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use ot_commissioner_rs::meshcop::{
-    CoapMessage, parse_notification, parse_petition_response, parse_state, parse_state_response,
+use meshcop::meshcop::{
+    parse_notification, parse_petition_response, parse_state, parse_state_response, CoapMessage,
 };
 
 // MeshCoP CoAP decoding plus the higher-level response/notification parsers that

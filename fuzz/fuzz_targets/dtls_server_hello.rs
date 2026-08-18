@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use thread_dtls::ServerHello;
+use meshcop_dtls::ServerHello;
 
 // ServerHello decoding: a decoded hello must round-trip through encode/decode.
 fuzz_target!(|data: &[u8]| {

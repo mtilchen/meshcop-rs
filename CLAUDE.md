@@ -10,7 +10,7 @@ The notes below are an orientation map; they do not override `AGENTS.md`.
 
 ## What this crate is
 
-`ot-commissioner-rs` is a pure-Rust Thread MeshCoP commissioner with the
+MeshCoP for Rust (`meshcop`) is a pure-Rust Thread MeshCoP commissioner with the
 non-CCM feature set of the C++ `ot-commissioner` reference (matrix in
 `docs/PARITY.md`). It establishes a Thread DTLS 1.2 session authenticated with
 EC J-PAKE over PSKc, petitions a border agent, keeps the session alive,
@@ -25,7 +25,7 @@ mbedTLS at runtime.
 - Thread 1.4.0 specification — the wire formats, MeshCoP CoAP resources, dataset
   TLVs, and security policy bits implemented here.
 - RFC 8236 (J-PAKE) and RFC 8235 (Schnorr NIZK) — the EC J-PAKE handshake in
-  `crates/thread-dtls/src/ecjpake/` follows the EC form of both.
+  `crates/meshcop-dtls/src/ecjpake/` follows the EC form of both.
 - OpenThread `ot-commissioner` (github.com/openthread/ot-commissioner) — the C++
   reference implementation, used for parity and as a source of test vectors. The
   `tools/mbedtls_*.c` harnesses and the mbedTLS reference vector in the
@@ -33,14 +33,14 @@ mbedTLS at runtime.
 
 ## Workspace map (`crates/`)
 
-Three cargo-workspace members (root `Cargo.toml`), plus `fuzz/` and
+Four Cargo-workspace members (root `Cargo.toml`), plus `fuzz/` and
 `demo/esp32h2-dtls/`, which are excluded workspaces with their own lockfiles.
 The demo is two-role ESP32-H2 firmware for commissioner-style DTLS over a real
 two-node OpenThread IPv6 network.
 
-- `crates/thread-dtls` — the Thread MeshCoP DTLS 1.2 profile, standalone with
-  `no_std` + `alloc` support and runtime-neutral apart from its optional Tokio
-  session driver.
+- `crates/meshcop-dtls` — the project's Thread MeshCoP DTLS 1.2 profile,
+  standalone with `no_std` + `alloc` support and runtime-neutral apart from its
+  optional Tokio session driver.
   - `ecjpake/` — EC J-PAKE party + Schnorr NIZK over P-256, split into the
     protocol state machine and shared P-256 helpers (`mod.rs`), the Schnorr
     proof gen/verify (`schnorr.rs`), and the TLS `ECJPAKEKeyKPPairList` /
@@ -60,7 +60,7 @@ two-node OpenThread IPv6 network.
   - `test_support.rs` — in-process loopback DTLS server for deterministic
     handshake tests, gated behind the `test-support` feature. Unit tests live
     in `tests/`.
-- `crates/ot-commissioner-rs` — the library.
+- `crates/meshcop` — the commissioner library.
   - `tlv.rs` — Thread TLV codec. Preserves wire order, duplicates, unknown
     types, and supports the extended (0xff) length form. Foundation for
     everything else.
@@ -88,15 +88,16 @@ two-node OpenThread IPv6 network.
     transport that exercises the production incoming-message loop, `pub`
     behind the `test-support` feature.
   - `error.rs` — Crate-wide `thiserror` `Error`/`Result`, including a
-    transparent `Dtls` variant wrapping `thread_dtls::Error`.
+    transparent `Dtls` variant wrapping `meshcop_dtls::Error`.
   - `tests/` (`interop_openthread.rs`, `live_border_router.rs`) and
     `examples/` live here too.
-- `crates/ot-commissioner-cli` — the REPL binary (still named
+- `crates/ot-commissioner-cli` — the example REPL port (still named
   `ot-commissioner-rs`), formerly the library's `cli` feature. Run it with
   `cargo run -p ot-commissioner-cli`. Its scripted tests use the library's
   `test-support` feature.
-- `crates/ot-netdiag` — the read-only Thread network topology and diagnostics
-  collector. Run it with `cargo run -p ot-netdiag -- --help`.
+- `crates/meshcop-netdiag` — the read-only Thread network topology and
+  diagnostics collector. Run it with
+  `cargo run -p meshcop-netdiag -- --help`.
 
 ## Conventions and gotchas worth knowing
 
@@ -110,12 +111,12 @@ two-node OpenThread IPv6 network.
   `netdiag` collector do this while their sessions are active.
 - Live border-router tests are `#[ignore]` and require a real agent plus
   `ESP_MATTER_TEST_THREAD_DATASET_HEX`; they must not leak secrets.
-- Mutating CLI/example operations are gated behind `OT_COMMISSIONER_MUTATE_OK=1`.
+- Mutating CLI/example operations are gated behind `MESHCOP_MUTATE_OK=1`.
 - CCM (token/certificate) flows are intentionally deferred and return
   `Error::Unsupported`.
-- `OT_COMMISSIONER_TRACE` prints non-secret MeshCoP and DTLS protocol traces to
+- `MESHCOP_TRACE` prints non-secret MeshCoP and DTLS protocol traces to
   stderr as `[meshcop] message` and `[dtls] message`.
-- `OT_COMMISSIONER_TRACE_SECRETS` additionally prints sensitive DTLS key
+- `MESHCOP_TRACE_SECRETS` additionally prints sensitive DTLS key
   material and plaintext to stderr as `[dtls-secret] message`. Use it only in
   controlled debugging environments.
 
@@ -127,12 +128,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-When touching `crates/thread-dtls`, also build the no_std profile the CI
+When touching `crates/meshcop-dtls`, also build the no_std profile the CI
 `no-std` job enforces — host gates always have `std` on and cannot catch
 `std`/`eprintln!` leaking into un-gated code:
 
 ```sh
-cargo build -p thread-dtls --no-default-features --target riscv32imac-unknown-none-elf
+cargo build -p meshcop-dtls --no-default-features --target riscv32imac-unknown-none-elf
 ```
 
 When adding, deleting, or demoting source files in a crate the mutation gate

@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use thread_dtls::{DtlsRecord, RecordHeader};
+use meshcop_dtls::{DtlsRecord, RecordHeader};
 
 // DTLS record framing: parsing one datagram into records must never panic, and
 // any record that parses must re-encode and re-parse to an identical sequence.

@@ -61,7 +61,7 @@ jobs:
         run: cargo test --workspace --all-features
 
   no-std:
-    name: thread-dtls no_std
+    name: "MeshCoP for Rust: DTLS no_std"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -85,7 +85,7 @@ jobs:
             cargo-${{ runner.os }}-
 
       - name: cargo build
-        run: cargo build -p thread-dtls --no-default-features --target riscv32imac-unknown-none-elf
+        run: cargo build -p meshcop-dtls --no-default-features --target riscv32imac-unknown-none-elf
 
   supply-chain:
     name: Supply Chain (audit, deny)

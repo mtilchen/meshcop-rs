@@ -23,20 +23,20 @@ filters=()
 case "${scope}" in
   targeted)
     filters=(
-      --file 'crates/ot-commissioner-rs/src/commissioner/client/*.rs'
-      --file crates/ot-commissioner-rs/src/commissioner/joiner.rs
-      --file crates/ot-commissioner-rs/src/meshcop/coap.rs
-      --file 'crates/ot-commissioner-rs/src/meshcop/diag/*.rs'
-      --file crates/ot-commissioner-rs/src/meshcop/parsers.rs
-      --file crates/ot-commissioner-rs/src/meshcop/builders.rs
-      --file crates/thread-dtls/src/driver.rs
-      --file crates/thread-dtls/src/client_driver.rs
-      --file crates/thread-dtls/src/server_driver.rs
-      --file crates/thread-dtls/src/tokio_session.rs
-      --file crates/thread-dtls/src/tokio_transport.rs
-      --file crates/thread-dtls/src/handshake.rs
-      --file crates/thread-dtls/src/thread_server_handshake.rs
-      --file 'crates/thread-dtls/src/ecjpake/*.rs'
+      --file 'crates/meshcop/src/commissioner/client/*.rs'
+      --file crates/meshcop/src/commissioner/joiner.rs
+      --file crates/meshcop/src/meshcop/coap.rs
+      --file 'crates/meshcop/src/meshcop/diag/*.rs'
+      --file crates/meshcop/src/meshcop/parsers.rs
+      --file crates/meshcop/src/meshcop/builders.rs
+      --file crates/meshcop-dtls/src/driver.rs
+      --file crates/meshcop-dtls/src/client_driver.rs
+      --file crates/meshcop-dtls/src/server_driver.rs
+      --file crates/meshcop-dtls/src/tokio_session.rs
+      --file crates/meshcop-dtls/src/tokio_transport.rs
+      --file crates/meshcop-dtls/src/handshake.rs
+      --file crates/meshcop-dtls/src/thread_server_handshake.rs
+      --file 'crates/meshcop-dtls/src/ecjpake/*.rs'
     )
     ;;
   full)

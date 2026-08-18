@@ -1,4 +1,4 @@
-# Coverage-guided fuzz harnesses for ot-commissioner-rs wire parsers.
+# Coverage-guided fuzz harnesses for the MeshCoP for Rust wire parsers.
 #
 # This crate is intentionally isolated from the main crate's workspace: it
 # requires a nightly toolchain (libfuzzer needs sanitizer codegen) and must
@@ -10,7 +10,7 @@
 # attacker-controlled wire bytes.
 
 [package]
-name = "ot-commissioner-rs-fuzz"
+name = "meshcop-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -21,11 +21,11 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
-[dependencies.ot-commissioner-rs]
-path = "../crates/ot-commissioner-rs"
+[dependencies.meshcop]
+path = "../crates/meshcop"
 
-[dependencies.thread-dtls]
-path = "../crates/thread-dtls"
+[dependencies.meshcop-dtls]
+path = "../crates/meshcop-dtls"
 
 # Keep this crate out of the parent package's build graph.
 [workspace]

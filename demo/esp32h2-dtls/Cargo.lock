@@ -1235,7 +1235,7 @@ dependencies = [
  "openthread",
  "rand_core 0.6.4",
  "static_cell",
- "thread-dtls",
+ "meshcop-dtls",
  "tinyrlibc",
 ]
 
@@ -2247,7 +2247,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "thread-dtls"
+name = "meshcop-dtls"
 version = "0.1.0"
 dependencies = [
  "aes",
