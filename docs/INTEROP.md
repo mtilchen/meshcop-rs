@@ -52,8 +52,10 @@ on loopback:
 
 A weekly scheduled run catches drift against OpenThread even when this repo is
 quiet. Reproduce locally on Linux with `tools/ci/interop.sh`. The pinned
-OpenThread ref is set through `MESHCOP_INTEROP_OPENTHREAD_REF`; cached binaries
-are reused only after their checked-out commit is verified against that ref.
+OpenThread ref lives in [`tools/ci/openthread-ref`](../tools/ci/openthread-ref)
+and may be overridden with `MESHCOP_INTEROP_OPENTHREAD_REF`; cached binaries are
+reused only after their checked-out commit is verified against the effective
+ref.
 
 ## Physical border router — manual, read-only
 

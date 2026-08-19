@@ -88,14 +88,14 @@ async fn interop_wrong_pskc_is_rejected_and_border_agent_recovers() -> meshcop::
         .petition()
         .await
         .expect_err("a commissioner with the wrong PSKc must not petition successfully");
-    let is_authentication_failure = match &error {
-        Error::Dtls(_) => true,
-        Error::Timeout(reason) => *reason == "DTLS handshake timed out",
-        _ => false,
-    };
+    let is_authentication_failure = matches!(
+        &error,
+        Error::Dtls(meshcop_dtls::Error::Crypto(message))
+            if message.contains("DTLS alert") && message.contains("level=2")
+    );
     assert!(
         is_authentication_failure,
-        "wrong PSKc failed outside DTLS authentication: {error}"
+        "wrong PSKc did not produce a fatal DTLS authentication alert: {error}"
     );
     rejected.disconnect();
 
@@ -126,10 +126,20 @@ async fn interop_competing_commissioner_is_rejected_then_can_take_over() -> mesh
         return Err(error);
     }
 
-    primary.resign().await?;
-    let petition = contender.petition().await?;
-    assert_ne!(petition.session_id, 0, "takeover returned session id 0");
-    contender.resign().await
+    let takeover = async {
+        primary.resign().await?;
+        let petition = contender.petition().await?;
+        if petition.session_id == 0 {
+            return Err(Error::InvalidState("takeover returned session id 0"));
+        }
+        Ok(())
+    }
+    .await;
+    let contender_resign = resign_if_active(&mut contender).await;
+    let primary_resign = resign_if_active(&mut primary).await;
+    takeover?;
+    contender_resign?;
+    primary_resign
 }
 
 #[tokio::test]
@@ -196,17 +206,18 @@ async fn exercise_diagnostics(
 async fn wait_for_diagnostic_answer(
     commissioner: &mut Commissioner,
 ) -> meshcop::Result<Box<NetDiagData>> {
-    tokio::time::timeout(DIAGNOSTIC_DEADLINE, async {
-        loop {
-            if let Some(CommissionerEvent::DiagnosticAnswer { data, .. }) =
-                commissioner.next_event().await?
-            {
-                return Ok::<Box<NetDiagData>, Error>(data);
+    let deadline = tokio::time::Instant::now() + DIAGNOSTIC_DEADLINE;
+    loop {
+        match tokio::time::timeout_at(deadline, commissioner.next_event()).await {
+            Err(_elapsed) => {
+                return Err(Error::Timeout("OpenThread diagnostic answer timed out"));
             }
+            Ok(Ok(Some(CommissionerEvent::DiagnosticAnswer { data, .. }))) => return Ok(data),
+            Ok(Ok(_)) => {}
+            Ok(Err(Error::Dtls(meshcop_dtls::Error::Timeout(_)))) => {}
+            Ok(Err(error)) => return Err(error),
         }
-    })
-    .await
-    .map_err(|_| Error::Timeout("OpenThread diagnostic answer timed out"))?
+    }
 }
 
 fn require_diagnostic_fields(source: &str, data: &NetDiagData) -> meshcop::Result<()> {
@@ -362,6 +373,8 @@ async fn commission_joiner(
     });
 
     let deadline = tokio::time::Instant::now() + JOIN_DEADLINE;
+    let keepalive_interval = commissioner.config().keepalive_interval;
+    let mut keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
     let mut connected = false;
     let mut finalized = false;
     let mut joined = false;
@@ -374,6 +387,14 @@ async fn commission_joiner(
             } else {
                 "joiner was entrusted but never attached to the network"
             }));
+        }
+        if tokio::time::Instant::now() >= keepalive_deadline {
+            if commissioner.keep_alive().await? != ResultCode::Accept {
+                return Err(Error::InvalidState(
+                    "commissioner keep-alive was rejected during joiner commissioning",
+                ));
+            }
+            keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
         }
         tokio::select! {
             result = &mut driver, if !joined => {
