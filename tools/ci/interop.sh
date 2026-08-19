@@ -19,6 +19,7 @@ openthread_ref="${MESHCOP_INTEROP_OPENTHREAD_REF:-v2026.06.0}"
 runtime_dir="${MESHCOP_INTEROP_RUNTIME_DIR:-/tmp/meshcop-interop}"
 openthread_dir="${runtime_dir}/openthread"
 daemon_log="${runtime_dir}/ot-daemon.log"
+readonly OPENTHREAD_REPOSITORY=https://github.com/openthread/openthread.git
 
 # Fixed, non-secret network parameters: the test vectors from the C++
 # ot-commissioner integration suite (tests/integration/common.sh).
@@ -76,15 +77,37 @@ wait_for() {
     die "timed out waiting for ${description}"
 }
 
+openthread_binaries_exist() {
+    [[ -x "${ot_daemon}" && -x "${ot_ctl}" && -x "${ot_rcp}" && -x "${ot_cli_ftd}" ]]
+}
+
+fetch_openthread_ref() {
+    git -C "${openthread_dir}" fetch --depth 1 origin "${openthread_ref}"
+    git -C "${openthread_dir}" rev-parse --verify 'FETCH_HEAD^{commit}'
+}
+
 build_openthread() {
-    if [[ -x "${ot_daemon}" && -x "${ot_rcp}" && -x "${ot_cli_ftd}" ]]; then
-        echo "Using cached OpenThread build at ${openthread_dir}"
-        return
+    local current_commit requested_commit
+    if [[ -d "${openthread_dir}/.git" ]]; then
+        if ! requested_commit="$(fetch_openthread_ref)"; then
+            die "could not resolve OpenThread ref ${openthread_ref}"
+        fi
+        current_commit="$(git -C "${openthread_dir}" rev-parse --verify HEAD)"
+        if openthread_binaries_exist && [[ "${current_commit}" == "${requested_commit}" ]]; then
+            echo "Using cached OpenThread build at ${requested_commit}"
+            return
+        fi
+        echo "Cached OpenThread build is ${current_commit}; rebuilding ${requested_commit}"
     fi
+
     rm -rf "${openthread_dir}"
-    git clone --depth 1 --branch "${openthread_ref}" \
-        --recurse-submodules --shallow-submodules \
-        https://github.com/openthread/openthread.git "${openthread_dir}"
+    git init --quiet "${openthread_dir}"
+    git -C "${openthread_dir}" remote add origin "${OPENTHREAD_REPOSITORY}"
+    git -C "${openthread_dir}" fetch --depth 1 origin "${openthread_ref}"
+    git -C "${openthread_dir}" checkout --quiet --detach FETCH_HEAD
+    git -C "${openthread_dir}" submodule update --init --recursive --depth 1
+    requested_commit="$(git -C "${openthread_dir}" rev-parse --verify HEAD)"
+    echo "Building OpenThread ${openthread_ref} at ${requested_commit}"
     cd "${openthread_dir}"
     # The simulated RCP that stands in for an 802.15.4 radio, plus an FTD CLI
     # node that acts as the joiner on the same simulated radio bus.
@@ -145,9 +168,10 @@ run_interop_test() {
     [[ -n "${dataset_hex}" ]] || die "could not read the active dataset"
 
     echo "Border agent on port ${ba_port}; commissioning..."
-    # Serial test threads: both tests petition the same border agent, and a
-    # border agent serves one active commissioner at a time.
-    MESHCOP_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
+    # Serial test threads: every live case shares one border agent, which can
+    # serve only one active commissioner at a time.
+    MESHCOP_MUTATE_OK=1 \
+        MESHCOP_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
         MESHCOP_INTEROP_DATASET_HEX="${dataset_hex}" \
         MESHCOP_INTEROP_JOINER_CLI="${ot_cli_ftd}" \
         cargo test -p meshcop --test interop_openthread --all-features -- \
@@ -164,12 +188,14 @@ write_summary() {
             echo "| --- | --- | --- | --- |"
             echo "| OpenThread \`${openthread_ref}\` (posix ot-daemon, simulated RCP) | border agent + leader | DTLS/EC-J-PAKE over UDP | ${result} |"
             echo
-            echo "Covered: DTLS 1.2 + EC J-PAKE handshake (PSKc), COMM_PET, COMM_KA,"
-            echo "MGMT_ACTIVE_GET (full dataset compare), MGMT_COMMISSIONER_GET via"
-            echo "the UDP_TX/UDP_RX proxy to the leader ALOC, resign; plus a full"
-            echo "joiner commissioning of a simulated ot-cli-ftd node: steering data"
-            echo "by EUI-64, the joiner DTLS session over RLY_RX/RLY_TX (PSKd),"
-            echo "JOIN_FIN, KEK entrustment, and the joiner attaching as a child."
+            echo "Covered: successful and wrong-PSKc DTLS 1.2 + EC J-PAKE handshakes,"
+            echo "recovery after authentication failure, commissioner contention and"
+            echo "takeover, COMM_PET, COMM_KA, MGMT_ACTIVE_GET (full dataset compare),"
+            echo "MGMT_COMMISSIONER_GET and unicast/asynchronous network diagnostics via"
+            echo "the UDP_TX/UDP_RX proxy, and resign. Joiner coverage commissions a"
+            echo "simulated ot-cli-ftd node end to end: steering data by EUI-64, the"
+            echo "joiner DTLS session over RLY_RX/RLY_TX (PSKd), JOIN_FIN, KEK"
+            echo "entrustment, and attachment as a child."
         } >>"${GITHUB_STEP_SUMMARY}"
     fi
 }

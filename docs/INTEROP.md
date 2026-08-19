@@ -17,7 +17,7 @@ it once against a device on the bench" are very different claims:
 
 | Peer | Roles exercised | Assurance | Where |
 | --- | --- | --- | --- |
-| **OpenThread** `v2026.06.0` — posix `ot-daemon` (border agent + leader) + simulated RCP | Commissioner **and** joiner, end to end | Continuous (every PR/push + weekly) | [interop.yml](../.github/workflows/interop.yml), [tools/ci/interop.sh](../tools/ci/interop.sh) |
+| **OpenThread** `v2026.06.0` — posix `ot-daemon` (border agent + leader) + simulated RCP | Commissioner authentication, arbitration, diagnostics, and joiner commissioning | Continuous (every PR/push + weekly) | [interop.yml](../.github/workflows/interop.yml), [tools/ci/interop.sh](../tools/ci/interop.sh) |
 | **Physical Thread border router** (Espressif ESP-Matter) | Commissioner session + dataset/commissioner-dataset reads | Manual, author-run, point-in-time | [tests/live_border_router.rs](../crates/meshcop/tests/live_border_router.rs) |
 | **mbedTLS / OpenSSL / Thread spec / OpenThread** | Crypto primitives + key schedule | Vector (every build) | [VECTORS.md](VECTORS.md) |
 
@@ -26,22 +26,34 @@ it once against a device on the bench" are very different claims:
 The [interop gate](../.github/workflows/interop.yml) builds OpenThread at a
 pinned release (a posix `ot-daemon` border router driven by a simulated RCP over
 forkpty — the arrangement the C++ `ot-commissioner` integration suite uses),
-forms a Thread network, and runs two gated tests against the live border agent
+forms a Thread network, and runs five gated tests against the live border agent
 on loopback:
 
 - **Commissioner session:** DTLS 1.2 + EC J-PAKE handshake (PSKc), `COMM_PET`
   petition, `COMM_KA` keep-alive, `MGMT_ACTIVE_GET` with a full, order-insensitive
   active-dataset comparison against the leader's own view, `MGMT_COMMISSIONER_GET`
   routed through the UDP_TX/UDP_RX proxy to the leader ALOC, and a clean resign.
+- **Authentication failure and recovery:** a commissioner using the wrong PSKc
+  must fail during DTLS authentication, after which a fresh commissioner using
+  the correct PSKc must immediately petition and resign successfully.
+- **Commissioner arbitration:** while one commissioner is active, a second
+  commissioner must receive a petition rejection naming the incumbent. After
+  the incumbent resigns, that same contender must petition successfully.
+- **Network diagnostics:** both unicast `DIAG_GET.req` and asynchronous
+  `DIAG_GET.qry`/`DIAG_GET.ans` exchanges are proxied to the OpenThread leader;
+  their MAC Address, Mode, Route64, and Leader Data TLVs are decoded and
+  required.
 - **Joiner commissioning:** advertise a specific joiner by EUI-64 in the steering
   data (exercising the SHA-256 joiner-ID derivation and Bloom filter against
   OpenThread's own computation), then drive a real simulated `ot-cli-ftd` node
   through the joiner DTLS session over `RLY_RX`/`RLY_TX` (PSKd), `JOIN_FIN`, the
   KEK hand-off to the joiner router, and finally watch it attach to the network.
+  The harness explicitly sets `MESHCOP_MUTATE_OK=1` for this disposable network.
 
 A weekly scheduled run catches drift against OpenThread even when this repo is
 quiet. Reproduce locally on Linux with `tools/ci/interop.sh`. The pinned
-OpenThread ref is the one-line `MESHCOP_INTEROP_OPENTHREAD_REF` in that script.
+OpenThread ref is set through `MESHCOP_INTEROP_OPENTHREAD_REF`; cached binaries
+are reused only after their checked-out commit is verified against that ref.
 
 ## Physical border router — manual, read-only
 

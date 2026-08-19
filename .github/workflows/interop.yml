@@ -22,6 +22,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  MESHCOP_INTEROP_OPENTHREAD_REF: v2026.06.0
   RUST_BACKTRACE: 1
 
 jobs:
@@ -54,7 +55,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /tmp/meshcop-interop/openthread
-          key: openthread-${{ runner.os }}-${{ hashFiles('tools/ci/interop.sh') }}
+          key: openthread-${{ runner.os }}-${{ env.MESHCOP_INTEROP_OPENTHREAD_REF }}-${{ hashFiles('tools/ci/interop.sh') }}
 
       - name: Install build dependencies
         run: |
@@ -64,10 +65,11 @@ jobs:
       - name: Run interop test
         run: tools/ci/interop.sh
 
-      - name: Upload daemon log
+      - name: Upload interop logs
         uses: actions/upload-artifact@v7
         if: failure()
         with:
-          name: ot-daemon-log
-          path: /tmp/meshcop-interop/ot-daemon.log
+          name: interop-logs
+          path: /tmp/meshcop-interop/*.log
           if-no-files-found: warn
+          retention-days: 7

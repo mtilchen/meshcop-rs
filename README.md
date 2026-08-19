@@ -127,15 +127,14 @@ process.
   machines carry negative-path tests, not only happy-path vectors.
 - **Live interop (CI-enforced).** Every change commissions a real OpenThread
   border agent (posix `ot-daemon` at a pinned release, driven by a simulated
-  RCP) via [interop.yml](.github/workflows/interop.yml): the full DTLS 1.2 +
-  EC J-PAKE handshake, petition and keep-alive, a full active-dataset
-  comparison, and a UDP-proxied MGMT_COMMISSIONER_GET against the live
-  leader — then a complete joiner commissioning of a simulated OpenThread
-  node: steering data by EUI-64, the joiner DTLS session over the relay
-  (PSKd), JOIN_FIN, KEK entrustment, and the joiner attaching to the
-  network. A weekly scheduled run catches drift against OpenThread even
-  when this repo is quiet. The full interoperability matrix — and what is
-  verified continuously versus by hand — is in [docs/INTEROP.md](docs/INTEROP.md).
+  RCP) via [interop.yml](.github/workflows/interop.yml): successful and
+  wrong-credential DTLS authentication, commissioner petition/arbitration and
+  takeover, keep-alive, dataset reads, synchronous and asynchronous network
+  diagnostics, and a complete joiner commissioning of a simulated OpenThread
+  node through JOIN_FIN, KEK entrustment, and attachment. A weekly scheduled
+  run catches drift even when this repo is quiet. The full interoperability
+  matrix — and what is verified continuously versus by hand — is in
+  [docs/INTEROP.md](docs/INTEROP.md).
 - **Coverage gates (CI-enforced).** Minimum 80% line, 80% region, and 75%
   function coverage via `cargo-llvm-cov`.
 - **Mutation testing.** `cargo-mutants` runs against the high-risk protocol
