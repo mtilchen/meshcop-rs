@@ -1,7 +1,8 @@
-# ESP32-H2 Thread IPv6 DTLS demo
+# MeshCoP for Rust: ESP32-H2 Thread IPv6 DTLS demo
 
-This firmware forms a real, two-node Thread network and runs this repository's
-`thread-dtls` client and server over OpenThread native IPv6 UDP sockets:
+This firmware forms a real, two-node Thread network and runs the
+`meshcop-dtls` client and server from MeshCoP for Rust over OpenThread native
+IPv6 UDP sockets:
 
 - `role-server` is a router-eligible Full Thread Device (FTD). It installs the
   canned Active Operational Dataset, forms the partition, becomes Leader, and
@@ -12,11 +13,11 @@ This firmware forms a real, two-node Thread network and runs this repository's
 - The client sends `hello N`; the Leader replies with `ack: hello N` over the
   established DTLS session.
 
-This is a commissioner-style session: `thread-dtls` performs its Thread
-PSKc/EC-JPAKE DTLS handshake using the PSKc taken directly from the installed
-dataset. The PSKc, Network Key, derived keys, and raw handshake data are never
-logged. All compiled-in credentials are public, desk-demo credentials and must
-not be reused.
+This is a commissioner-style session: the project's DTLS crate performs its
+Thread PSKc/EC-JPAKE DTLS handshake using the PSKc taken directly from the
+installed dataset. The PSKc, Network Key, derived keys, and raw handshake data
+are never logged. All compiled-in credentials are public, desk-demo credentials
+and must not be reused.
 
 OpenThread supplies the real Thread IPv6, 6LoWPAN, mesh routing, MAC security,
 and device-role machinery. There is no application fragmentation shim and no
@@ -66,7 +67,7 @@ The dataset is encoded as one TLV hex constant in `src/config.rs`. It was
 generated with this repository's own `Dataset` and typed TLV value builders:
 
 ```console
-cargo run -p ot-commissioner-rs --example generate_esp32h2_demo_dataset
+cargo run -p meshcop --example generate_esp32h2_demo_dataset
 ```
 
 Run that command from the repository root. It prints the complete demo dataset,
@@ -74,7 +75,7 @@ including demo-only key material, so do not use its output in production logs.
 
 | Field | Value |
 | --- | --- |
-| Network name | `thread-dtls-demo` |
+| Network name | `meshcop-dtls-demo` |
 | Channel | 15 |
 | PAN ID | `0xd71d` |
 | Extended PAN ID | `02240723d715a10c` |

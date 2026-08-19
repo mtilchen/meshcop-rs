@@ -4,7 +4,7 @@
 
 use serde_json::{Map, Value, json};
 
-use ot_commissioner_rs::{
+use meshcop::{
     dataset::{
         Channel, ChannelMaskEntry, Dataset, SecurityPolicy, SecurityPolicyFlags,
         TLV_ACTIVE_TIMESTAMP, TLV_CHANNEL, TLV_CHANNEL_MASK, TLV_DELAY_TIMER, TLV_EXTENDED_PAN_ID,
@@ -309,8 +309,8 @@ pub fn dump(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ot_commissioner_rs::dataset::{TLV_NETWORK_NAME, TLV_PAN_ID};
-    use ot_commissioner_rs::meshcop::TLV_BORDER_AGENT_LOCATOR;
+    use meshcop::dataset::{TLV_NETWORK_NAME, TLV_PAN_ID};
+    use meshcop::meshcop::TLV_BORDER_AGENT_LOCATOR;
 
     #[test]
     fn timestamp_round_trips_through_cpp_object() {

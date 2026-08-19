@@ -352,6 +352,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
+name = "meshcop"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "argh",
+ "cmac",
+ "hex",
+ "meshcop-dtls",
+ "rand_core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "meshcop-dtls"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "ccm",
+ "embedded-hal-async",
+ "embedded-io",
+ "embedded-nal-async",
+ "hex",
+ "hmac",
+ "p256",
+ "rand_core",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "meshcop-netdiag"
+version = "0.1.0"
+dependencies = [
+ "argh",
+ "hex",
+ "meshcop",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -373,41 +423,11 @@ name = "ot-commissioner-cli"
 version = "0.1.0"
 dependencies = [
  "hex",
- "ot-commissioner-rs",
+ "meshcop",
  "serde",
  "serde_json",
  "tokio",
  "zeroize",
-]
-
-[[package]]
-name = "ot-commissioner-rs"
-version = "0.1.0"
-dependencies = [
- "aes",
- "argh",
- "cmac",
- "hex",
- "rand_core",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "thread-dtls",
- "tokio",
- "zeroize",
-]
-
-[[package]]
-name = "ot-netdiag"
-version = "0.1.0"
-dependencies = [
- "argh",
- "hex",
- "ot-commissioner-rs",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]
@@ -584,26 +604,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "thread-dtls"
-version = "0.1.0"
-dependencies = [
- "aes",
- "ccm",
- "embedded-hal-async",
- "embedded-io",
- "embedded-nal-async",
- "hex",
- "hmac",
- "p256",
- "rand_core",
- "sha2",
- "subtle",
- "thiserror",
- "tokio",
- "zeroize",
 ]
 
 [[package]]

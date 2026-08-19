@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use ot_commissioner_rs::meshcop::NetDiagData;
+use meshcop::meshcop::NetDiagData;
 
 // DIAG_GET.ans payload decoding: nested network-diagnostic TLVs including
 // Route64, Child Table, Connectivity, and Thread Network Data prefix

@@ -1,6 +1,6 @@
 [package]
 name = "ot-commissioner-cli"
-description = "The ot-commissioner-rs interactive REPL: a faithful reimplementation of the C++ ot-commissioner CLI"
+description = "A faithful Rust port of the C++ ot-commissioner CLI, built on MeshCoP for Rust"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,11 +10,11 @@ license.workspace = true
 [[bin]]
 name = "ot-commissioner-rs"
 path = "src/main.rs"
-# Its normalized rustdoc name collides with the library crate in workspace docs.
+# This compatibility CLI is executable-facing and has no standalone rustdoc surface.
 doc = false
 
 [dependencies]
-ot-commissioner-rs.workspace = true
+meshcop.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,5 +22,5 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-ot-commissioner-rs = { workspace = true, features = ["test-support"] }
+meshcop = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

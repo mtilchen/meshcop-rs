@@ -5,7 +5,7 @@ name: Interop
 #
 # The weekly run catches drift against OpenThread even when this repo is
 # quiet. Bumping the pinned OpenThread ref is a deliberate one-line change in
-# tools/ci/interop.sh (OT_INTEROP_OPENTHREAD_REF).
+# tools/ci/interop.sh (MESHCOP_INTEROP_OPENTHREAD_REF).
 
 on:
   pull_request:
@@ -53,7 +53,7 @@ jobs:
       - name: Cache OpenThread build
         uses: actions/cache@v5
         with:
-          path: /tmp/ot-rs-interop/openthread
+          path: /tmp/meshcop-interop/openthread
           key: openthread-${{ runner.os }}-${{ hashFiles('tools/ci/interop.sh') }}
 
       - name: Install build dependencies
@@ -69,5 +69,5 @@ jobs:
         if: failure()
         with:
           name: ot-daemon-log
-          path: /tmp/ot-rs-interop/ot-daemon.log
+          path: /tmp/meshcop-interop/ot-daemon.log
           if-no-files-found: warn

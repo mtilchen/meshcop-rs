@@ -22,9 +22,7 @@ impl Interpreter {
                     .get_commissioner_dataset(CommissionerDatasetFlags::BORDER_AGENT_LOCATOR)
                     .await
                 {
-                    Ok(dataset) => match dataset
-                        .raw(ot_commissioner_rs::meshcop::TLV_BORDER_AGENT_LOCATOR)
-                    {
+                    Ok(dataset) => match dataset.raw(meshcop::meshcop::TLV_BORDER_AGENT_LOCATOR) {
                         Some([hi, lo]) => {
                             CommandValue::ok(format!("0x{:04x}", u16::from_be_bytes([*hi, *lo])))
                         }
@@ -105,14 +103,10 @@ impl Interpreter {
                 .get_commissioner_dataset(CommissionerDatasetFlags::JOINER_UDP_PORT)
                 .await
             {
-                Ok(dataset) => {
-                    match dataset.raw(ot_commissioner_rs::meshcop::TLV_JOINER_UDP_PORT) {
-                        Some([hi, lo]) => {
-                            CommandValue::ok(u16::from_be_bytes([*hi, *lo]).to_string())
-                        }
-                        _ => CommandValue::failed("joiner UDP port not present"),
-                    }
-                }
+                Ok(dataset) => match dataset.raw(meshcop::meshcop::TLV_JOINER_UDP_PORT) {
+                    Some([hi, lo]) => CommandValue::ok(u16::from_be_bytes([*hi, *lo]).to_string()),
+                    _ => CommandValue::failed("joiner UDP port not present"),
+                },
                 Err(err) => CommandValue::failed(err.to_string()),
             },
             "setport" => {
@@ -124,7 +118,7 @@ impl Interpreter {
                 };
                 let mut dataset = Dataset::default();
                 dataset.set_raw(
-                    ot_commissioner_rs::meshcop::TLV_JOINER_UDP_PORT,
+                    meshcop::meshcop::TLV_JOINER_UDP_PORT,
                     port.to_be_bytes().to_vec(),
                 );
                 commissioner.set_commissioner_dataset(&dataset).await.into()

@@ -1,9 +1,9 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use thread_dtls::{
-    ContentType, DtlsRecord, HandshakeFragment, HandshakeHeader, HandshakeReassembler,
-    parse_unfragmented_handshake_messages,
+use meshcop_dtls::{
+    parse_unfragmented_handshake_messages, ContentType, DtlsRecord, HandshakeFragment,
+    HandshakeHeader, HandshakeReassembler,
 };
 
 // DTLS handshake framing and reassembly: header/fragment parsing, fragment

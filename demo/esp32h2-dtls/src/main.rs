@@ -28,15 +28,15 @@ use esp_hal::{
 };
 use esp_println::println;
 use esp_radio::ieee802154::Ieee802154;
+#[cfg(feature = "role-client")]
+use meshcop_dtls::DtlsClient;
+#[cfg(feature = "role-server")]
+use meshcop_dtls::DtlsServer;
 use openthread::{
     DeviceRole, OpenThread, OtResources, OtUdpResources, SimpleRamSettings, UdpSocket,
     esp::EspRadio,
 };
 use static_cell::StaticCell;
-#[cfg(feature = "role-client")]
-use thread_dtls::DtlsClient;
-#[cfg(feature = "role-server")]
-use thread_dtls::DtlsServer;
 use tinyrlibc as _;
 
 #[cfg(feature = "role-client")]

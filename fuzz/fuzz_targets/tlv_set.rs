@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use ot_commissioner_rs::tlv::{TlvSet, parse_one};
+use meshcop::tlv::{parse_one, TlvSet};
 
 // Thread TLV decoding: single-entry and full-stream parsing must never panic,
 // and a parsed set must survive an encode/parse round-trip with equal entries.
