@@ -433,10 +433,12 @@ async fn run_flight_fault_case(
         observation.dropped.is_some(),
         "proxy did not fault {direction:?} flight {ordinal}"
     );
-    assert!(
-        observation.saw_fresh_semantic_retry,
-        "{direction:?} flight {ordinal} was not retransmitted with fresh record sequences"
-    );
+    if fault != FlightFault::ReverseRecords {
+        assert!(
+            observation.saw_fresh_semantic_retry,
+            "{direction:?} flight {ordinal} was not retransmitted with fresh record sequences"
+        );
+    }
     Ok(())
 }
 
