@@ -95,7 +95,10 @@ async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()
         FaultTarget::PetitionRequest,
         FaultTarget::PetitionResponse,
     ] {
-        run_packet_loss_case(border_agent, &expected, target).await?;
+        eprintln!("injecting OpenThread fault: {target:?}");
+        run_packet_loss_case(border_agent, &expected, target)
+            .await
+            .map_err(|error| Error::Dataset(format!("{target:?} recovery failed: {error}")))?;
     }
     Ok(())
 }
