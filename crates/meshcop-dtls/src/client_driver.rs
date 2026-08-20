@@ -18,11 +18,11 @@ use crate::{
     util::dtls_trace,
 };
 
-// Both peers normally arm a one-second timer after the cookie ClientHello.
-// Waiting a little longer for the server's cached-flight retransmission avoids
-// racing it with a duplicate ClientHello, while a genuinely lost ClientHello
-// still recovers promptly.
-const SERVER_FLIGHT_INITIAL_TIMEOUT: Duration = Duration::from_millis(1_500);
+// OpenThread's Thread SecureTransport configures an eight-second minimum
+// handshake timeout. Waiting just beyond that peer timer avoids racing its
+// cached server-flight retransmission with a duplicate ClientHello, while a
+// genuinely lost ClientHello still recovers within the absolute deadline.
+const SERVER_FLIGHT_INITIAL_TIMEOUT: Duration = Duration::from_millis(8_500);
 
 /// A runtime-neutral DTLS client before its handshake is run.
 ///

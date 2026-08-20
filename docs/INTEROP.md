@@ -38,10 +38,9 @@ on loopback:
   the correct PSKc must immediately petition and resign successfully.
 - **Packet-loss recovery:** a protocol-aware loopback UDP fault proxy recognizes
   handshake messages rather than assuming fixed packet ordinals. In separate
-  sessions it drops each of the three commissioner and three border-agent
-  flight positions, then the first CoAP petition request and response. A
-  multi-datagram server flight is suppressed in full until the client's retry
-  begins. Every case must still petition and resign against OpenThread.
+  sessions it drops one datagram from each of the three commissioner and three
+  border-agent flight positions, then the first CoAP petition request and
+  response. Every case must still petition and resign against OpenThread.
 - **Commissioner arbitration:** while one commissioner is active, a second
   commissioner must receive a petition rejection naming the incumbent. After
   the incumbent resigns, that same contender must petition successfully.
