@@ -169,6 +169,8 @@ async fn dataset_set_operations_validate_mandatory_tlvs() {
 async fn commissioner_runs_petition_over_a_real_dtls_session() {
     use meshcop_dtls::{ContentType, DtlsRecord, test_support};
 
+    const LOOPBACK_PETITION_TIMEOUT: Duration = Duration::from_secs(5);
+
     let pskc = [0x42u8; 16];
     let border = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let border_addr = border.local_addr().unwrap();
@@ -235,7 +237,10 @@ async fn commissioner_runs_petition_over_a_real_dtls_session() {
         Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr)
             .await
             .unwrap();
-    let petition = commissioner.petition().await.unwrap();
+    let petition = tokio::time::timeout(LOOPBACK_PETITION_TIMEOUT, commissioner.petition())
+        .await
+        .expect("loopback petition timed out")
+        .unwrap();
     assert_eq!(petition.session_id, 0x1234);
     assert_eq!(commissioner.state(), CommissionerState::Active);
     agent.await.expect("agent task panicked");
