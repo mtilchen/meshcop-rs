@@ -168,8 +168,10 @@ form_network() {
         bash -c "sudo '${ot_ctl}' state | grep -q leader"
 }
 
-run_interop_test() {
+run_interop_selection() {
+    local test_filter=${1:-}
     local ba_port dataset_hex
+    local -a cargo_args=(cargo test -p meshcop --test interop_openthread --all-features)
     # Recent OpenThread versions gate the border agent behind a runtime
     # toggle; older ones lack the subcommand and auto-start it instead.
     ctl ba enable || true
@@ -178,7 +180,22 @@ run_interop_test() {
     dataset_hex="$(ctl dataset active -x | grep -o '[0-9a-fA-F]\{16,\}' | head -1)"
     [[ -n "${dataset_hex}" ]] || die "could not read the active dataset"
 
-    echo "Border agent on port ${ba_port}; commissioning..."
+    if [[ -n "${test_filter}" ]]; then
+        echo "Border agent on port ${ba_port}; running ${test_filter}..."
+        cargo_args+=("${test_filter}")
+    else
+        echo "Border agent on port ${ba_port}; commissioning..."
+    fi
+    cargo_args+=(-- --ignored --nocapture --test-threads=1)
+    if [[ -n "${test_filter}" ]]; then
+        cargo_args+=(--exact)
+    else
+        # The observed limitation cases leave this pinned OpenThread peer
+        # unable to accept another commissioner immediately. Each runs below
+        # against a freshly started daemon and newly formed network.
+        cargo_args+=(--skip interop_limit_)
+    fi
+
     # Serial test threads: every live case shares one border agent, which can
     # serve only one active commissioner at a time.
     MESHCOP_TRACE=1 \
@@ -186,8 +203,13 @@ run_interop_test() {
         MESHCOP_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
         MESHCOP_INTEROP_DATASET_HEX="${dataset_hex}" \
         MESHCOP_INTEROP_JOINER_CLI="${ot_cli_ftd}" \
-        cargo test -p meshcop --test interop_openthread --all-features -- \
-        --ignored --nocapture --test-threads=1
+        "${cargo_args[@]}"
+}
+
+restart_network() {
+    stop_daemon
+    start_daemon
+    form_network
 }
 
 write_summary() {
@@ -201,8 +223,9 @@ write_summary() {
             echo "| OpenThread \`${openthread_ref}\` (posix ot-daemon, simulated RCP) | border agent + leader | DTLS/EC-J-PAKE over UDP | ${result} |"
             echo
             echo "Covered: successful and wrong-PSKc DTLS 1.2 + EC J-PAKE handshakes,"
-            echo "recovery after authentication failure, loss of every DTLS flight and"
-            echo "the first CoAP petition request/response, commissioner contention and"
+            echo "recovery after authentication failure, six DTLS/CoAP loss positions,"
+            echo "and explicit sentinels for two pinned key-flight retransmission limits;"
+            echo "commissioner contention and"
             echo "takeover, COMM_PET, COMM_KA, MGMT_ACTIVE_GET (full dataset compare),"
             echo "MGMT_COMMISSIONER_GET and unicast/asynchronous network diagnostics via"
             echo "the UDP_TX/UDP_RX proxy, and resign. Joiner coverage commissions a"
@@ -233,7 +256,13 @@ main() {
     stop_daemon
     phase start-daemon start_daemon
     phase form-network form_network
-    phase interop-test run_interop_test
+    phase interop-test run_interop_selection
+    phase restart-client-finished-limit restart_network
+    phase client-finished-limit run_interop_selection \
+        interop_limit_client_finished_flight_retransmission_is_rejected
+    phase restart-server-handshake-limit restart_network
+    phase server-handshake-limit run_interop_selection \
+        interop_limit_server_handshake_retransmission_is_rejected
     write_summary "✅ passed"
 }
 

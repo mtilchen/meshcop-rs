@@ -26,8 +26,9 @@ it once against a device on the bench" are very different claims:
 The [interop gate](../.github/workflows/interop.yml) builds OpenThread at a
 pinned release (a posix `ot-daemon` border router driven by a simulated RCP over
 forkpty — the arrangement the C++ `ot-commissioner` integration suite uses),
-forms a Thread network, and runs seven gated tests against the live border agent
-on loopback:
+forms a Thread network, and runs eight gated tests against the live border agent
+on loopback. The two limitation sentinels each receive a freshly started daemon
+and newly formed network so a rejected session cannot mask later coverage:
 
 - **Commissioner session:** DTLS 1.2 + EC J-PAKE handshake (PSKc), `COMM_PET`
   petition, `COMM_KA` keep-alive, `MGMT_ACTIVE_GET` with a full, order-insensitive
@@ -39,19 +40,24 @@ on loopback:
 - **Packet-loss recovery:** a protocol-aware loopback UDP fault proxy recognizes
   handshake messages rather than assuming fixed packet ordinals. In separate
   sessions it drops the initial ClientHello, HelloVerifyRequest, cookie-bearing
-  ClientHello, client key-exchange/Finished flight, server Finished flight, and
-  first CoAP petition request and response. Every one of these seven cases must
-  still petition and resign against OpenThread.
-- **Pinned server-flight limitation:** a final sentinel drops OpenThread's
-  ServerHello/key-exchange flight. OpenThread v2026.06.0, whose
+  ClientHello, server Finished flight, and first CoAP petition request and
+  response. Every one of these six cases must still petition and resign against
+  OpenThread.
+- **Pinned key-flight limitations:** one sentinel drops the client's complete
+  key-exchange/ChangeCipherSpec/Finished flight. MeshCoP retransmits the same
+  plaintext handshake messages using fresh record sequences and fresh
+  protection, but OpenThread rejects the retry with fatal `handshake_failure`.
+  The other drops OpenThread's ServerHello/key-exchange flight. OpenThread
+  v2026.06.0, whose
   `SecureTransport` configures an [eight-second minimum DTLS timeout](https://github.com/openthread/openthread/blob/v2026.06.0/src/core/meshcop/secure_transport.cpp#L256),
   retransmits an unchanged logical flight but then rejects the client's
   Finished with fatal `handshake_failure`. CI asserts that exact observed
-  behavior so a future peer change is visible rather than silently skipped.
+  behavior in both cases so a future peer change is visible rather than
+  silently skipped.
   Deterministic MeshCoP-client/MeshCoP-server tests prove successful recovery
-  for the same loss position in both library roles. The evidence localizes the
-  remaining failure to the pinned reference-peer path, but it has not yet been
-  confirmed as an upstream OpenThread or Mbed TLS defect.
+  for the same loss positions. The evidence localizes the remaining failures to
+  the pinned reference-peer path, but they have not yet been confirmed as
+  upstream OpenThread or Mbed TLS defects.
 - **Commissioner arbitration:** while one commissioner is active, a second
   commissioner must receive a petition rejection naming the incumbent. After
   the incumbent resigns, that same contender must petition successfully.

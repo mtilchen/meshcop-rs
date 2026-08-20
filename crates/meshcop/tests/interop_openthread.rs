@@ -14,11 +14,12 @@
 //!
 //! A protocol-aware loopback UDP fault proxy also drops one datagram from each
 //! DTLS handshake flight position and the first confirmable CoAP
-//! request/response once. Seven positions recover against OpenThread. A final
-//! test pins an observed OpenThread v2026.06.0 limitation: after its server
-//! handshake flight is dropped, OpenThread retransmits the same logical flight
-//! but rejects the client's Finished. Deterministic in-process tests cover
-//! successful recovery at that position for both MeshCoP roles.
+//! request/response once. Six positions recover against OpenThread. Two tests
+//! pin observed OpenThread v2026.06.0 limitations around the remaining
+//! key-exchange flights. The CI harness gives each limitation a fresh daemon
+//! because the rejected handshake temporarily prevents another commissioner
+//! session. Deterministic in-process tests cover successful recovery at both
+//! positions for the MeshCoP roles.
 //!
 //! The dataset for this network is disposable CI test data (the fixed vectors
 //! from the C++ `ot-commissioner` integration suite), but the test still never
@@ -87,6 +88,7 @@ enum FaultTarget {
 #[derive(Default)]
 struct FaultObservation {
     dropped: AtomicBool,
+    client_finished_retry_fresh: AtomicBool,
     server_handshake_retry_unchanged: AtomicBool,
 }
 
@@ -98,7 +100,6 @@ async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()
         FaultTarget::InitialClientHello,
         FaultTarget::HelloVerifyRequest,
         FaultTarget::CookieClientHello,
-        FaultTarget::ClientFinished,
         FaultTarget::ServerFinished,
         FaultTarget::PetitionRequest,
         FaultTarget::PetitionResponse,
@@ -113,17 +114,33 @@ async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()
 
 #[tokio::test]
 #[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
-// Keep this alphabetically last: the observed failure leaves this pinned
-// OpenThread border agent unable to accept another commissioner immediately.
-async fn interop_z_openthread_server_handshake_retransmission_limit() -> meshcop::Result<()> {
+async fn interop_limit_client_finished_flight_retransmission_is_rejected() -> meshcop::Result<()> {
+    let (border_agent, expected) = interop_inputs()?;
+    let error = run_packet_loss_case(border_agent, &expected, FaultTarget::ClientFinished)
+        .await
+        .expect_err(
+            "update this limitation test when OpenThread accepts the retransmitted client Finished flight",
+        );
+    assert_observed_handshake_failure(&error, "client Finished flight");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
+async fn interop_limit_server_handshake_retransmission_is_rejected() -> meshcop::Result<()> {
     let (border_agent, expected) = interop_inputs()?;
     let error = run_packet_loss_case(border_agent, &expected, FaultTarget::ServerHandshake)
         .await
         .expect_err(
             "update this limitation test when OpenThread accepts a client Finished after retransmitting its server handshake",
         );
+    assert_observed_handshake_failure(&error, "server handshake flight");
+    Ok(())
+}
+
+fn assert_observed_handshake_failure(error: &Error, flight: &str) {
     let is_observed_failure = matches!(
-        &error,
+        error,
         Error::Dtls(meshcop_dtls::Error::Crypto(message))
             if message.contains("DTLS alert")
                 && message.contains("level=2")
@@ -131,9 +148,8 @@ async fn interop_z_openthread_server_handshake_retransmission_limit() -> meshcop
     );
     assert!(
         is_observed_failure,
-        "OpenThread's server-handshake retransmission behavior changed: {error}"
+        "OpenThread's {flight} retransmission behavior changed: {error}"
     );
-    Ok(())
 }
 
 async fn run_packet_loss_case(
@@ -175,6 +191,15 @@ async fn run_packet_loss_case(
             "OpenThread did not retransmit the unchanged logical server handshake",
         ));
     }
+    if target == FaultTarget::ClientFinished
+        && !observation
+            .client_finished_retry_fresh
+            .load(Ordering::Relaxed)
+    {
+        return Err(Error::InvalidState(
+            "client Finished flight retry did not use fresh record sequences and protection",
+        ));
+    }
     petition?;
     resign?;
     Ok(())
@@ -187,7 +212,7 @@ async fn run_fault_proxy(
     observation: Arc<FaultObservation>,
 ) -> meshcop::Result<()> {
     let mut commissioner_addr = None;
-    let mut dropped_server_handshake = None;
+    let mut dropped_flight = None;
     let mut buffer = [0u8; meshcop_dtls::driver::MAX_DATAGRAM_SIZE];
     loop {
         let (length, source) = socket.recv_from(&mut buffer).await?;
@@ -208,12 +233,27 @@ async fn run_fault_proxy(
         let observed = classify_fault_target(&buffer[..length], from_commissioner);
         if observed == Some(target) {
             if !observation.dropped.swap(true, Ordering::Relaxed) {
-                if target == FaultTarget::ServerHandshake {
-                    dropped_server_handshake = server_handshake_messages(&buffer[..length]);
+                if matches!(
+                    target,
+                    FaultTarget::ClientFinished | FaultTarget::ServerHandshake
+                ) {
+                    dropped_flight = Some(buffer[..length].to_vec());
                 }
                 continue;
             }
+            if target == FaultTarget::ClientFinished {
+                let fresh = dropped_flight.as_deref().is_some_and(|dropped| {
+                    client_finished_retry_is_fresh(dropped, &buffer[..length])
+                });
+                observation
+                    .client_finished_retry_fresh
+                    .fetch_or(fresh, Ordering::Relaxed);
+                eprintln!("client Finished flight retry uses fresh protection: {fresh}");
+            }
             if target == FaultTarget::ServerHandshake {
+                let dropped_server_handshake = dropped_flight
+                    .as_deref()
+                    .and_then(server_handshake_messages);
                 let retransmitted = server_handshake_messages(&buffer[..length]);
                 let unchanged = dropped_server_handshake
                     .as_ref()
@@ -221,7 +261,7 @@ async fn run_fault_proxy(
                     .is_some_and(|(dropped, retransmitted)| dropped == retransmitted);
                 observation
                     .server_handshake_retry_unchanged
-                    .store(unchanged, Ordering::Relaxed);
+                    .fetch_or(unchanged, Ordering::Relaxed);
                 eprintln!(
                     "OpenThread retransmitted an unchanged logical server handshake: {}",
                     unchanged
@@ -230,6 +270,26 @@ async fn run_fault_proxy(
         }
         socket.send_to(&buffer[..length], destination).await?;
     }
+}
+
+fn client_finished_retry_is_fresh(dropped: &[u8], retransmitted: &[u8]) -> bool {
+    let (Ok(dropped), Ok(retransmitted)) = (
+        meshcop_dtls::DtlsRecord::parse_datagram(dropped),
+        meshcop_dtls::DtlsRecord::parse_datagram(retransmitted),
+    ) else {
+        return false;
+    };
+    dropped.len() == retransmitted.len()
+        && dropped.iter().zip(retransmitted).all(|(before, after)| {
+            before.header.epoch == after.header.epoch
+                && before.header.content_type == after.header.content_type
+                && before.header.sequence_number != after.header.sequence_number
+                && if before.header.epoch == 0 {
+                    before.payload == after.payload
+                } else {
+                    before.payload != after.payload
+                }
+        })
 }
 
 fn server_handshake_messages(datagram: &[u8]) -> Option<Vec<meshcop_dtls::HandshakeMessage>> {
