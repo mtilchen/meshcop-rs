@@ -47,6 +47,12 @@ use crate::{
 pub const MAX_DATAGRAM_SIZE: usize = 4096;
 
 pub(crate) const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(test))]
+const DRIVER_INITIAL_RETRANSMIT_TIMEOUT: Duration = INITIAL_RETRANSMIT_TIMEOUT;
+// Loopback state-machine tests exercise the same timer/backoff transitions at
+// a smaller scale so mutation runs do not spend seconds sleeping per mutant.
+#[cfg(test)]
+const DRIVER_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_DUPLICATE_RETRANSMISSIONS: u8 = 4;
 
@@ -101,8 +107,13 @@ pub(crate) struct RetransmitSchedule {
 impl RetransmitSchedule {
     pub(crate) const fn new() -> Self {
         Self {
-            timeout: INITIAL_RETRANSMIT_TIMEOUT,
+            timeout: DRIVER_INITIAL_RETRANSMIT_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    const fn with_initial(timeout: Duration) -> Self {
+        Self { timeout }
     }
 
     pub(crate) const fn timeout(self) -> Duration {
@@ -850,7 +861,7 @@ mod tests {
 
     #[test]
     fn retransmit_schedule_doubles_and_caps_at_sixty_seconds() {
-        let mut schedule = RetransmitSchedule::new();
+        let mut schedule = RetransmitSchedule::with_initial(INITIAL_RETRANSMIT_TIMEOUT);
         let expected = [1, 2, 4, 8, 16, 32, 60, 60];
         for seconds in expected {
             assert_eq!(schedule.timeout(), Duration::from_secs(seconds));
