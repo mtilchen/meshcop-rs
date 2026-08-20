@@ -39,26 +39,14 @@ cannot mask later coverage:
   must fail during DTLS authentication, after which a fresh commissioner using
   the correct PSKc must immediately petition and resign successfully.
 - **Packet-loss recovery:** a protocol-aware loopback UDP fault proxy recognizes
-  handshake messages rather than assuming fixed packet ordinals. In separate
-  sessions it drops the initial ClientHello, HelloVerifyRequest, cookie-bearing
-  ClientHello, server Finished flight, and first CoAP petition request and
-  response. Every one of these six cases must still petition and resign against
-  OpenThread.
-- **Pinned key-flight limitations:** one sentinel drops the client's complete
-  key-exchange/ChangeCipherSpec/Finished flight. MeshCoP retransmits the same
-  plaintext handshake messages using fresh record sequences and fresh
-  protection, but OpenThread rejects the retry with fatal `handshake_failure`.
-  The other drops OpenThread's ServerHello/key-exchange flight. OpenThread
-  v2026.06.0, whose
-  `SecureTransport` configures an [eight-second minimum DTLS timeout](https://github.com/openthread/openthread/blob/v2026.06.0/src/core/meshcop/secure_transport.cpp#L256),
-  retransmits an unchanged logical flight but then rejects the client's
-  Finished with fatal `handshake_failure`. CI asserts that exact observed
-  behavior in both cases so a future peer change is visible rather than
-  silently skipped.
-  Deterministic MeshCoP-client/MeshCoP-server tests prove successful recovery
-  for the same loss positions. The evidence localizes the remaining failures to
-  the pinned reference-peer path, but they have not yet been confirmed as
-  upstream OpenThread or Mbed TLS defects.
+  handshake messages rather than assuming fixed packet ordinals. In eight
+  separately formed networks it drops the initial ClientHello,
+  HelloVerifyRequest, cookie-bearing ClientHello, server key-exchange flight,
+  client key-exchange/Finished flight, server Finished flight, and first CoAP
+  petition request and response. Every case must still petition and resign
+  against OpenThread. The proxy additionally proves that the client Finished
+  retry uses fresh record sequences and protection, and that OpenThread's
+  server-flight retry retains the same logical handshake messages.
 - **Commissioner arbitration:** while one commissioner is active, a second
   commissioner must receive a petition rejection naming the incumbent. After
   the incumbent resigns, that same contender must petition successfully.

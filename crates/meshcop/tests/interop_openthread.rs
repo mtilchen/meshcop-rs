@@ -16,12 +16,9 @@
 //!
 //! A protocol-aware loopback UDP fault proxy also drops one datagram from each
 //! DTLS handshake flight position and the first confirmable CoAP
-//! request/response once. Six positions recover against OpenThread. Two tests
-//! pin observed OpenThread v2026.06.0 limitations around the remaining
-//! key-exchange flights. The CI harness gives every fault scenario a fresh
-//! daemon and Thread network, preventing session cleanup or a rejected
-//! handshake from affecting another result. Deterministic in-process tests
-//! cover successful recovery at both limited positions for the MeshCoP roles.
+//! request/response once. All eight positions recover against OpenThread. The
+//! CI harness gives every fault scenario a fresh daemon and Thread network,
+//! preventing border-agent session cleanup from affecting another result.
 //!
 //! The dataset for this network is disposable CI test data (the fixed vectors
 //! from the C++ `ot-commissioner` integration suite), but the test still never
@@ -102,6 +99,8 @@ async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()
         FaultTarget::InitialClientHello,
         FaultTarget::HelloVerifyRequest,
         FaultTarget::CookieClientHello,
+        FaultTarget::ServerHandshake,
+        FaultTarget::ClientFinished,
         FaultTarget::ServerFinished,
         FaultTarget::PetitionRequest,
         FaultTarget::PetitionResponse,
@@ -127,51 +126,13 @@ fn parse_recovery_fault_target(value: &str) -> Option<FaultTarget> {
         "initial-client-hello" => Some(FaultTarget::InitialClientHello),
         "hello-verify-request" => Some(FaultTarget::HelloVerifyRequest),
         "cookie-client-hello" => Some(FaultTarget::CookieClientHello),
+        "server-handshake" => Some(FaultTarget::ServerHandshake),
+        "client-finished" => Some(FaultTarget::ClientFinished),
         "server-finished" => Some(FaultTarget::ServerFinished),
         "petition-request" => Some(FaultTarget::PetitionRequest),
         "petition-response" => Some(FaultTarget::PetitionResponse),
         _ => None,
     }
-}
-
-#[tokio::test]
-#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
-async fn interop_limit_client_finished_flight_retransmission_is_rejected() -> meshcop::Result<()> {
-    let (border_agent, expected) = interop_inputs()?;
-    let error = run_packet_loss_case(border_agent, &expected, FaultTarget::ClientFinished)
-        .await
-        .expect_err(
-            "update this limitation test when OpenThread accepts the retransmitted client Finished flight",
-        );
-    assert_observed_handshake_failure(&error, "client Finished flight");
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
-async fn interop_limit_server_handshake_retransmission_is_rejected() -> meshcop::Result<()> {
-    let (border_agent, expected) = interop_inputs()?;
-    let error = run_packet_loss_case(border_agent, &expected, FaultTarget::ServerHandshake)
-        .await
-        .expect_err(
-            "update this limitation test when OpenThread accepts a client Finished after retransmitting its server handshake",
-        );
-    assert_observed_handshake_failure(&error, "server handshake flight");
-    Ok(())
-}
-
-fn assert_observed_handshake_failure(error: &Error, flight: &str) {
-    let is_observed_failure = matches!(
-        error,
-        Error::Dtls(meshcop_dtls::Error::Crypto(message))
-            if message.contains("DTLS alert")
-                && message.contains("level=2")
-                && message.contains("description=40")
-    );
-    assert!(
-        is_observed_failure,
-        "OpenThread's {flight} retransmission behavior changed: {error}"
-    );
 }
 
 async fn run_packet_loss_case(

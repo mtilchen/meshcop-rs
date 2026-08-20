@@ -46,6 +46,8 @@ readonly RECOVERY_FAULT_TARGETS=(
     initial-client-hello
     hello-verify-request
     cookie-client-hello
+    server-handshake
+    client-finished
     server-finished
     petition-request
     petition-response
@@ -201,7 +203,7 @@ run_interop_selection() {
     else
         # Fault cases run below against separate, freshly formed networks so
         # peer session cleanup cannot affect the following scenario.
-        cargo_args+=(--skip interop_limit_ --skip interop_packet_loss_)
+        cargo_args+=(--skip interop_packet_loss_)
     fi
 
     # Serial test threads: every live case shares one border agent, which can
@@ -232,8 +234,8 @@ write_summary() {
             echo "| OpenThread \`${openthread_ref}\` (posix ot-daemon, simulated RCP) | border agent + leader | DTLS/EC-J-PAKE over UDP | ${result} |"
             echo
             echo "Covered: successful and wrong-PSKc DTLS 1.2 + EC J-PAKE handshakes,"
-            echo "recovery after authentication failure, six DTLS/CoAP loss positions,"
-            echo "and explicit sentinels for two pinned key-flight retransmission limits;"
+            echo "recovery after authentication failure and all eight DTLS/CoAP loss"
+            echo "positions, each isolated in a fresh daemon and Thread network;"
             echo "commissioner contention and"
             echo "takeover, COMM_PET, COMM_KA, MGMT_ACTIVE_GET (full dataset compare),"
             echo "MGMT_COMMISSIONER_GET and unicast/asynchronous network diagnostics via"
@@ -272,12 +274,6 @@ main() {
         phase "fault-${fault_target}" run_interop_selection \
             interop_packet_loss_recovery_against_openthread "${fault_target}"
     done
-    phase restart-client-finished-limit restart_network
-    phase client-finished-limit run_interop_selection \
-        interop_limit_client_finished_flight_retransmission_is_rejected
-    phase restart-server-handshake-limit restart_network
-    phase server-handshake-limit run_interop_selection \
-        interop_limit_server_handshake_retransmission_is_rejected
     write_summary "✅ passed"
 }
 
