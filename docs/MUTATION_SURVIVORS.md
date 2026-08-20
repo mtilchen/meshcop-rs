@@ -14,6 +14,11 @@ each one; every other viable mutant must be killed by the test suite.
   set bit zero, and retain the same newest sequence. For `| 1` → `^ 1`, the
   slide arm has a shift of at least one, so bit zero is clear before the
   operation and OR and XOR produce the same value.
+- `crates/meshcop/src/commissioner/joiner.rs`
+  `JoinerReplayWindow::mark_seen`, `>` → `>=` and `| 1` → `^ 1`, for the same
+  zero-shift and known-clear-bit reasons as the generic DTLS replay window.
+  This small window stays crate-private rather than expanding
+  `meshcop-dtls`'s public API for one commissioner-only consumer.
 - `crates/meshcop/src/meshcop/diag/decode.rs`
   `decode_child_table`, `<< 8 | low` → `<< 8 ^ low`. The 9th child-ID bit
   (`<< 8`) and the low byte occupy disjoint bit ranges, so `|` and `^` produce

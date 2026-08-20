@@ -2,6 +2,7 @@
 //! UDP_TX/UDP_RX proxy encapsulation with ALOC addressing.
 
 use std::net::Ipv6Addr;
+use std::time::Duration;
 
 use crate::{
     Result,
@@ -10,12 +11,59 @@ use crate::{
     meshcop::{self, CommissionerOperation},
 };
 use meshcop_dtls::DtlsSession;
+use rand_core::RngCore;
 
 use super::super::types::{CommissionerEvent, CommissionerState, DatasetFlags};
 use super::{
-    Commissioner, DTLS_HANDSHAKE_TIMEOUT, MESHCOP_TIMEOUT, MeshcopRoute, aloc_address,
+    COAP_EXCHANGE_TIMEOUT, Commissioner, DTLS_HANDSHAKE_TIMEOUT, MeshcopRoute, aloc_address,
     check_state_response, commissioner_trace,
 };
+
+const COAP_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+const COAP_ACK_RANDOM_WINDOW_MILLIS: u64 = 1_000;
+// Two retries always fit the 12-second MeshCoP operation deadline with the
+// RFC 7252 randomized 2-3 second initial timeout and its doubled successor.
+const COAP_MAX_RETRANSMIT: u8 = 2;
+
+#[derive(Debug, Clone, Copy)]
+struct CoapRetransmitSchedule {
+    timeout: Duration,
+    retransmissions: u8,
+}
+
+impl CoapRetransmitSchedule {
+    fn randomized(rng: &mut impl RngCore) -> Self {
+        let jitter = u64::from(rng.next_u32()) % (COAP_ACK_RANDOM_WINDOW_MILLIS + 1);
+        Self::new(COAP_ACK_TIMEOUT + Duration::from_millis(jitter))
+    }
+
+    const fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            retransmissions: 0,
+        }
+    }
+
+    const fn timeout(self) -> Option<Duration> {
+        if self.retransmissions < COAP_MAX_RETRANSMIT {
+            Some(self.timeout)
+        } else {
+            None
+        }
+    }
+
+    fn record_retransmission(&mut self) {
+        self.retransmissions = self.retransmissions.saturating_add(1);
+        self.timeout = self.timeout.saturating_mul(2);
+    }
+}
+
+#[derive(Debug)]
+enum IncomingOutcome {
+    Response(meshcop::CoapMessage),
+    Acknowledged,
+    Continue,
+}
 
 impl Commissioner {
     /// Returns the cached mesh-local prefix, fetching it from the active
@@ -167,12 +215,26 @@ impl Commissioner {
                         "scripted MeshCoP exchange did not produce a response",
                     ));
                 };
-                if let Some(response) = self.handle_incoming(Some(&request), &message).await? {
+                if let IncomingOutcome::Response(response) =
+                    self.route_incoming(Some(&request), &message).await?
+                {
                     return Ok(Some(response));
                 }
             }
         }
 
+        Box::pin(self.execute_live(operation, request, wire_message, route, wait_for_response))
+            .await
+    }
+
+    async fn execute_live(
+        &mut self,
+        operation: CommissionerOperation,
+        request: meshcop::CoapMessage,
+        wire_message: meshcop::CoapMessage,
+        route: MeshcopRoute,
+        wait_for_response: bool,
+    ) -> Result<Option<meshcop::CoapMessage>> {
         self.ensure_dtls_session().await?;
         let wire = wire_message.encode()?;
         self.send_application_data(&wire).await?;
@@ -180,45 +242,120 @@ impl Commissioner {
             return Ok(None);
         }
 
-        with_meshcop_exchange_timeout(async {
-            loop {
-                let response_wire = self.recv_application_data().await?;
-                let message = meshcop::CoapMessage::decode(&response_wire)?;
-                commissioner_trace(format_args!(
-                    "recv {} mid={} type={:?} code=0x{:02x} token={}",
-                    operation.label(),
-                    message.message_id,
-                    message.ty,
-                    message.code.0,
-                    hex::encode(&message.token)
-                ));
-                if let Some(response) = self.handle_incoming(Some(&request), &message).await? {
-                    return Ok(Some(response));
-                }
-            }
-        })
+        let retransmit = (request.ty == meshcop::CoapType::Confirmable).then(|| {
+            let mut rng = rand_core::OsRng;
+            CoapRetransmitSchedule::randomized(&mut rng)
+        });
+        with_meshcop_exchange_timeout(Box::pin(
+            self.wait_for_response(operation, &request, &wire, route, retransmit),
+        ))
         .await
+    }
+
+    async fn wait_for_response(
+        &mut self,
+        operation: CommissionerOperation,
+        request: &meshcop::CoapMessage,
+        wire: &[u8],
+        route: MeshcopRoute,
+        mut retransmit: Option<CoapRetransmitSchedule>,
+    ) -> Result<Option<meshcop::CoapMessage>> {
+        let mut retry_at = retransmit
+            .and_then(CoapRetransmitSchedule::timeout)
+            .map(|timeout| tokio::time::Instant::now() + timeout);
+        loop {
+            let response_wire = if let Some(deadline) = retry_at {
+                tokio::select! {
+                    response = self.recv_application_data() => response?,
+                    () = tokio::time::sleep_until(deadline) => {
+                        let retransmission = self.retransmission_wire(request, wire, route)?;
+                        self.send_application_data(&retransmission).await?;
+                        let schedule = retransmit
+                            .as_mut()
+                            .ok_or(Error::InvalidState("CoAP retransmission schedule is missing"))?;
+                        schedule.record_retransmission();
+                        retry_at = schedule
+                            .timeout()
+                            .map(|timeout| tokio::time::Instant::now() + timeout);
+                        commissioner_trace(format_args!(
+                            "retransmit {} mid={} attempt={}",
+                            operation.label(),
+                            request.message_id,
+                            schedule.retransmissions
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                self.recv_application_data().await?
+            };
+            let message = meshcop::CoapMessage::decode(&response_wire)?;
+            commissioner_trace(format_args!(
+                "recv {} mid={} type={:?} code=0x{:02x} token={}",
+                operation.label(),
+                message.message_id,
+                message.ty,
+                message.code.0,
+                hex::encode(&message.token)
+            ));
+            match self.route_incoming(Some(request), &message).await? {
+                IncomingOutcome::Response(response) => return Ok(Some(response)),
+                IncomingOutcome::Acknowledged => retry_at = None,
+                IncomingOutcome::Continue => {}
+            }
+        }
+    }
+
+    fn retransmission_wire(
+        &mut self,
+        request: &meshcop::CoapMessage,
+        initial_wire: &[u8],
+        route: MeshcopRoute,
+    ) -> Result<Vec<u8>> {
+        match route {
+            MeshcopRoute::Direct => Ok(initial_wire.to_vec()),
+            MeshcopRoute::Proxied {
+                destination,
+                destination_port,
+            } => {
+                let inner = request.encode()?;
+                let (message_id, token) = self.next_request_identity();
+                meshcop::udp_tx_request(message_id, token, destination, destination_port, &inner)?
+                    .encode()
+            }
+        }
     }
 
     /// Routes one incoming message.
     ///
     /// When `expected` is set and `incoming` answers that request (directly or
     /// through a UDP_RX encapsulation), the response is returned. Unsolicited
-    /// notifications are converted to queued events. Unexpected direct
-    /// messages fail the exchange; unmatched proxied messages are dropped the
-    /// way the reference implementation drops unmatched proxy traffic.
+    /// notifications are converted to queued events. Unmatched direct and
+    /// proxied messages are dropped so delayed duplicate responses cannot
+    /// poison a later exchange.
     pub(super) async fn handle_incoming(
         &mut self,
         expected: Option<&meshcop::CoapMessage>,
         incoming: &meshcop::CoapMessage,
     ) -> Result<Option<meshcop::CoapMessage>> {
+        match self.route_incoming(expected, incoming).await? {
+            IncomingOutcome::Response(response) => Ok(Some(response)),
+            IncomingOutcome::Acknowledged | IncomingOutcome::Continue => Ok(None),
+        }
+    }
+
+    async fn route_incoming(
+        &mut self,
+        expected: Option<&meshcop::CoapMessage>,
+        incoming: &meshcop::CoapMessage,
+    ) -> Result<IncomingOutcome> {
         let udp_rx = match meshcop::parse_udp_rx(incoming) {
             Ok(udp_rx) => udp_rx,
             Err(err) => {
                 // A peer on the mesh controls UDP_RX contents; drop malformed
                 // encapsulations instead of failing the commissioner exchange.
                 commissioner_trace(format_args!("drop malformed UDP_RX: {err}"));
-                return Ok(None);
+                return Ok(IncomingOutcome::Continue);
             }
         };
         if let Some(udp_rx) = udp_rx {
@@ -227,18 +364,18 @@ impl Commissioner {
                     "drop UDP_RX for unsupported port {}",
                     udp_rx.destination_port
                 ));
-                return Ok(None);
+                return Ok(IncomingOutcome::Continue);
             }
             let inner = match meshcop::CoapMessage::decode(&udp_rx.payload) {
                 Ok(inner) => inner,
                 Err(err) => {
                     commissioner_trace(format_args!("drop undecodable proxied datagram: {err}"));
-                    return Ok(None);
+                    return Ok(IncomingOutcome::Continue);
                 }
             };
             if let Some(request) = expected {
                 if inner.is_empty_ack_for(request.message_id) {
-                    return Ok(None);
+                    return Ok(IncomingOutcome::Acknowledged);
                 }
                 if inner.token == request.token {
                     if inner.ty == meshcop::CoapType::Confirmable {
@@ -248,45 +385,56 @@ impl Commissioner {
                         )
                         .await?;
                     }
-                    return Ok(Some(inner));
+                    return Ok(IncomingOutcome::Response(inner));
                 }
             }
             if self.route_unsolicited_proxied(&inner, &udp_rx).await? {
-                return Ok(None);
+                return Ok(IncomingOutcome::Continue);
             }
             commissioner_trace(format_args!(
                 "drop unmatched proxied message mid={} token={}",
                 inner.message_id,
                 hex::encode(&inner.token)
             ));
-            return Ok(None);
+            return Ok(IncomingOutcome::Continue);
         }
 
         if let Some(request) = expected {
             if incoming.is_empty_ack_for(request.message_id) {
-                return Ok(None);
+                return Ok(IncomingOutcome::Acknowledged);
             }
             if incoming.token == request.token {
                 self.ack_if_confirmable(incoming).await?;
-                return Ok(Some(incoming.clone()));
+                return Ok(IncomingOutcome::Response(incoming.clone()));
             }
         }
         if self.route_unsolicited_message(incoming).await? {
             self.ack_if_confirmable(incoming).await?;
-            return Ok(None);
+            return Ok(IncomingOutcome::Continue);
         }
         match expected {
-            Some(_) => Err(Error::InvalidState("CoAP response token mismatch")),
-            None => Ok(None),
+            Some(_) => {
+                commissioner_trace(format_args!(
+                    "drop unmatched direct message mid={} token={}",
+                    incoming.message_id,
+                    hex::encode(&incoming.token)
+                ));
+                Ok(IncomingOutcome::Continue)
+            }
+            None => Ok(IncomingOutcome::Continue),
         }
     }
 
     async fn ensure_dtls_session(&mut self) -> Result<()> {
         if self.dtls_session.is_none() {
             let session = with_dtls_handshake_timeout(async {
-                DtlsSession::connect(&self.socket, self.config.pskc.as_bytes(), MESHCOP_TIMEOUT)
-                    .await
-                    .map_err(Error::from)
+                DtlsSession::connect(
+                    &self.socket,
+                    self.config.pskc.as_bytes(),
+                    DTLS_HANDSHAKE_TIMEOUT,
+                )
+                .await
+                .map_err(Error::from)
             })
             .await?;
             self.dtls_session = Some(session);
@@ -322,7 +470,7 @@ impl Commissioner {
             .as_mut()
             .ok_or(Error::InvalidState("DTLS session is not established"))?;
         session
-            .recv_application_data(&self.socket, MESHCOP_TIMEOUT)
+            .recv_application_data(&self.socket, COAP_EXCHANGE_TIMEOUT)
             .await
             .map_err(Error::from)
     }
@@ -452,7 +600,7 @@ impl Commissioner {
 async fn with_meshcop_exchange_timeout<T>(
     exchange: impl core::future::Future<Output = Result<T>>,
 ) -> Result<T> {
-    tokio::time::timeout(MESHCOP_TIMEOUT, exchange)
+    tokio::time::timeout(COAP_EXCHANGE_TIMEOUT, exchange)
         .await
         .map_err(|_| Error::Timeout("MeshCoP exchange timed out"))?
 }
@@ -486,6 +634,166 @@ fn require_success_response(response: meshcop::CoapMessage) -> Result<meshcop::C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commissioner::{CommissionerConfig, harness::ScriptedMeshcopTransport};
+    use crate::meshcop::{CoapCode, CoapMessage, CoapType, TLV_UDP_ENCAPSULATION};
+    use crate::tlv::TlvSet;
+    use meshcop_dtls::DtlsServer;
+    use rand_core::Error as RandError;
+
+    struct FixedRng(u32);
+
+    impl RngCore for FixedRng {
+        fn next_u32(&mut self) -> u32 {
+            self.0
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            u64::from(self.0)
+        }
+
+        fn fill_bytes(&mut self, destination: &mut [u8]) {
+            destination.fill(self.0 as u8);
+        }
+
+        fn try_fill_bytes(
+            &mut self,
+            destination: &mut [u8],
+        ) -> core::result::Result<(), RandError> {
+            self.fill_bytes(destination);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn randomized_coap_timeout_spans_the_inclusive_two_to_three_second_window() {
+        let lower = CoapRetransmitSchedule::randomized(&mut FixedRng(0));
+        let upper = CoapRetransmitSchedule::randomized(&mut FixedRng(1_000));
+        assert_eq!(lower.timeout(), Some(Duration::from_secs(2)));
+        assert_eq!(upper.timeout(), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn coap_retransmit_schedule_doubles_and_stops_at_the_exchange_limit() {
+        let mut schedule = CoapRetransmitSchedule::new(Duration::from_secs(2));
+        for expected in [2, 4] {
+            assert_eq!(schedule.timeout(), Some(Duration::from_secs(expected)));
+            schedule.record_retransmission();
+        }
+        assert_eq!(schedule.timeout(), None);
+        assert_eq!(schedule.retransmissions, COAP_MAX_RETRANSMIT);
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_returns_a_matching_direct_response() {
+        let mut commissioner = Commissioner::connect_scripted(
+            CommissionerConfig::pskc("incoming-response", [0x42; 16]),
+            "127.0.0.1:49191".parse().expect("border agent address"),
+            ScriptedMeshcopTransport::new([]),
+            [],
+        )
+        .await
+        .expect("scripted commissioner");
+        let request = CoapMessage {
+            ty: CoapType::Confirmable,
+            code: CoapCode::POST,
+            message_id: 0x1234,
+            token: vec![0x12, 0x34],
+            options: Vec::new(),
+            payload: Vec::new(),
+        };
+        let response = CoapMessage {
+            ty: CoapType::Acknowledgement,
+            code: CoapCode::CHANGED,
+            message_id: request.message_id,
+            token: request.token.clone(),
+            options: Vec::new(),
+            payload: Vec::new(),
+        };
+
+        assert_eq!(
+            commissioner
+                .handle_incoming(Some(&request), &response)
+                .await
+                .expect("route response"),
+            Some(response)
+        );
+    }
+
+    #[tokio::test]
+    async fn proxied_retry_preserves_inner_identity_and_refreshes_outer_identity() {
+        let pskc = [0x42; 16];
+        let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr();
+        let destination: Ipv6Addr = "fd00::1".parse().unwrap();
+        let server_task = async move {
+            let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
+            let first_wire = session
+                .recv_application_data(Duration::from_secs(10))
+                .await
+                .unwrap();
+            let second_wire = session
+                .recv_application_data(Duration::from_secs(5))
+                .await
+                .unwrap();
+            let first = CoapMessage::decode(&first_wire).unwrap();
+            let second = CoapMessage::decode(&second_wire).unwrap();
+            assert_eq!(first.ty, CoapType::NonConfirmable);
+            assert_eq!(second.ty, CoapType::NonConfirmable);
+            assert_ne!(first.message_id, second.message_id);
+            assert_ne!(first.token, second.token);
+
+            let first_inner = proxied_inner_wire(&first);
+            let second_inner = proxied_inner_wire(&second);
+            assert_eq!(first_inner, second_inner);
+            let request = CoapMessage::decode(&first_inner).unwrap();
+            let response = CoapMessage {
+                ty: CoapType::Acknowledgement,
+                code: CoapCode::CHANGED,
+                message_id: request.message_id,
+                token: request.token,
+                options: Vec::new(),
+                payload: Vec::new(),
+            };
+            let outer = crate::commissioner::harness::udp_rx_message(
+                destination,
+                meshcop::DEFAULT_MM_PORT,
+                meshcop::DEFAULT_MM_PORT,
+                &response.encode().unwrap(),
+            )
+            .unwrap();
+            session
+                .send_application_data(&outer.encode().unwrap())
+                .await
+                .unwrap();
+        };
+
+        let mut commissioner =
+            Commissioner::connect(CommissionerConfig::pskc("proxied-retry", pskc), server_addr)
+                .await
+                .unwrap();
+        let request = CoapMessage::post_request(
+            CoapType::Confirmable,
+            0x1234,
+            [0x12, 0x34],
+            "/test",
+            Vec::new(),
+        )
+        .unwrap();
+        let route = MeshcopRoute::Proxied {
+            destination,
+            destination_port: meshcop::DEFAULT_MM_PORT,
+        };
+        let ((), response) = tokio::join!(
+            server_task,
+            commissioner.execute(CommissionerOperation::Petition, request, route, true)
+        );
+        assert!(response.unwrap().is_some());
+    }
+
+    fn proxied_inner_wire(message: &CoapMessage) -> Vec<u8> {
+        let tlvs = TlvSet::parse(&message.payload).unwrap();
+        tlvs.last_value(TLV_UDP_ENCAPSULATION).unwrap()[4..].to_vec()
+    }
 
     #[tokio::test(start_paused = true)]
     async fn meshcop_exchange_timeout_is_absolute() {
@@ -495,7 +803,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::Timeout("MeshCoP exchange timed out")));
-        assert_eq!(started.elapsed(), MESHCOP_TIMEOUT);
+        assert_eq!(started.elapsed(), COAP_EXCHANGE_TIMEOUT);
     }
 
     #[tokio::test(start_paused = true)]

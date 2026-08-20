@@ -400,13 +400,13 @@ fn commissioner_trace(args: core::fmt::Arguments<'_>) {
     }
 }
 
-/// Timeout applied to each DTLS receive and to an overall MeshCoP response wait.
-const MESHCOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Absolute budget for one CoAP request/response exchange.
+const COAP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
 /// Absolute DTLS handshake budget.
 ///
-/// This leaves five seconds for the petition response after a replacement
-/// commissioner refreshes a session using the minimum 30-second keep-alive
-/// interval.
+/// A caller replacing an active session should begin before its keep-alive
+/// deadline: the handshake has a 20-second budget and its subsequent CoAP
+/// exchange has a 12-second budget.
 const DTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn result_code_from_meshcop_state(state: MeshcopState) -> ResultCode {

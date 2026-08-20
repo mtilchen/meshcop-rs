@@ -169,6 +169,8 @@ async fn dataset_set_operations_validate_mandatory_tlvs() {
 async fn commissioner_runs_petition_over_a_real_dtls_session() {
     use meshcop_dtls::{ContentType, DtlsRecord, test_support};
 
+    const LOOPBACK_PETITION_TIMEOUT: Duration = Duration::from_secs(5);
+
     let pskc = [0x42u8; 16];
     let border = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let border_addr = border.local_addr().unwrap();
@@ -235,10 +237,107 @@ async fn commissioner_runs_petition_over_a_real_dtls_session() {
         Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr)
             .await
             .unwrap();
-    let petition = commissioner.petition().await.unwrap();
+    let petition = tokio::time::timeout(LOOPBACK_PETITION_TIMEOUT, commissioner.petition())
+        .await
+        .expect("loopback petition timed out")
+        .unwrap();
     assert_eq!(petition.session_id, 0x1234);
     assert_eq!(commissioner.state(), CommissionerState::Active);
     agent.await.expect("agent task panicked");
+}
+
+#[tokio::test]
+async fn confirmable_request_is_retransmitted_without_changing_its_coap_identity() {
+    use meshcop_dtls::DtlsServer;
+
+    let pskc = [0x42u8; 16];
+    let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
+    let border_addr = server.local_addr();
+    let server_task = async move {
+        let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
+        let first = session
+            .recv_application_data(Duration::from_secs(10))
+            .await
+            .unwrap();
+        let repeated = session
+            .recv_application_data(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(repeated, first);
+
+        let request = CoapMessage::decode(&repeated).unwrap();
+        let response =
+            petition_accept_response(CoapType::Acknowledgement, request.message_id, request.token);
+        session
+            .send_application_data(&response.encode().unwrap())
+            .await
+            .unwrap();
+    };
+
+    let mut commissioner =
+        Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr)
+            .await
+            .unwrap();
+    let ((), petition) = tokio::join!(server_task, commissioner.petition());
+    assert_eq!(petition.unwrap().session_id, 0x1234);
+}
+
+#[tokio::test]
+async fn empty_ack_stops_retransmission_while_a_separate_response_is_pending() {
+    use meshcop_dtls::{DtlsServer, driver::DriverError};
+
+    let pskc = [0x42u8; 16];
+    let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
+    let border_addr = server.local_addr();
+    let server_task = async move {
+        let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
+        let request_wire = session
+            .recv_application_data(Duration::from_secs(10))
+            .await
+            .unwrap();
+        let request = CoapMessage::decode(&request_wire).unwrap();
+        let ack = CoapMessage::empty_ack(request.message_id);
+        session
+            .send_application_data(&ack.encode().unwrap())
+            .await
+            .unwrap();
+
+        let unexpected = session.recv_application_data(Duration::from_secs(4)).await;
+        assert!(
+            matches!(unexpected, Err(DriverError::Timeout)),
+            "an acknowledged CoAP request must not be retransmitted: {unexpected:?}"
+        );
+
+        let response = petition_accept_response(
+            CoapType::NonConfirmable,
+            request.message_id.wrapping_add(1),
+            request.token,
+        );
+        session
+            .send_application_data(&response.encode().unwrap())
+            .await
+            .unwrap();
+    };
+
+    let mut commissioner =
+        Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr)
+            .await
+            .unwrap();
+    let ((), petition) = tokio::join!(server_task, commissioner.petition());
+    assert_eq!(petition.unwrap().session_id, 0x1234);
+}
+
+fn petition_accept_response(ty: CoapType, message_id: u16, token: Vec<u8>) -> CoapMessage {
+    let mut payload = vec![TLV_STATE, 1, 0x01];
+    payload.extend_from_slice(&[TLV_COMMISSIONER_SESSION_ID, 2, 0x12, 0x34]);
+    CoapMessage {
+        ty,
+        code: CoapCode::CHANGED,
+        message_id,
+        token,
+        options: Vec::new(),
+        payload,
+    }
 }
 
 #[tokio::test]

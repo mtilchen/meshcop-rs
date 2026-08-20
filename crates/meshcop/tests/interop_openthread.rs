@@ -9,8 +9,16 @@
 //!   `ot-ctl dataset active -x`, including the PSKc used to authenticate.
 //! - `MESHCOP_INTEROP_JOINER_CLI` — a simulated OpenThread FTD used as a
 //!   real joiner peer.
+//! - `MESHCOP_INTEROP_FAULT_TARGET` — optional single fault selected by the CI
+//!   harness when isolating loss scenarios in fresh daemon instances.
 //! - `MESHCOP_MUTATE_OK=1` — explicit authorization for the joiner test to
 //!   update steering data on the disposable network.
+//!
+//! A protocol-aware loopback UDP fault proxy also drops one datagram from each
+//! DTLS handshake flight position and the first confirmable CoAP
+//! request/response once. All eight positions recover against OpenThread. The
+//! CI harness gives every fault scenario a fresh daemon and Thread network,
+//! preventing border-agent session cleanup from affecting another result.
 //!
 //! The dataset for this network is disposable CI test data (the fixed vectors
 //! from the C++ `ot-commissioner` integration suite), but the test still never
@@ -21,6 +29,10 @@ use std::collections::BTreeSet;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use meshcop::{
@@ -36,6 +48,7 @@ use meshcop::{
     },
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::net::UdpSocket;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 #[tokio::test]
@@ -57,6 +70,289 @@ async fn interop_commissioner_session_against_openthread() -> meshcop::Result<()
     let resign = commissioner.resign().await;
     session?;
     resign
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultTarget {
+    InitialClientHello,
+    HelloVerifyRequest,
+    CookieClientHello,
+    ServerHandshake,
+    ClientFinished,
+    ServerFinished,
+    PetitionRequest,
+    PetitionResponse,
+}
+
+#[derive(Default)]
+struct FaultObservation {
+    dropped: AtomicBool,
+    client_finished_retry_fresh: AtomicBool,
+    server_handshake_retry_unchanged: AtomicBool,
+}
+
+#[tokio::test]
+#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
+async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()> {
+    let (border_agent, expected) = interop_inputs()?;
+    let all_targets = [
+        FaultTarget::InitialClientHello,
+        FaultTarget::HelloVerifyRequest,
+        FaultTarget::CookieClientHello,
+        FaultTarget::ServerHandshake,
+        FaultTarget::ClientFinished,
+        FaultTarget::ServerFinished,
+        FaultTarget::PetitionRequest,
+        FaultTarget::PetitionResponse,
+    ];
+    let selected = std::env::var("MESHCOP_INTEROP_FAULT_TARGET")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let targets: Vec<_> = match selected.as_deref() {
+        None => all_targets.to_vec(),
+        Some(value) => vec![parse_recovery_fault_target(value).ok_or_else(|| {
+            Error::Dataset(format!("unknown MESHCOP_INTEROP_FAULT_TARGET {value:?}"))
+        })?],
+    };
+    for target in targets {
+        eprintln!("injecting OpenThread fault: {target:?}");
+        run_packet_loss_case(border_agent, &expected, target)
+            .await
+            .map_err(|error| Error::Dataset(format!("{target:?} recovery failed: {error}")))?;
+    }
+    Ok(())
+}
+
+fn parse_recovery_fault_target(value: &str) -> Option<FaultTarget> {
+    match value {
+        "initial-client-hello" => Some(FaultTarget::InitialClientHello),
+        "hello-verify-request" => Some(FaultTarget::HelloVerifyRequest),
+        "cookie-client-hello" => Some(FaultTarget::CookieClientHello),
+        "server-handshake" => Some(FaultTarget::ServerHandshake),
+        "client-finished" => Some(FaultTarget::ClientFinished),
+        "server-finished" => Some(FaultTarget::ServerFinished),
+        "petition-request" => Some(FaultTarget::PetitionRequest),
+        "petition-response" => Some(FaultTarget::PetitionResponse),
+        _ => None,
+    }
+}
+
+async fn run_packet_loss_case(
+    border_agent: SocketAddr,
+    dataset: &Dataset,
+    target: FaultTarget,
+) -> meshcop::Result<()> {
+    let proxy = UdpSocket::bind("[::1]:0").await?;
+    let proxy_addr = proxy.local_addr()?;
+    let observation = Arc::new(FaultObservation::default());
+    let proxy_observation = Arc::clone(&observation);
+    let proxy_task = tokio::spawn(async move {
+        run_fault_proxy(proxy, border_agent, target, proxy_observation).await
+    });
+
+    let config = CommissionerConfig::from_dataset("meshcop-loss", dataset)?;
+    let mut commissioner = Commissioner::connect(config, proxy_addr).await?;
+    let petition = commissioner.petition().await;
+    let resign = resign_if_active(&mut commissioner).await;
+    proxy_task.abort();
+    match proxy_task.await {
+        Err(error) if error.is_cancelled() => {}
+        Err(_) => return Err(Error::InvalidState("fault proxy task panicked")),
+        Ok(Err(error)) => return Err(error),
+        Ok(Ok(())) => return Err(Error::InvalidState("fault proxy exited unexpectedly")),
+    }
+
+    if !observation.dropped.load(Ordering::Relaxed) {
+        return Err(Error::Dataset(format!(
+            "fault proxy did not observe and drop {target:?}"
+        )));
+    }
+    if target == FaultTarget::ServerHandshake
+        && !observation
+            .server_handshake_retry_unchanged
+            .load(Ordering::Relaxed)
+    {
+        return Err(Error::InvalidState(
+            "OpenThread did not retransmit the unchanged logical server handshake",
+        ));
+    }
+    if target == FaultTarget::ClientFinished
+        && !observation
+            .client_finished_retry_fresh
+            .load(Ordering::Relaxed)
+    {
+        return Err(Error::InvalidState(
+            "client Finished flight retry did not use fresh record sequences and protection",
+        ));
+    }
+    petition?;
+    resign?;
+    Ok(())
+}
+
+async fn run_fault_proxy(
+    socket: UdpSocket,
+    border_agent: SocketAddr,
+    target: FaultTarget,
+    observation: Arc<FaultObservation>,
+) -> meshcop::Result<()> {
+    let mut commissioner_addr = None;
+    let mut dropped_flight = None;
+    let mut buffer = [0u8; meshcop_dtls::driver::MAX_DATAGRAM_SIZE];
+    loop {
+        let (length, source) = socket.recv_from(&mut buffer).await?;
+        let (from_commissioner, destination) = if source == border_agent {
+            let Some(commissioner_addr) = commissioner_addr else {
+                continue;
+            };
+            (false, commissioner_addr)
+        } else {
+            match commissioner_addr {
+                None => commissioner_addr = Some(source),
+                Some(expected) if source != expected => continue,
+                Some(_) => {}
+            }
+            (true, border_agent)
+        };
+
+        let observed = classify_fault_target(&buffer[..length], from_commissioner);
+        if observed == Some(target) {
+            if !observation.dropped.swap(true, Ordering::Relaxed) {
+                if matches!(
+                    target,
+                    FaultTarget::ClientFinished | FaultTarget::ServerHandshake
+                ) {
+                    dropped_flight = Some(buffer[..length].to_vec());
+                }
+                continue;
+            }
+            if target == FaultTarget::ClientFinished {
+                let fresh = dropped_flight.as_deref().is_some_and(|dropped| {
+                    client_finished_retry_is_fresh(dropped, &buffer[..length])
+                });
+                observation
+                    .client_finished_retry_fresh
+                    .fetch_or(fresh, Ordering::Relaxed);
+                eprintln!("client Finished flight retry uses fresh protection: {fresh}");
+            }
+            if target == FaultTarget::ServerHandshake {
+                let dropped_server_handshake = dropped_flight
+                    .as_deref()
+                    .and_then(server_handshake_messages);
+                let retransmitted = server_handshake_messages(&buffer[..length]);
+                let unchanged = dropped_server_handshake
+                    .as_ref()
+                    .zip(retransmitted.as_ref())
+                    .is_some_and(|(dropped, retransmitted)| dropped == retransmitted);
+                observation
+                    .server_handshake_retry_unchanged
+                    .fetch_or(unchanged, Ordering::Relaxed);
+                eprintln!(
+                    "OpenThread retransmitted an unchanged logical server handshake: {}",
+                    unchanged
+                );
+            }
+        }
+        socket.send_to(&buffer[..length], destination).await?;
+    }
+}
+
+fn client_finished_retry_is_fresh(dropped: &[u8], retransmitted: &[u8]) -> bool {
+    let (Ok(dropped), Ok(retransmitted)) = (
+        meshcop_dtls::DtlsRecord::parse_datagram(dropped),
+        meshcop_dtls::DtlsRecord::parse_datagram(retransmitted),
+    ) else {
+        return false;
+    };
+    dropped.len() == retransmitted.len()
+        && dropped.iter().zip(retransmitted).all(|(before, after)| {
+            before.header.epoch == after.header.epoch
+                && before.header.content_type == after.header.content_type
+                && before.header.sequence_number != after.header.sequence_number
+                && if before.header.epoch == 0 {
+                    before.payload == after.payload
+                } else {
+                    before.payload != after.payload
+                }
+        })
+}
+
+fn server_handshake_messages(datagram: &[u8]) -> Option<Vec<meshcop_dtls::HandshakeMessage>> {
+    use meshcop_dtls::{ContentType, DtlsRecord, parse_unfragmented_handshake_messages};
+
+    let records = DtlsRecord::parse_datagram(datagram).ok()?;
+    let mut messages = Vec::new();
+    for record in records {
+        if record.header.epoch == 0 && record.header.content_type == ContentType::Handshake {
+            messages.extend(parse_unfragmented_handshake_messages(&record).ok()?);
+        }
+    }
+    Some(messages)
+}
+
+fn classify_fault_target(datagram: &[u8], from_commissioner: bool) -> Option<FaultTarget> {
+    use meshcop_dtls::{
+        ClientHello, ContentType, DtlsRecord, HandshakeType, parse_unfragmented_handshake_messages,
+    };
+
+    let Ok(records) = DtlsRecord::parse_datagram(datagram) else {
+        return None;
+    };
+    if records.iter().any(|record| {
+        record.header.epoch == 1 && record.header.content_type == ContentType::ApplicationData
+    }) {
+        return Some(if from_commissioner {
+            FaultTarget::PetitionRequest
+        } else {
+            FaultTarget::PetitionResponse
+        });
+    }
+
+    for record in &records {
+        if record.header.epoch != 0 || record.header.content_type != ContentType::Handshake {
+            continue;
+        }
+        let Ok(messages) = parse_unfragmented_handshake_messages(record) else {
+            continue;
+        };
+        for message in messages {
+            match message.message_type {
+                HandshakeType::ClientHello => {
+                    let Ok(hello) = ClientHello::decode(&message.payload) else {
+                        continue;
+                    };
+                    return Some(if hello.cookie.is_empty() {
+                        FaultTarget::InitialClientHello
+                    } else {
+                        FaultTarget::CookieClientHello
+                    });
+                }
+                HandshakeType::HelloVerifyRequest => {
+                    return Some(FaultTarget::HelloVerifyRequest);
+                }
+                HandshakeType::ServerHello
+                | HandshakeType::ServerKeyExchange
+                | HandshakeType::ServerHelloDone => {
+                    return Some(FaultTarget::ServerHandshake);
+                }
+                HandshakeType::ClientKeyExchange => {
+                    return Some(FaultTarget::ClientFinished);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if records.iter().any(|record| {
+        record.header.epoch == 1 && record.header.content_type == ContentType::Handshake
+    }) {
+        return Some(if from_commissioner {
+            FaultTarget::ClientFinished
+        } else {
+            FaultTarget::ServerFinished
+        });
+    }
+    None
 }
 
 const PRIMARY_COMMISSIONER_ID: &str = "meshcop-primary";

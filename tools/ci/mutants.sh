@@ -2,6 +2,7 @@
 set -euo pipefail
 
 scope="${1:-${MUTANTS_SCOPE:-targeted}}"
+shard="${MUTANTS_SHARD:-all}"
 output_parent="${MUTANTS_OUTPUT_PARENT:-target/cargo-mutants}"
 jobs="${CARGO_MUTANTS_JOBS:-2}"
 minimum_timeout="${CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT:-20}"
@@ -19,25 +20,63 @@ if [[ "${scope}" == "skip" ]]; then
   exit 0
 fi
 
+# Matrix runs split the normal targeted scope. Full/custom invocations still
+# run exactly once on the primary shard so workflow_dispatch does not duplicate
+# an intentionally unsharded audit.
+if [[ "${scope}" != "targeted" && "${shard}" == "dtls" ]]; then
+  echo "Mutation scope ${scope} runs only on the primary meshcop shard."
+  exit 0
+fi
+
 filters=()
 case "${scope}" in
   targeted)
-    filters=(
-      --file 'crates/meshcop/src/commissioner/client/*.rs'
-      --file crates/meshcop/src/commissioner/joiner.rs
-      --file crates/meshcop/src/meshcop/coap.rs
-      --file 'crates/meshcop/src/meshcop/diag/*.rs'
-      --file crates/meshcop/src/meshcop/parsers.rs
-      --file crates/meshcop/src/meshcop/builders.rs
-      --file crates/meshcop-dtls/src/driver.rs
-      --file crates/meshcop-dtls/src/client_driver.rs
-      --file crates/meshcop-dtls/src/server_driver.rs
-      --file crates/meshcop-dtls/src/tokio_session.rs
-      --file crates/meshcop-dtls/src/tokio_transport.rs
-      --file crates/meshcop-dtls/src/handshake.rs
-      --file crates/meshcop-dtls/src/thread_server_handshake.rs
-      --file 'crates/meshcop-dtls/src/ecjpake/*.rs'
-    )
+    case "${shard}" in
+      all)
+        filters=(
+          --file 'crates/meshcop/src/commissioner/client/*.rs'
+          --file crates/meshcop/src/commissioner/joiner.rs
+          --file crates/meshcop/src/meshcop/coap.rs
+          --file 'crates/meshcop/src/meshcop/diag/*.rs'
+          --file crates/meshcop/src/meshcop/parsers.rs
+          --file crates/meshcop/src/meshcop/builders.rs
+          --file crates/meshcop-dtls/src/driver.rs
+          --file crates/meshcop-dtls/src/client_driver.rs
+          --file crates/meshcop-dtls/src/server_driver.rs
+          --file crates/meshcop-dtls/src/tokio_session.rs
+          --file crates/meshcop-dtls/src/tokio_transport.rs
+          --file crates/meshcop-dtls/src/handshake.rs
+          --file crates/meshcop-dtls/src/thread_server_handshake.rs
+          --file 'crates/meshcop-dtls/src/ecjpake/*.rs'
+        )
+        ;;
+      meshcop)
+        filters=(
+          --file 'crates/meshcop/src/commissioner/client/*.rs'
+          --file crates/meshcop/src/commissioner/joiner.rs
+          --file crates/meshcop/src/meshcop/coap.rs
+          --file 'crates/meshcop/src/meshcop/diag/*.rs'
+          --file crates/meshcop/src/meshcop/parsers.rs
+          --file crates/meshcop/src/meshcop/builders.rs
+        )
+        ;;
+      dtls)
+        filters=(
+          --file crates/meshcop-dtls/src/driver.rs
+          --file crates/meshcop-dtls/src/client_driver.rs
+          --file crates/meshcop-dtls/src/server_driver.rs
+          --file crates/meshcop-dtls/src/tokio_session.rs
+          --file crates/meshcop-dtls/src/tokio_transport.rs
+          --file crates/meshcop-dtls/src/handshake.rs
+          --file crates/meshcop-dtls/src/thread_server_handshake.rs
+          --file 'crates/meshcop-dtls/src/ecjpake/*.rs'
+        )
+        ;;
+      *)
+        echo "unknown MUTANTS_SHARD: ${shard}" >&2
+        exit 2
+        ;;
+    esac
     ;;
   full)
     filters=()
@@ -60,6 +99,7 @@ esac
 
 set +e
 cargo mutants \
+  --workspace \
   "${filters[@]}" \
   --all-features \
   --annotations github \
@@ -89,6 +129,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo "## Mutation Testing"
     echo
     echo "Scope: \`${scope}\`"
+    echo "Shard: \`${shard}\`"
     echo
     echo "| Outcome | Count |"
     echo "| --- | ---: |"

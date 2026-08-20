@@ -452,25 +452,28 @@ async fn public_api_maps_protocol_errors_without_touching_live_network() {
         Error::InvalidState("MeshCoP request was rejected")
     ));
 
-    let mut mismatched_token = scripted_commissioner(
+    let mut delayed_duplicate = scripted_commissioner(
         ScriptedMeshcopTransport::new([exchange(
             CommissionerOperation::Petition,
-            [ScriptedResponse::Raw(CoapMessage {
-                ty: CoapType::Acknowledgement,
-                code: CoapCode::CHANGED,
-                message_id: 1,
-                token: vec![0xaa, 0xbb],
-                options: Vec::new(),
-                payload: vec![TLV_STATE, 1, 1, TLV_COMMISSIONER_SESSION_ID, 2, 0x12, 0x34],
-            })],
+            [
+                ScriptedResponse::Raw(CoapMessage {
+                    ty: CoapType::Acknowledgement,
+                    code: CoapCode::CHANGED,
+                    message_id: 1,
+                    token: vec![0xaa, 0xbb],
+                    options: Vec::new(),
+                    payload: vec![TLV_STATE, 1, 1],
+                }),
+                ScriptedResponse::petition_accept(0x1234),
+            ],
         )]),
         [],
     )
     .await;
-    assert!(matches!(
-        mismatched_token.petition().await.unwrap_err(),
-        Error::InvalidState("CoAP response token mismatch")
-    ));
+    assert_eq!(
+        delayed_duplicate.petition().await.unwrap().session_id,
+        0x1234
+    );
 
     let mut responses = (0..40)
         .map(|idx| ScriptedResponse::Raw(dataset_changed_notification(0x8000 + idx, true)))

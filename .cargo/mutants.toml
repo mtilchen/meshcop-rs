@@ -16,6 +16,11 @@ exclude_re = [
     # `seen |= 1 << 0` arm the original guard selects.
     'replace > with >= in DtlsReplayWindow::mark_seen',
 
+    # Same equivalent zero-shift case in the commissioner joiner's local
+    # replay window (kept crate-private to avoid expanding meshcop-dtls's
+    # public API solely for one consumer).
+    'replace > with >= in JoinerReplayWindow::mark_seen',
+
     # Equivalent mutants: these default trait-method bodies are already a
     # no-op (`let _ = ...`) and an unconditional `true` respectively, so the
     # replacement bodies cannot change behavior. The `-> bool with false`
@@ -37,6 +42,9 @@ exclude_re = [
     # so `shift >= 1` and bit 0 of `seen << shift` is always zero, making
     # `| 1` and `^ 1` identical.
     'replace \| with \^ in DtlsReplayWindow::mark_seen',
+
+    # Same equivalent known-clear low bit in the joiner's local replay window.
+    'replace \| with \^ in JoinerReplayWindow::mark_seen',
 
     # Equivalent mutants: the CoAP header byte ORs the version (bit 6), type
     # (bits 4-5, type <= 3) and token length (bits 0-3, length <= 8 enforced

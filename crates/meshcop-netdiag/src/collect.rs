@@ -110,9 +110,9 @@ impl<'a> Collector<'a> {
         node_timeout: Duration,
     ) -> meshcop::Result<Collector<'a>> {
         let keep_alive_interval = commissioner.config().keepalive_interval;
-        if node_timeout >= keep_alive_interval {
+        if node_timeout.saturating_mul(2) >= keep_alive_interval {
             return Err(Error::Configuration(
-                "netdiag node timeout must be shorter than the keepalive interval",
+                "two netdiag node timeouts must fit within the keepalive interval",
             ));
         }
         let petition = commissioner.petition().await?;
@@ -380,20 +380,26 @@ impl<'a> Collector<'a> {
 
     async fn keep_alive_before_request(&mut self) -> meshcop::Result<()> {
         // Send before the next diagnostic wait could cross the absolute
-        // keep-alive deadline. `start` requires the wait itself to be shorter
-        // than the interval, so one accepted keep-alive creates enough room.
+        // keep-alive deadline. `start` requires both the keep-alive wait and
+        // the following diagnostic wait to fit inside one interval.
         if request_may_cross_keepalive_deadline(
             self.last_keep_alive.elapsed(),
             self.node_timeout,
             self.keep_alive_interval,
         ) {
-            let result = match self.commissioner.keep_alive().await {
-                Ok(result) => result,
-                Err(err) => {
-                    self.commissioner.disconnect();
-                    return Err(err);
-                }
-            };
+            let result =
+                match tokio::time::timeout(self.node_timeout, self.commissioner.keep_alive()).await
+                {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(err)) => {
+                        self.commissioner.disconnect();
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        self.commissioner.disconnect();
+                        return Err(Error::Timeout("netdiag keep-alive timed out"));
+                    }
+                };
             match result {
                 ResultCode::Accept => {
                     self.last_keep_alive = tokio::time::Instant::now();
@@ -614,6 +620,13 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshcop::{
+        commissioner::{
+            CommissionerConfig,
+            harness::{ScriptedExchange, ScriptedMeshcopTransport, ScriptedResponse},
+        },
+        meshcop::CommissionerOperation,
+    };
 
     #[test]
     fn keepalive_is_sent_before_the_next_request_can_cross_its_deadline() {
@@ -634,5 +647,54 @@ mod tests {
             request_timeout,
             interval
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collector_refreshes_keepalive_before_a_request_crosses_the_deadline() {
+        let script = ScriptedMeshcopTransport::new([
+            ScriptedExchange::new(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0x1234)],
+            ),
+            ScriptedExchange::new(
+                CommissionerOperation::KeepAlive,
+                [ScriptedResponse::accept()],
+            ),
+        ]);
+        let mut commissioner = Commissioner::connect_scripted(
+            CommissionerConfig::pskc("netdiag-test", [0x42; 16]),
+            "127.0.0.1:49191".parse().unwrap(),
+            script,
+            [],
+        )
+        .await
+        .unwrap();
+        commissioner.petition().await.unwrap();
+
+        let mut collector = Collector {
+            commissioner: &mut commissioner,
+            node_timeout: Duration::from_secs(2),
+            keep_alive_interval: Duration::from_secs(30),
+            last_keep_alive: tokio::time::Instant::now() - Duration::from_secs(29),
+            mesh_local_prefix: [0xfd, 0, 0, 0, 0, 0, 0, 0],
+            dataset: Dataset::default(),
+        };
+        collector.keep_alive_before_request().await.unwrap();
+        drop(collector);
+
+        let operations = commissioner
+            .scripted_transport()
+            .unwrap()
+            .observed_requests()
+            .iter()
+            .map(|request| request.operation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            [
+                CommissionerOperation::Petition,
+                CommissionerOperation::KeepAlive
+            ]
+        );
     }
 }
