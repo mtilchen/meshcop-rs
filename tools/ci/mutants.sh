@@ -6,7 +6,6 @@ shard="${MUTANTS_SHARD:-all}"
 output_parent="${MUTANTS_OUTPUT_PARENT:-target/cargo-mutants}"
 jobs="${CARGO_MUTANTS_JOBS:-2}"
 minimum_timeout="${CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT:-20}"
-test_threads="${CARGO_MUTANTS_TEST_THREADS:-8}"
 
 mkdir -p "${output_parent}"
 
@@ -100,16 +99,14 @@ esac
 
 set +e
 cargo mutants \
+  --workspace \
   "${filters[@]}" \
   --all-features \
   --annotations github \
   --jobs "${jobs}" \
   --minimum-test-timeout "${minimum_timeout}" \
   --no-times \
-  --output "${output_parent}" \
-  -- \
-  -- \
-  --test-threads="${test_threads}"
+  --output "${output_parent}"
 mutants_status=$?
 set -e
 

@@ -400,7 +400,7 @@ async fn run_flight_fault_case(
     });
 
     let pskc = [0x42; 16];
-    let deadline = core::time::Duration::from_secs(12);
+    let deadline = core::time::Duration::from_secs(4);
     let server_task = async move {
         let mut session = server.accept(&pskc, deadline).await?;
         let request = session
