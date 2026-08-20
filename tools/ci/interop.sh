@@ -15,10 +15,21 @@
 
 set -euo pipefail
 
-openthread_ref="${MESHCOP_INTEROP_OPENTHREAD_REF:-v2026.06.0}"
+die() {
+    echo "*** ERROR: $*" >&2
+    exit 1
+}
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+openthread_ref_file="${script_dir}/openthread-ref"
+[[ -r "${openthread_ref_file}" ]] || die "missing ${openthread_ref_file}"
+default_openthread_ref="$(<"${openthread_ref_file}")"
+[[ -n "${default_openthread_ref}" ]] || die "${openthread_ref_file} is empty"
+openthread_ref="${MESHCOP_INTEROP_OPENTHREAD_REF:-${default_openthread_ref}}"
 runtime_dir="${MESHCOP_INTEROP_RUNTIME_DIR:-/tmp/meshcop-interop}"
 openthread_dir="${runtime_dir}/openthread"
 daemon_log="${runtime_dir}/ot-daemon.log"
+readonly OPENTHREAD_REPOSITORY=https://github.com/openthread/openthread.git
 
 # Fixed, non-secret network parameters: the test vectors from the C++
 # ot-commissioner integration suite (tests/integration/common.sh).
@@ -36,11 +47,6 @@ ot_daemon="${openthread_dir}/build/posix/src/posix/ot-daemon"
 ot_ctl="${openthread_dir}/build/posix/src/posix/ot-ctl"
 ot_rcp="${openthread_dir}/build/simulation/examples/apps/ncp/ot-rcp"
 ot_cli_ftd="${openthread_dir}/build/simulation/examples/apps/cli/ot-cli-ftd"
-
-die() {
-    echo "*** ERROR: $*" >&2
-    exit 1
-}
 
 # Runs a phase with its output teed to a log; on failure, surfaces the log
 # tail as a GitHub error annotation (annotations stay readable on the run
@@ -76,27 +82,55 @@ wait_for() {
     die "timed out waiting for ${description}"
 }
 
+openthread_binaries_exist() {
+    [[ -x "${ot_daemon}" && -x "${ot_ctl}" && -x "${ot_rcp}" && -x "${ot_cli_ftd}" ]]
+}
+
+fetch_openthread_ref() {
+    git -C "${openthread_dir}" fetch --depth 1 origin "${openthread_ref}" || return 1
+    git -C "${openthread_dir}" rev-parse --verify 'FETCH_HEAD^{commit}'
+}
+
 build_openthread() {
-    if [[ -x "${ot_daemon}" && -x "${ot_rcp}" && -x "${ot_cli_ftd}" ]]; then
-        echo "Using cached OpenThread build at ${openthread_dir}"
-        return
+    local current_commit requested_commit
+    if [[ -d "${openthread_dir}/.git" ]]; then
+        if ! requested_commit="$(fetch_openthread_ref)"; then
+            die "could not resolve OpenThread ref ${openthread_ref}"
+        fi
+        current_commit="$(git -C "${openthread_dir}" rev-parse --verify HEAD)" || return 1
+        if [[ "${current_commit}" == "${requested_commit}" ]]; then
+            if openthread_binaries_exist; then
+                echo "Using cached OpenThread build at ${requested_commit}"
+                return
+            fi
+            echo "Cached OpenThread checkout at ${requested_commit} is missing required binaries; rebuilding"
+        else
+            echo "Cached OpenThread checkout is ${current_commit}; rebuilding ${requested_commit}"
+        fi
     fi
-    rm -rf "${openthread_dir}"
-    git clone --depth 1 --branch "${openthread_ref}" \
-        --recurse-submodules --shallow-submodules \
-        https://github.com/openthread/openthread.git "${openthread_dir}"
-    cd "${openthread_dir}"
+
+    rm -rf "${openthread_dir}" || return 1
+    git init --quiet "${openthread_dir}" || return 1
+    git -C "${openthread_dir}" remote add origin "${OPENTHREAD_REPOSITORY}" || return 1
+    git -C "${openthread_dir}" fetch --depth 1 origin "${openthread_ref}" || return 1
+    git -C "${openthread_dir}" checkout --quiet --detach FETCH_HEAD || return 1
+    git -C "${openthread_dir}" submodule update --init --recursive --depth 1 || return 1
+    requested_commit="$(git -C "${openthread_dir}" rev-parse --verify HEAD)" || return 1
+    echo "Building OpenThread ${openthread_ref} at ${requested_commit}"
+    cd "${openthread_dir}" || return 1
     # The simulated RCP that stands in for an 802.15.4 radio, plus an FTD CLI
     # node that acts as the joiner on the same simulated radio bus.
     OT_CMAKE_NINJA_TARGET="ot-rcp ot-cli-ftd" \
         ./script/cmake-build simulation -DOT_MTD=OFF \
-        -DOT_APP_NCP=OFF -DBUILD_TESTING=OFF
+        -DOT_APP_NCP=OFF -DBUILD_TESTING=OFF || return 1
     # The posix border router; OT_PLATFORM_UDP puts the border agent on a
     # real host UDP socket so the commissioner can reach it over loopback.
     OT_CMAKE_NINJA_TARGET="ot-daemon ot-ctl" \
         ./script/cmake-build posix -DOT_DAEMON=ON -DOT_PLATFORM_NETIF=ON \
-        -DOT_PLATFORM_UDP=ON -DBUILD_TESTING=OFF
-    cd -
+        -DOT_PLATFORM_UDP=ON -DBUILD_TESTING=OFF || return 1
+    cd - || return 1
+    openthread_binaries_exist || die \
+        "OpenThread build did not produce ot-daemon, ot-ctl, ot-rcp, and ot-cli-ftd"
 }
 
 start_daemon() {
@@ -145,9 +179,10 @@ run_interop_test() {
     [[ -n "${dataset_hex}" ]] || die "could not read the active dataset"
 
     echo "Border agent on port ${ba_port}; commissioning..."
-    # Serial test threads: both tests petition the same border agent, and a
-    # border agent serves one active commissioner at a time.
-    MESHCOP_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
+    # Serial test threads: every live case shares one border agent, which can
+    # serve only one active commissioner at a time.
+    MESHCOP_MUTATE_OK=1 \
+        MESHCOP_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
         MESHCOP_INTEROP_DATASET_HEX="${dataset_hex}" \
         MESHCOP_INTEROP_JOINER_CLI="${ot_cli_ftd}" \
         cargo test -p meshcop --test interop_openthread --all-features -- \
@@ -164,12 +199,14 @@ write_summary() {
             echo "| --- | --- | --- | --- |"
             echo "| OpenThread \`${openthread_ref}\` (posix ot-daemon, simulated RCP) | border agent + leader | DTLS/EC-J-PAKE over UDP | ${result} |"
             echo
-            echo "Covered: DTLS 1.2 + EC J-PAKE handshake (PSKc), COMM_PET, COMM_KA,"
-            echo "MGMT_ACTIVE_GET (full dataset compare), MGMT_COMMISSIONER_GET via"
-            echo "the UDP_TX/UDP_RX proxy to the leader ALOC, resign; plus a full"
-            echo "joiner commissioning of a simulated ot-cli-ftd node: steering data"
-            echo "by EUI-64, the joiner DTLS session over RLY_RX/RLY_TX (PSKd),"
-            echo "JOIN_FIN, KEK entrustment, and the joiner attaching as a child."
+            echo "Covered: successful and wrong-PSKc DTLS 1.2 + EC J-PAKE handshakes,"
+            echo "recovery after authentication failure, commissioner contention and"
+            echo "takeover, COMM_PET, COMM_KA, MGMT_ACTIVE_GET (full dataset compare),"
+            echo "MGMT_COMMISSIONER_GET and unicast/asynchronous network diagnostics via"
+            echo "the UDP_TX/UDP_RX proxy, and resign. Joiner coverage commissions a"
+            echo "simulated ot-cli-ftd node end to end: steering data by EUI-64, the"
+            echo "joiner DTLS session over RLY_RX/RLY_TX (PSKd), JOIN_FIN, KEK"
+            echo "entrustment, and attachment as a child."
         } >>"${GITHUB_STEP_SUMMARY}"
     fi
 }

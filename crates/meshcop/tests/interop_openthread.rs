@@ -7,6 +7,10 @@
 //! - `MESHCOP_INTEROP_BORDER_AGENT` — `host:port` of the live agent.
 //! - `MESHCOP_INTEROP_DATASET_HEX` — the active dataset reported by
 //!   `ot-ctl dataset active -x`, including the PSKc used to authenticate.
+//! - `MESHCOP_INTEROP_JOINER_CLI` — a simulated OpenThread FTD used as a
+//!   real joiner peer.
+//! - `MESHCOP_MUTATE_OK=1` — explicit authorization for the joiner test to
+//!   update steering data on the disposable network.
 //!
 //! The dataset for this network is disposable CI test data (the fixed vectors
 //! from the C++ `ot-commissioner` integration suite), but the test still never
@@ -14,7 +18,7 @@
 //! run against a private network by hand.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -22,11 +26,14 @@ use std::time::Duration;
 use meshcop::{
     commissioner::{
         Commissioner, CommissionerConfig, CommissionerDatasetFlags, CommissionerEvent,
-        DatasetFlags, ResultCode, StaticJoinerHandler,
+        CommissionerState, DatasetFlags, PetitionResponse, ResultCode, StaticJoinerHandler,
     },
     dataset::Dataset,
     error::Error,
-    meshcop::{TLV_BORDER_AGENT_LOCATOR, TLV_COMMISSIONER_SESSION_ID},
+    meshcop::{
+        TLV_BORDER_AGENT_LOCATOR, TLV_COMMISSIONER_SESSION_ID,
+        diag::{NetDiagData, diag_flags},
+    },
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -34,15 +41,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 #[tokio::test]
 #[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
 async fn interop_commissioner_session_against_openthread() -> meshcop::Result<()> {
-    let border_agent: SocketAddr = std::env::var("MESHCOP_INTEROP_BORDER_AGENT")
-        .expect("MESHCOP_INTEROP_BORDER_AGENT must be host:port")
-        .parse()
-        .expect("MESHCOP_INTEROP_BORDER_AGENT must parse as a socket address");
-    let dataset_hex = std::env::var("MESHCOP_INTEROP_DATASET_HEX")
-        .expect("MESHCOP_INTEROP_DATASET_HEX must contain the active dataset with PSKc");
-
-    let expected = Dataset::from_hex(dataset_hex)?;
-    let config = CommissionerConfig::from_dataset("meshcop-interop", &expected)?;
+    let (border_agent, expected) = interop_inputs()?;
+    let config = CommissionerConfig::from_dataset("meshcop-session", &expected)?;
 
     // DTLS 1.2 + EC J-PAKE handshake authenticated with the network PSKc.
     let mut commissioner = Commissioner::connect(config, border_agent).await?;
@@ -57,6 +57,197 @@ async fn interop_commissioner_session_against_openthread() -> meshcop::Result<()
     let resign = commissioner.resign().await;
     session?;
     resign
+}
+
+const PRIMARY_COMMISSIONER_ID: &str = "meshcop-primary";
+const CONTENDING_COMMISSIONER_ID: &str = "meshcop-contender";
+const WRONG_PSKC: [u8; 16] = [0xa5; 16];
+const DIAGNOSTIC_FLAGS: u64 =
+    diag_flags::MAC_ADDR | diag_flags::MODE | diag_flags::ROUTE64 | diag_flags::LEADER_DATA;
+const DIAGNOSTIC_DEADLINE: Duration = Duration::from_secs(10);
+const LEADER_ALOC_IID: [u8; 8] = [0x00, 0x00, 0x00, 0xff, 0xfe, 0x00, 0xfc, 0x00];
+
+fn interop_inputs() -> meshcop::Result<(SocketAddr, Dataset)> {
+    let border_agent = std::env::var("MESHCOP_INTEROP_BORDER_AGENT")
+        .expect("MESHCOP_INTEROP_BORDER_AGENT must be host:port")
+        .parse()
+        .expect("MESHCOP_INTEROP_BORDER_AGENT must parse as a socket address");
+    let dataset_hex = std::env::var("MESHCOP_INTEROP_DATASET_HEX")
+        .expect("MESHCOP_INTEROP_DATASET_HEX must contain the active dataset with PSKc");
+    Ok((border_agent, Dataset::from_hex(dataset_hex)?))
+}
+
+#[tokio::test]
+#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
+async fn interop_wrong_pskc_is_rejected_and_border_agent_recovers() -> meshcop::Result<()> {
+    let (border_agent, expected) = interop_inputs()?;
+    let wrong_config = CommissionerConfig::pskc("meshcop-wrong-pskc", WRONG_PSKC);
+    let mut rejected = Commissioner::connect(wrong_config, border_agent).await?;
+
+    let error = rejected
+        .petition()
+        .await
+        .expect_err("a commissioner with the wrong PSKc must not petition successfully");
+    let is_authentication_failure = matches!(
+        &error,
+        Error::Dtls(meshcop_dtls::Error::Crypto(message))
+            if message.contains("DTLS alert") && message.contains("level=2")
+    );
+    assert!(
+        is_authentication_failure,
+        "wrong PSKc did not produce a fatal DTLS authentication alert: {error}"
+    );
+    rejected.disconnect();
+
+    // A failed authentication attempt must not wedge the border agent. Prove
+    // that a fresh commissioner with the real PSKc can immediately establish
+    // DTLS, petition, and resign.
+    let config = CommissionerConfig::from_dataset("meshcop-auth-recovery", &expected)?;
+    let mut recovered = Commissioner::connect(config, border_agent).await?;
+    let petition = recovered.petition().await?;
+    assert_ne!(petition.session_id, 0, "petition returned session id 0");
+    recovered.resign().await
+}
+
+#[tokio::test]
+#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
+async fn interop_competing_commissioner_is_rejected_then_can_take_over() -> meshcop::Result<()> {
+    let (border_agent, expected) = interop_inputs()?;
+    let primary_config = CommissionerConfig::from_dataset(PRIMARY_COMMISSIONER_ID, &expected)?;
+    let contender_config = CommissionerConfig::from_dataset(CONTENDING_COMMISSIONER_ID, &expected)?;
+    let mut primary = Commissioner::connect(primary_config, border_agent).await?;
+    let mut contender = Commissioner::connect(contender_config, border_agent).await?;
+
+    primary.petition().await?;
+    let rejection = verify_contention_rejection(contender.petition().await);
+    if let Err(error) = rejection {
+        let _ = resign_if_active(&mut contender).await;
+        let _ = resign_if_active(&mut primary).await;
+        return Err(error);
+    }
+
+    let takeover = async {
+        primary.resign().await?;
+        let petition = contender.petition().await?;
+        if petition.session_id == 0 {
+            return Err(Error::InvalidState("takeover returned session id 0"));
+        }
+        Ok(())
+    }
+    .await;
+    let contender_resign = resign_if_active(&mut contender).await;
+    let primary_resign = resign_if_active(&mut primary).await;
+    takeover?;
+    contender_resign?;
+    primary_resign
+}
+
+#[tokio::test]
+#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
+async fn interop_network_diagnostics_against_openthread() -> meshcop::Result<()> {
+    let (border_agent, expected) = interop_inputs()?;
+    let config = CommissionerConfig::from_dataset("meshcop-diagnostics", &expected)?;
+    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    commissioner.petition().await?;
+
+    let session = exercise_diagnostics(&mut commissioner, &expected).await;
+    let resign = commissioner.resign().await;
+    session?;
+    resign
+}
+
+fn verify_contention_rejection(result: meshcop::Result<PetitionResponse>) -> meshcop::Result<()> {
+    match result {
+        Err(Error::PetitionRejected {
+            existing_commissioner_id: Some(existing),
+        }) if existing == PRIMARY_COMMISSIONER_ID => Ok(()),
+        Err(Error::PetitionRejected {
+            existing_commissioner_id,
+        }) => Err(Error::Dataset(format!(
+            "petition rejection identified {existing_commissioner_id:?}, expected {PRIMARY_COMMISSIONER_ID}"
+        ))),
+        Err(error) => Err(Error::Dataset(format!(
+            "contending petition failed with an unexpected error: {error}"
+        ))),
+        Ok(_) => Err(Error::InvalidState(
+            "contending commissioner petition was accepted",
+        )),
+    }
+}
+
+async fn resign_if_active(commissioner: &mut Commissioner) -> meshcop::Result<()> {
+    if commissioner.state() == CommissionerState::Active {
+        commissioner.resign().await
+    } else {
+        Ok(())
+    }
+}
+
+async fn exercise_diagnostics(
+    commissioner: &mut Commissioner,
+    expected: &Dataset,
+) -> meshcop::Result<()> {
+    let leader_aloc = leader_aloc_from_dataset(expected)?;
+
+    // Unicast DIAG_GET.req returns the requested TLVs directly in the proxied
+    // response. This covers both UDP proxying and typed OpenThread decoding.
+    let unicast = commissioner
+        .get_diagnostics(leader_aloc, DIAGNOSTIC_FLAGS)
+        .await?;
+    require_diagnostic_fields("unicast", &unicast)?;
+
+    // DIAG_GET.qry is a separate asynchronous resource: the command is
+    // acknowledged first and the leader later emits DIAG_GET.ans.
+    commissioner.diagnostic_get(None, DIAGNOSTIC_FLAGS).await?;
+    let asynchronous = wait_for_diagnostic_answer(commissioner).await?;
+    require_diagnostic_fields("asynchronous", &asynchronous)
+}
+
+async fn wait_for_diagnostic_answer(
+    commissioner: &mut Commissioner,
+) -> meshcop::Result<Box<NetDiagData>> {
+    let deadline = tokio::time::Instant::now() + DIAGNOSTIC_DEADLINE;
+    loop {
+        match tokio::time::timeout_at(deadline, commissioner.next_event()).await {
+            Err(_elapsed) => {
+                return Err(Error::Timeout("OpenThread diagnostic answer timed out"));
+            }
+            Ok(Ok(Some(CommissionerEvent::DiagnosticAnswer { data, .. }))) => return Ok(data),
+            Ok(Ok(_)) => {}
+            Ok(Err(Error::Dtls(meshcop_dtls::Error::Timeout(_)))) => {}
+            Ok(Err(error)) => return Err(error),
+        }
+    }
+}
+
+fn require_diagnostic_fields(source: &str, data: &NetDiagData) -> meshcop::Result<()> {
+    let missing = [
+        ("MAC Address", data.mac_addr.is_some()),
+        ("Mode", data.mode.is_some()),
+        ("Route64", data.route64.is_some()),
+        ("Leader Data", data.leader_data.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| (!present).then_some(name))
+    .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Dataset(format!(
+            "{source} diagnostic answer is missing {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+fn leader_aloc_from_dataset(dataset: &Dataset) -> meshcop::Result<Ipv6Addr> {
+    let prefix = dataset
+        .mesh_local_prefix()?
+        .ok_or_else(|| Error::Dataset("interop dataset has no mesh-local prefix".to_string()))?;
+    let mut octets = [0u8; 16];
+    octets[..8].copy_from_slice(&prefix);
+    octets[8..].copy_from_slice(&LEADER_ALOC_IID);
+    Ok(Ipv6Addr::from(octets))
 }
 
 async fn exercise_session(
@@ -112,18 +303,13 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(90);
 #[tokio::test]
 #[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
 async fn interop_joiner_commissioning_against_openthread() -> meshcop::Result<()> {
-    let border_agent: SocketAddr = std::env::var("MESHCOP_INTEROP_BORDER_AGENT")
-        .expect("MESHCOP_INTEROP_BORDER_AGENT must be host:port")
-        .parse()
-        .expect("MESHCOP_INTEROP_BORDER_AGENT must parse as a socket address");
-    let dataset_hex = std::env::var("MESHCOP_INTEROP_DATASET_HEX")
-        .expect("MESHCOP_INTEROP_DATASET_HEX must contain the active dataset with PSKc");
+    require_mutation_gate()?;
+    let (border_agent, expected) = interop_inputs()?;
     let joiner_cli = PathBuf::from(
         std::env::var("MESHCOP_INTEROP_JOINER_CLI")
             .expect("MESHCOP_INTEROP_JOINER_CLI must point at a simulation ot-cli-ftd"),
     );
 
-    let expected = Dataset::from_hex(dataset_hex)?;
     let channel = expected
         .channel()?
         .expect("the interop network dataset always carries a channel")
@@ -146,6 +332,16 @@ async fn interop_joiner_commissioning_against_openthread() -> meshcop::Result<()
     let resign = commissioner.resign().await;
     session?;
     resign
+}
+
+fn require_mutation_gate() -> meshcop::Result<()> {
+    if std::env::var("MESHCOP_MUTATE_OK").ok().as_deref() == Some("1") {
+        Ok(())
+    } else {
+        Err(Error::InvalidState(
+            "joiner interop requires MESHCOP_MUTATE_OK=1",
+        ))
+    }
 }
 
 async fn commission_joiner(
@@ -177,6 +373,8 @@ async fn commission_joiner(
     });
 
     let deadline = tokio::time::Instant::now() + JOIN_DEADLINE;
+    let keepalive_interval = commissioner.config().keepalive_interval;
+    let mut keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
     let mut connected = false;
     let mut finalized = false;
     let mut joined = false;
@@ -189,6 +387,14 @@ async fn commission_joiner(
             } else {
                 "joiner was entrusted but never attached to the network"
             }));
+        }
+        if tokio::time::Instant::now() >= keepalive_deadline {
+            if commissioner.keep_alive().await? != ResultCode::Accept {
+                return Err(Error::InvalidState(
+                    "commissioner keep-alive was rejected during joiner commissioning",
+                ));
+            }
+            keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
         }
         tokio::select! {
             result = &mut driver, if !joined => {
@@ -253,7 +459,7 @@ impl JoinerCli {
     /// simulated-flash state from earlier runs cannot leak in.
     fn spawn(binary: &std::path::Path, node_id: u32) -> meshcop::Result<Self> {
         let scratch = std::env::temp_dir().join(format!(
-            "ot-rs-interop-joiner-{}-{node_id}",
+            "meshcop-interop-joiner-{}-{node_id}",
             std::process::id()
         ));
         if scratch.exists() {

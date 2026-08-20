@@ -5,7 +5,7 @@ name: Interop
 #
 # The weekly run catches drift against OpenThread even when this repo is
 # quiet. Bumping the pinned OpenThread ref is a deliberate one-line change in
-# tools/ci/interop.sh (MESHCOP_INTEROP_OPENTHREAD_REF).
+# tools/ci/openthread-ref.
 
 on:
   pull_request:
@@ -38,6 +38,10 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Read OpenThread ref
+        id: openthread
+        run: echo "ref=$(< tools/ci/openthread-ref)" >> "${GITHUB_OUTPUT}"
+
       - name: Cache Cargo
         uses: actions/cache@v5
         with:
@@ -54,7 +58,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: /tmp/meshcop-interop/openthread
-          key: openthread-${{ runner.os }}-${{ hashFiles('tools/ci/interop.sh') }}
+          key: openthread-${{ runner.os }}-${{ steps.openthread.outputs.ref }}-${{ hashFiles('tools/ci/interop.sh') }}
 
       - name: Install build dependencies
         run: |
@@ -64,10 +68,11 @@ jobs:
       - name: Run interop test
         run: tools/ci/interop.sh
 
-      - name: Upload daemon log
+      - name: Upload interop logs
         uses: actions/upload-artifact@v7
         if: failure()
         with:
-          name: ot-daemon-log
-          path: /tmp/meshcop-interop/ot-daemon.log
+          name: interop-logs
+          path: /tmp/meshcop-interop/*.log
           if-no-files-found: warn
+          retention-days: 7
