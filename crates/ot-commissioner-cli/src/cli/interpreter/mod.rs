@@ -33,11 +33,11 @@ const NOT_CONNECTED: &str = "commissioner is not started; run 'start' first";
 
 // A commissioner operation owns the transport until its response arrives, so
 // a keep-alive cannot safely be interleaved with an in-flight command. The
-// longest current command paths can wait through multiple serial five-second
-// MeshCoP receive windows plus an event-collection period. Reserving twenty
-// seconds before dispatch keeps those bounded paths inside the minimum
-// thirty-second keep-alive interval with scheduling/processing margin.
-const COMMAND_KEEPALIVE_HEADROOM: Duration = Duration::from_secs(20);
+// longest current command paths can perform two serial 12-second MeshCoP
+// exchanges (a mesh-local-prefix read followed by a proxied request). Keeping
+// 28 seconds before dispatch leaves four seconds of processing margin beyond
+// those network waits inside the minimum 30-second keep-alive interval.
+const COMMAND_KEEPALIVE_HEADROOM: Duration = Duration::from_secs(28);
 
 /// One parsed REPL command line.
 type Tokens = Vec<String>;

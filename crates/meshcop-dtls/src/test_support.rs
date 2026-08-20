@@ -23,6 +23,8 @@ use super::{
 pub enum LoopbackEnd {
     /// Complete the handshake and return the session keys.
     Complete,
+    /// Replace the first cookie, then complete the handshake.
+    ReplaceCookieThenComplete,
     /// Send a fatal alert instead of the ChangeCipherSpec + Finished flight.
     AlertInsteadOfFinished,
 }
@@ -52,6 +54,9 @@ pub async fn loopback_dtls_server_with_rng(
     let mut epoch0_seq = 0u64;
     let mut saw_change_cipher_spec = false;
     let mut key_material: Option<ThreadDtlsKeyMaterial> = None;
+    let replacement_cookie = vec![0xca, 0xfe, 0xba, 0xbe];
+    let mut replacement_sent = false;
+    let mut server_message_sequence = 1u16;
 
     loop {
         let len = tokio::time::timeout(core::time::Duration::from_secs(2), socket.recv(&mut buf))
@@ -64,32 +69,52 @@ pub async fn loopback_dtls_server_with_rng(
                         match message.message_type {
                             HandshakeType::ClientHello => {
                                 let hello = ClientHello::decode(&message.payload)?;
-                                if !cookies.verify(&hello.random, &hello.cookie) {
+                                let cookie_is_valid = if replacement_sent {
+                                    hello.cookie == replacement_cookie
+                                } else {
+                                    cookies.verify(&hello.random, &hello.cookie)
+                                };
+                                let replace_cookie = end == LoopbackEnd::ReplaceCookieThenComplete
+                                    && !hello.cookie.is_empty()
+                                    && !replacement_sent;
+                                if !cookie_is_valid || replace_cookie {
+                                    let cookie = if replace_cookie {
+                                        replacement_sent = true;
+                                        replacement_cookie.clone()
+                                    } else {
+                                        cookies.cookie(&hello.random)?.to_vec()
+                                    };
                                     let verify = HandshakeMessage {
                                         message_type: HandshakeType::HelloVerifyRequest,
                                         message_seq: message.message_seq,
                                         payload: HelloVerifyRequest {
                                             server_version: DTLS_1_2_VERSION,
-                                            cookie: cookies.cookie(&hello.random)?.to_vec(),
+                                            cookie,
                                         }
                                         .encode()?,
                                     };
                                     let record = DtlsRecord::new(
                                         ContentType::Handshake,
                                         0,
-                                        epoch0_seq,
+                                        record.header.sequence_number,
                                         verify.encode()?,
                                     )?;
-                                    epoch0_seq += 1;
                                     socket.send(&record.encode()?).await?;
                                     continue;
                                 }
                                 server.handle_client_hello(&message)?;
+                                epoch0_seq = record.header.sequence_number;
+                                server_message_sequence = message.message_seq;
                                 let mut datagram = Vec::new();
                                 for built in [
-                                    server.build_server_hello(1)?,
-                                    server.build_server_key_exchange(2, rng)?,
-                                    server.build_server_hello_done(3)?,
+                                    server.build_server_hello(server_message_sequence)?,
+                                    server.build_server_key_exchange(
+                                        server_message_sequence.wrapping_add(1),
+                                        rng,
+                                    )?,
+                                    server.build_server_hello_done(
+                                        server_message_sequence.wrapping_add(2),
+                                    )?,
                                 ] {
                                     let record = DtlsRecord::new(
                                         ContentType::Handshake,
@@ -150,7 +175,8 @@ pub async fn loopback_dtls_server_with_rng(
                         send_fatal_handshake_alert(socket, epoch0_seq).await?;
                         return Err(error);
                     }
-                    let server_finished = server.build_server_finished(4, keys)?;
+                    let server_finished = server
+                        .build_server_finished(server_message_sequence.wrapping_add(3), keys)?;
                     let mut datagram =
                         DtlsRecord::new(ContentType::ChangeCipherSpec, 0, epoch0_seq, vec![1])?
                             .encode()?;

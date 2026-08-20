@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn server_handshake_completes_against_client_and_derives_matching_kek() {
@@ -293,6 +294,214 @@ async fn dtls_server_accepts_cookie_retry_and_echoes_protected_payload() -> crat
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlightDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlightFault {
+    Drop,
+    ForwardFirstRecord,
+}
+
+#[derive(Debug, Default)]
+struct LossObservation {
+    dropped: Option<Vec<u8>>,
+    saw_fresh_semantic_retry: bool,
+}
+
+#[tokio::test]
+async fn dtls_handshake_recovers_when_each_flight_is_dropped_once() -> crate::Result<()> {
+    for (direction, ordinal) in [
+        (FlightDirection::ClientToServer, 1),
+        (FlightDirection::ServerToClient, 1),
+        (FlightDirection::ClientToServer, 2),
+        (FlightDirection::ServerToClient, 2),
+        (FlightDirection::ClientToServer, 3),
+        (FlightDirection::ServerToClient, 3),
+    ] {
+        run_flight_fault_case(direction, ordinal, FlightFault::Drop).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dtls_handshake_recovers_from_a_partially_delivered_client_flight() -> crate::Result<()> {
+    run_flight_fault_case(
+        FlightDirection::ClientToServer,
+        3,
+        FlightFault::ForwardFirstRecord,
+    )
+    .await
+}
+
+async fn run_flight_fault_case(
+    direction: FlightDirection,
+    ordinal: usize,
+    fault: FlightFault,
+) -> crate::Result<()> {
+    let server = DtlsServer::bind("127.0.0.1:0").await?;
+    let server_addr = server.local_addr();
+    let proxy = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let proxy_addr = proxy.local_addr()?;
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    let client_addr = client_socket.local_addr()?;
+    client_socket.connect(proxy_addr).await?;
+
+    let observation = Arc::new(Mutex::new(LossObservation::default()));
+    let proxy_observation = Arc::clone(&observation);
+    let proxy_task = tokio::spawn(async move {
+        run_lossy_proxy(
+            proxy,
+            client_addr,
+            server_addr,
+            direction,
+            ordinal,
+            fault,
+            proxy_observation,
+        )
+        .await
+    });
+
+    let pskc = [0x42; 16];
+    let deadline = core::time::Duration::from_secs(5);
+    let server_task = async move {
+        let mut session = server.accept(&pskc, deadline).await?;
+        let request = session
+            .recv_application_data(deadline)
+            .await
+            .map_err(crate::Error::from)?;
+        session
+            .send_application_data(&request)
+            .await
+            .map_err(crate::Error::from)?;
+        crate::Result::Ok(session.key_material().master_secret)
+    };
+    let client_task = async {
+        let mut session = DtlsSession::connect(&client_socket, &pskc, deadline).await?;
+        let response = session
+            .request_application_data(&client_socket, b"lossy echo", deadline)
+            .await?;
+        crate::Result::Ok((response, session.key_material().master_secret))
+    };
+
+    let (server_result, client_result) = tokio::join!(server_task, client_task);
+    proxy_task.abort();
+    let server_secret = server_result?;
+    let (response, client_secret) = client_result?;
+    assert_eq!(response, b"lossy echo");
+    assert_eq!(server_secret, client_secret);
+
+    let observation = observation.lock().expect("loss observation lock poisoned");
+    assert!(
+        observation.dropped.is_some(),
+        "proxy did not fault {direction:?} flight {ordinal}"
+    );
+    assert!(
+        observation.saw_fresh_semantic_retry,
+        "{direction:?} flight {ordinal} was not retransmitted with fresh record sequences"
+    );
+    Ok(())
+}
+
+async fn run_lossy_proxy(
+    socket: tokio::net::UdpSocket,
+    client_addr: core::net::SocketAddr,
+    server_addr: core::net::SocketAddr,
+    drop_direction: FlightDirection,
+    drop_ordinal: usize,
+    fault: FlightFault,
+    observation: Arc<Mutex<LossObservation>>,
+) -> crate::Result<()> {
+    let mut client_to_server = 0usize;
+    let mut server_to_client = 0usize;
+    let mut buffer = [0u8; crate::driver::MAX_DATAGRAM_SIZE];
+    loop {
+        let (length, source) = socket.recv_from(&mut buffer).await?;
+        let (direction, ordinal, destination) = if source == client_addr {
+            client_to_server += 1;
+            (
+                FlightDirection::ClientToServer,
+                client_to_server,
+                server_addr,
+            )
+        } else if source == server_addr {
+            server_to_client += 1;
+            (
+                FlightDirection::ServerToClient,
+                server_to_client,
+                client_addr,
+            )
+        } else {
+            continue;
+        };
+        let datagram = &buffer[..length];
+        let fingerprint = handshake_flight_fingerprint(datagram)?;
+
+        let mut should_drop = false;
+        {
+            let mut observed = observation.lock().expect("loss observation lock poisoned");
+            if direction == drop_direction && ordinal == drop_ordinal {
+                observed.dropped = Some(datagram.to_vec());
+                should_drop = true;
+            } else if direction == drop_direction
+                && observed.dropped.as_deref().is_some_and(|dropped| {
+                    dropped != datagram
+                        && handshake_flight_fingerprint(dropped)
+                            .is_ok_and(|dropped_fingerprint| dropped_fingerprint == fingerprint)
+                        && record_sequences_are_fresh(dropped, datagram)
+                })
+            {
+                observed.saw_fresh_semantic_retry = true;
+            }
+        }
+        if !should_drop {
+            socket.send_to(datagram, destination).await?;
+        } else if fault == FlightFault::ForwardFirstRecord {
+            let records = DtlsRecord::parse_datagram(datagram)?;
+            let first = records
+                .first()
+                .ok_or(Error::Crypto("faulted DTLS flight is empty".into()))?;
+            socket.send_to(&first.encode()?, destination).await?;
+        }
+    }
+}
+
+fn record_sequences_are_fresh(previous: &[u8], retransmission: &[u8]) -> bool {
+    let Ok(previous) = DtlsRecord::parse_datagram(previous) else {
+        return false;
+    };
+    let Ok(retransmission) = DtlsRecord::parse_datagram(retransmission) else {
+        return false;
+    };
+    previous.len() == retransmission.len()
+        && previous.iter().zip(&retransmission).all(|(before, after)| {
+            before.header.epoch == after.header.epoch
+                && before.header.content_type == after.header.content_type
+                && before.header.sequence_number != after.header.sequence_number
+        })
+}
+
+fn handshake_flight_fingerprint(
+    datagram: &[u8],
+) -> crate::Result<Vec<(u16, ContentType, Vec<u8>)>> {
+    DtlsRecord::parse_datagram(datagram).map(|records| {
+        records
+            .into_iter()
+            .map(|record| {
+                let payload = if record.header.epoch == 0 {
+                    record.payload
+                } else {
+                    Vec::new()
+                };
+                (record.header.epoch, record.header.content_type, payload)
+            })
+            .collect()
+    })
+}
+
 #[tokio::test]
 async fn dtls_server_and_client_reject_wrong_pskc() -> crate::Result<()> {
     let server = DtlsServer::bind("127.0.0.1:0").await?;
@@ -319,21 +528,49 @@ async fn dtls_server_and_client_reject_wrong_pskc() -> crate::Result<()> {
 }
 
 #[tokio::test]
-async fn dtls_server_ignores_wrong_epoch_record_before_cookie_exchange() -> crate::Result<()> {
+async fn dtls_server_ignores_invalid_records_before_cookie_exchange() -> crate::Result<()> {
     let server = DtlsServer::bind("127.0.0.1:0").await?;
     let server_addr = server.local_addr();
     let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
     client_socket.connect(server_addr).await?;
+    let pskc = [0x42; 16];
+    let server_task = tokio::spawn(async move {
+        server
+            .accept(&pskc, core::time::Duration::from_secs(2))
+            .await
+    });
     let ignored = DtlsRecord::new(ContentType::Handshake, 1, 0, vec![0xff])?;
     client_socket.send(&ignored.encode()?).await?;
-    let pskc = [0x42; 16];
+    let mut rng = OsRng;
+    let wrong_epoch_client = ThreadDtlsHandshake::new(&pskc, &mut rng);
+    let mut wrong_epoch_hello = wrong_epoch_client
+        .client_hello_state()?
+        .next_client_hello_record()?;
+    wrong_epoch_hello.header.epoch = 1;
+    client_socket.send(&wrong_epoch_hello.encode()?).await?;
+    let malformed_hello = HandshakeMessage {
+        message_type: HandshakeType::ClientHello,
+        message_seq: 0,
+        payload: vec![0xff],
+    };
+    let malformed_record =
+        DtlsRecord::new(ContentType::Handshake, 0, 0, malformed_hello.encode()?)?;
+    client_socket.send(&malformed_record.encode()?).await?;
 
-    let server_task = server.accept(&pskc, core::time::Duration::from_secs(2));
-    let client_task =
-        DtlsSession::connect(&client_socket, &pskc, core::time::Duration::from_secs(2));
-    let (server_result, client_result) = tokio::join!(server_task, client_task);
-    let server_session = server_result?;
-    let client_session = client_result?;
+    let mut unexpected = [0u8; 4096];
+    assert!(
+        tokio::time::timeout(
+            core::time::Duration::from_millis(50),
+            client_socket.recv(&mut unexpected)
+        )
+        .await
+        .is_err(),
+        "invalid pre-cookie records must not receive a response"
+    );
+
+    let client_session =
+        DtlsSession::connect(&client_socket, &pskc, core::time::Duration::from_secs(2)).await?;
+    let server_session = server_task.await.expect("server task panicked")?;
     assert_eq!(
         server_session.key_material().master_secret,
         client_session.key_material().master_secret
@@ -381,6 +618,51 @@ async fn dtls_server_reports_client_alert_after_cookie_validation() -> crate::Re
             Err(crate::Error::Crypto(message)) if message.contains("description=90")
         ),
         "server must surface the selected peer's alert"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn established_dtls_server_session_reports_client_alerts() -> crate::Result<()> {
+    let server = DtlsServer::bind("127.0.0.1:0").await?;
+    let server_addr = server.local_addr();
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    client_socket.connect(server_addr).await?;
+    let pskc = [0x42; 16];
+
+    let server_task = async move {
+        let mut session = server
+            .accept(&pskc, core::time::Duration::from_secs(2))
+            .await?;
+        session
+            .recv_application_data(core::time::Duration::from_secs(2))
+            .await
+            .map_err(crate::Error::from)
+    };
+    let client_task = async {
+        let session =
+            DtlsSession::connect(&client_socket, &pskc, core::time::Duration::from_secs(2)).await?;
+        let unauthenticated = DtlsRecord::new(ContentType::Alert, 1, 1, vec![2, 40])?;
+        client_socket.send(&unauthenticated.encode()?).await?;
+        let authenticated = protect_aes_128_ccm_8_record(
+            ContentType::Alert,
+            1,
+            1,
+            RecordProtectionKey::new(session.key_material().key_block.client_write_key),
+            &session.key_material().key_block.client_write_iv,
+            &[2, 40],
+        )?;
+        client_socket.send(&authenticated.encode()?).await?;
+        crate::Result::Ok(())
+    };
+    let (server_result, client_result) = tokio::join!(server_task, client_task);
+    client_result?;
+    assert!(
+        matches!(
+            server_result,
+            Err(crate::Error::Crypto(message)) if message.contains("description=40")
+        ),
+        "established session must surface a client alert"
     );
     Ok(())
 }
@@ -496,22 +778,68 @@ async fn connect_reports_alert_and_repeat_cookie_during_server_flight() -> crate
     );
     alerting_server.await.expect("server task panicked")?;
 
-    // A second HelloVerifyRequest after the cookie exchange is a protocol
-    // violation, not a retry.
+    // A new HelloVerifyRequest means the server rejected the previous cookie.
+    // The client must adopt the replacement instead of replaying a stale one.
     let (client, server) = loopback_pair().await?;
     let looping_server = tokio::spawn(async move {
         respond_with_cookie(&server, 0).await?;
-        respond_with_cookie(&server, 1).await?;
+        let second_client_hello = recv_one(&server).await?;
+        let second_records = DtlsRecord::parse_datagram(&second_client_hello)?;
+        let second_message =
+            parse_unfragmented_handshake_record(&second_records[0], HandshakeType::ClientHello)?;
+        let replacement_cookie = vec![0xca, 0xfe];
+        send_cookie_message(
+            &server,
+            second_message.message_seq,
+            second_records[0].header.sequence_number,
+            replacement_cookie.clone(),
+        )
+        .await?;
+        let repeated_client_hello = recv_one(&server).await?;
+        assert_ne!(repeated_client_hello, second_client_hello);
+        let repeated_records = DtlsRecord::parse_datagram(&repeated_client_hello)?;
+        let repeated_message =
+            parse_unfragmented_handshake_record(&repeated_records[0], HandshakeType::ClientHello)?;
+        assert_eq!(
+            ClientHello::decode(&repeated_message.payload)?.cookie,
+            replacement_cookie
+        );
+        let alert = DtlsRecord::new(ContentType::Alert, 0, 2, vec![2, 40])?;
+        server.send(&alert.encode()?).await?;
         crate::Result::Ok(())
     });
     let err = DtlsSession::connect(&client, &[0x42; 16], core::time::Duration::from_secs(2))
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, crate::Error::Crypto(message) if message.contains("second HelloVerifyRequest")),
-        "expected a repeated-cookie error, got {err:?}"
+        matches!(&err, crate::Error::Crypto(message) if message.contains("alert")),
+        "expected the terminating alert, got {err:?}"
     );
     looping_server.await.expect("server task panicked")
+}
+
+#[tokio::test]
+async fn connect_completes_after_the_server_replaces_its_cookie() -> crate::Result<()> {
+    let (client, server) = loopback_pair().await?;
+    let replacing_server = tokio::spawn(async move {
+        test_support::loopback_dtls_server(
+            &server,
+            &[0x42; 16],
+            test_support::LoopbackEnd::ReplaceCookieThenComplete,
+        )
+        .await
+    });
+    let session =
+        DtlsSession::connect(&client, &[0x42; 16], core::time::Duration::from_secs(2)).await?;
+    let server_keys = replacing_server
+        .await
+        .expect("server task panicked")?
+        .expect("replacement-cookie handshake returns keys");
+    assert_eq!(
+        session.key_material().master_secret,
+        server_keys.master_secret
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -544,14 +872,37 @@ async fn connect_reports_alert_instead_of_server_finished() -> crate::Result<()>
 /// Answers one incoming ClientHello with a HelloVerifyRequest.
 async fn respond_with_cookie(socket: &tokio::net::UdpSocket, record_seq: u64) -> crate::Result<()> {
     let datagram = recv_one(socket).await?;
-    let records = DtlsRecord::parse_datagram(&datagram)?;
+    send_cookie_for(socket, &datagram, record_seq).await
+}
+
+async fn send_cookie_for(
+    socket: &tokio::net::UdpSocket,
+    datagram: &[u8],
+    record_seq: u64,
+) -> crate::Result<()> {
+    let records = DtlsRecord::parse_datagram(datagram)?;
     let hello = parse_unfragmented_handshake_record(&records[0], HandshakeType::ClientHello)?;
+    send_cookie_message(
+        socket,
+        hello.message_seq,
+        record_seq,
+        vec![0xc0, 0x0c, 0x1e],
+    )
+    .await
+}
+
+async fn send_cookie_message(
+    socket: &tokio::net::UdpSocket,
+    message_seq: u16,
+    record_seq: u64,
+    cookie: Vec<u8>,
+) -> crate::Result<()> {
     let verify = HandshakeMessage {
         message_type: HandshakeType::HelloVerifyRequest,
-        message_seq: hello.message_seq,
+        message_seq,
         payload: HelloVerifyRequest {
             server_version: DTLS_1_2_VERSION,
-            cookie: vec![0xc0, 0x0c, 0x1e],
+            cookie,
         }
         .encode()?,
     };

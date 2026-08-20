@@ -1,6 +1,6 @@
 //! Runtime-neutral asynchronous DTLS server driver.
 
-use alloc::{format, string::ToString, vec, vec::Vec};
+use alloc::{string::ToString, vec, vec::Vec};
 use core::{net::SocketAddr, time::Duration};
 
 use rand_core::{CryptoRng, RngCore};
@@ -10,11 +10,12 @@ use crate::{
     HandshakeMessage, HandshakeType, HelloVerifyRequest, RecordProtectionKey,
     ThreadDtlsKeyMaterial, ThreadDtlsServerHandshake,
     driver::{
-        DelayNs, DriverResult, SessionRole, SessionState, UnconnectedUdp, decode_alert_error,
-        recv_application_data, recv_records, send_records,
+        DelayNs, DriverError, DriverResult, DuplicateRetransmitBudget, RetransmitSchedule,
+        SessionRole, SessionState, UnconnectedUdp, decode_alert_error, recv_records_from,
+        recv_records_from_unbounded, recv_records_unbounded, send_records, with_timeout,
     },
     open_aes_128_ccm_8_record, parse_unfragmented_handshake_messages,
-    parse_unfragmented_handshake_record, protect_aes_128_ccm_8_record,
+    parse_unfragmented_handshake_record,
 };
 
 const ALERT_LEVEL_FATAL: u8 = 2;
@@ -53,12 +54,19 @@ where
     }
 
     /// Accepts the first cookie-validated peer using caller-supplied randomness.
+    ///
+    /// `timeout` is an absolute deadline for the complete handshake. Outbound
+    /// flights are retransmitted with bounded exponential backoff inside that
+    /// deadline.
     pub async fn accept_with_rng(
         mut self,
         rng: &mut (impl RngCore + CryptoRng),
         pskc: &[u8],
         timeout: Duration,
-    ) -> DriverResult<DtlsServerSession<U, D>, U::Error> {
+    ) -> DriverResult<DtlsServerSession<U, D>, U::Error>
+    where
+        D: Clone,
+    {
         let accepted =
             accept_with_rng(rng, &mut self.transport, &mut self.delay, pskc, timeout).await?;
         Ok(DtlsServerSession {
@@ -66,7 +74,9 @@ where
             delay: self.delay,
             local: accepted.local,
             peer: accepted.peer,
-            state: SessionState::new(accepted.key_material, SessionRole::Server),
+            state: accepted.state,
+            server_finished: accepted.server_finished,
+            next_epoch_zero_record: accepted.next_epoch_zero_record,
         })
     }
 
@@ -84,6 +94,8 @@ pub struct DtlsServerSession<U, D> {
     local: SocketAddr,
     peer: SocketAddr,
     state: SessionState,
+    server_finished: Vec<u8>,
+    next_epoch_zero_record: u64,
 }
 
 impl<U, D> DtlsServerSession<U, D>
@@ -111,15 +123,53 @@ where
     pub async fn recv_application_data(
         &mut self,
         timeout: Duration,
-    ) -> DriverResult<Vec<u8>, U::Error> {
-        recv_application_data(
-            &mut self.state,
-            &mut self.transport,
-            &mut self.delay,
-            self.peer,
-            timeout,
-        )
-        .await
+    ) -> DriverResult<Vec<u8>, U::Error>
+    where
+        D: Clone,
+    {
+        let deadline = self.delay.clone();
+        with_timeout(self.recv_application_data_inner(), deadline, timeout).await
+    }
+
+    async fn recv_application_data_inner(&mut self) -> DriverResult<Vec<u8>, U::Error> {
+        let mut duplicate_retransmissions = DuplicateRetransmitBudget::new();
+        loop {
+            let (records, _, _) =
+                recv_records_from_unbounded(&mut self.transport, self.peer).await?;
+            if !self.server_finished.is_empty()
+                && is_client_finished_flight(&records)
+                && duplicate_retransmissions.take()
+            {
+                let flight = build_server_finished_flight(
+                    &mut self.state,
+                    &self.server_finished,
+                    &mut self.next_epoch_zero_record,
+                )?;
+                send_records(&mut self.transport, self.local, self.peer, &flight).await?;
+            }
+            for record in records {
+                match (record.header.epoch, record.header.content_type) {
+                    (1, ContentType::ApplicationData) => {
+                        if let Ok(Some(plaintext)) = self.state.open_application_data(&record) {
+                            self.server_finished.clear();
+                            return Ok(plaintext);
+                        }
+                    }
+                    (1, ContentType::Alert) => {
+                        if let Ok(Some(plaintext)) = self.state.open_protected_record(&record) {
+                            let alert = DtlsRecord::new(
+                                ContentType::Alert,
+                                1,
+                                record.header.sequence_number,
+                                plaintext,
+                            )?;
+                            return Err(decode_alert_error(&alert).into());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Receives protected application data and sends a protected response.
@@ -127,7 +177,10 @@ where
         &mut self,
         response: &[u8],
         timeout: Duration,
-    ) -> DriverResult<Vec<u8>, U::Error> {
+    ) -> DriverResult<Vec<u8>, U::Error>
+    where
+        D: Clone,
+    {
         let request = self.recv_application_data(timeout).await?;
         self.send_application_data(response).await?;
         Ok(request)
@@ -142,7 +195,9 @@ where
 struct Accepted {
     local: SocketAddr,
     peer: SocketAddr,
-    key_material: ThreadDtlsKeyMaterial,
+    state: SessionState,
+    server_finished: Vec<u8>,
+    next_epoch_zero_record: u64,
 }
 
 async fn accept_with_rng<U, D>(
@@ -154,24 +209,42 @@ async fn accept_with_rng<U, D>(
 ) -> DriverResult<Accepted, U::Error>
 where
     U: UnconnectedUdp,
-    D: DelayNs,
+    D: DelayNs + Clone,
+{
+    let deadline = delay.clone();
+    with_timeout(accept_inner(rng, transport, delay, pskc), deadline, timeout).await
+}
+
+async fn accept_inner<U, D>(
+    rng: &mut (impl RngCore + CryptoRng),
+    transport: &mut U,
+    delay: &D,
+    pskc: &[u8],
+) -> DriverResult<Accepted, U::Error>
+where
+    U: UnconnectedUdp,
+    D: DelayNs + Clone,
 {
     let cookies = DtlsCookieGenerator::new_with_rng(rng);
-    let mut next_epoch_zero_record = 0u64;
-    let (local, peer, client_hello) = loop {
-        let (records, local, peer) = recv_records(transport, delay, timeout).await?;
+    let (local, peer, client_hello, client_hello_record_sequence) = loop {
+        let (records, local, peer) = recv_records_unbounded(transport).await?;
         let mut accepted = None;
         for record in records {
             if record.header.epoch != 0 || record.header.content_type != ContentType::Handshake {
                 continue;
             }
-            for message in parse_unfragmented_handshake_messages(&record)? {
+            let Ok(messages) = parse_unfragmented_handshake_messages(&record) else {
+                continue;
+            };
+            for message in messages {
                 if message.message_type != HandshakeType::ClientHello {
                     continue;
                 }
-                let hello = ClientHello::decode(&message.payload)?;
+                let Ok(hello) = ClientHello::decode(&message.payload) else {
+                    continue;
+                };
                 if cookies.verify(&hello.random, &hello.cookie) {
-                    accepted = Some(message);
+                    accepted = Some((message, record.header.sequence_number));
                     break;
                 }
                 let verify = HandshakeMessage {
@@ -186,28 +259,29 @@ where
                 let verify_record = DtlsRecord::new(
                     ContentType::Handshake,
                     0,
-                    next_epoch_zero_record,
+                    record.header.sequence_number,
                     verify.encode()?,
                 )?;
-                next_epoch_zero_record = next_epoch_zero_record.wrapping_add(1);
                 send_records(transport, local, peer, &[verify_record]).await?;
             }
             if accepted.is_some() {
                 break;
             }
         }
-        if let Some(message) = accepted {
-            break (local, peer, message);
+        if let Some((message, record_sequence)) = accepted {
+            break (local, peer, message, record_sequence);
         }
     };
 
     let mut handshake = ThreadDtlsServerHandshake::new_with_rng(rng, pskc);
     handshake.handle_client_hello(&client_hello)?;
+    let mut next_epoch_zero_record = client_hello_record_sequence;
+    let server_message_sequence = client_hello.message_seq;
     let mut server_flight = Vec::new();
     for message in [
-        handshake.build_server_hello(1)?,
-        handshake.build_server_key_exchange(2, rng)?,
-        handshake.build_server_hello_done(3)?,
+        handshake.build_server_hello(server_message_sequence)?,
+        handshake.build_server_key_exchange(server_message_sequence.wrapping_add(1), rng)?,
+        handshake.build_server_hello_done(server_message_sequence.wrapping_add(2))?,
     ] {
         server_flight.push(DtlsRecord::new(
             ContentType::Handshake,
@@ -219,26 +293,47 @@ where
     }
     send_records(transport, local, peer, &server_flight).await?;
 
+    let mut schedule = RetransmitSchedule::new();
+    let mut duplicate_retransmissions = DuplicateRetransmitBudget::new();
     let mut saw_change_cipher_spec = false;
     let mut key_material = None;
+    let mut client_key_exchange = None;
     loop {
-        let (records, _, source) = recv_records(transport, delay, timeout).await?;
-        if source != peer {
+        let (records, _, _) =
+            match recv_records_from(transport, delay, peer, schedule.timeout()).await {
+                Ok(received) => received,
+                Err(DriverError::Timeout) => {
+                    renumber_epoch_zero_flight(&mut server_flight, &mut next_epoch_zero_record);
+                    send_records(transport, local, peer, &server_flight).await?;
+                    schedule.back_off();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+        if contains_client_hello(&records, &client_hello) {
+            if duplicate_retransmissions.take() {
+                renumber_epoch_zero_flight(&mut server_flight, &mut next_epoch_zero_record);
+                send_records(transport, local, peer, &server_flight).await?;
+            }
             continue;
         }
         for record in records {
             match (record.header.epoch, record.header.content_type) {
                 (0, ContentType::Handshake) => {
-                    for message in parse_unfragmented_handshake_messages(&record)? {
+                    let Ok(messages) = parse_unfragmented_handshake_messages(&record) else {
+                        continue;
+                    };
+                    for message in messages {
                         if message.message_type != HandshakeType::ClientKeyExchange {
-                            return Err(Error::Crypto(format!(
-                                "unexpected DTLS handshake message {:?}",
-                                message.message_type
-                            ))
-                            .into());
+                            continue;
+                        }
+                        if client_key_exchange.as_ref() == Some(&message) {
+                            continue;
                         }
                         handshake.handle_client_key_exchange(&message)?;
                         key_material = Some(handshake.derive_key_material()?);
+                        client_key_exchange = Some(message);
                     }
                 }
                 (0, ContentType::ChangeCipherSpec) => {
@@ -286,41 +381,94 @@ where
                             .await?;
                         return Err(error.into());
                     }
-                    let server_finished = handshake.build_server_finished(4, keys)?;
-                    let change_cipher_spec = DtlsRecord::new(
-                        ContentType::ChangeCipherSpec,
-                        0,
-                        next_epoch_zero_record,
-                        vec![1],
-                    )?;
-                    let protected_finished = protect_aes_128_ccm_8_record(
-                        ContentType::Handshake,
-                        1,
-                        0,
-                        RecordProtectionKey::new(keys.key_block.server_write_key),
-                        &keys.key_block.server_write_iv,
-                        &server_finished.encode()?,
-                    )?;
-                    send_records(
-                        transport,
-                        local,
-                        peer,
-                        &[change_cipher_spec, protected_finished],
-                    )
-                    .await?;
+                    let server_finished = handshake
+                        .build_server_finished(server_message_sequence.wrapping_add(3), keys)?;
+                    let server_finished = server_finished.encode()?;
                     let key_material = key_material
+                        .take()
                         .ok_or(Error::InvalidState("client key material is missing"))?;
+                    let mut state =
+                        SessionState::during_handshake(key_material, SessionRole::Server);
+                    let server_finished_flight = build_server_finished_flight(
+                        &mut state,
+                        &server_finished,
+                        &mut next_epoch_zero_record,
+                    )?;
+                    send_records(transport, local, peer, &server_finished_flight).await?;
                     return Ok(Accepted {
                         local,
                         peer,
-                        key_material,
+                        state,
+                        server_finished,
+                        next_epoch_zero_record,
                     });
                 }
-                (_, ContentType::Alert) => return Err(decode_alert_error(&record).into()),
+                (0, ContentType::Alert) => return Err(decode_alert_error(&record).into()),
                 _ => {}
             }
         }
     }
+}
+
+fn contains_client_hello(records: &[DtlsRecord], expected: &HandshakeMessage) -> bool {
+    for record in records {
+        if record.header.epoch != 0 || record.header.content_type != ContentType::Handshake {
+            continue;
+        }
+        let Ok(messages) = parse_unfragmented_handshake_messages(record) else {
+            continue;
+        };
+        if messages.iter().any(|message| message == expected) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_client_finished_flight(records: &[DtlsRecord]) -> bool {
+    records.iter().any(
+        |record| match (record.header.epoch, record.header.content_type) {
+            (0, ContentType::Handshake) => {
+                parse_unfragmented_handshake_messages(record).is_ok_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message.message_type == HandshakeType::ClientKeyExchange)
+                })
+            }
+            (1, ContentType::Handshake) => true,
+            _ => false,
+        },
+    )
+}
+
+fn build_server_finished_flight(
+    state: &mut SessionState,
+    server_finished: &[u8],
+    next_epoch_zero_record: &mut u64,
+) -> crate::Result<Vec<DtlsRecord>> {
+    Ok(vec![
+        DtlsRecord::new(
+            ContentType::ChangeCipherSpec,
+            0,
+            take_record_sequence(next_epoch_zero_record),
+            vec![1],
+        )?,
+        state.protect_record(ContentType::Handshake, server_finished)?,
+    ])
+}
+
+fn renumber_epoch_zero_flight(records: &mut [DtlsRecord], next_sequence: &mut u64) {
+    for record in records {
+        if record.header.epoch == 0 {
+            record.header.sequence_number = take_record_sequence(next_sequence);
+        }
+    }
+}
+
+fn take_record_sequence(next_sequence: &mut u64) -> u64 {
+    let sequence = *next_sequence;
+    *next_sequence = next_sequence.wrapping_add(1);
+    sequence
 }
 
 async fn send_fatal_handshake_alert<U>(
@@ -339,4 +487,73 @@ where
         vec![ALERT_LEVEL_FATAL, ALERT_HANDSHAKE_FAILURE],
     )?;
     send_records(transport, local, peer, &[alert]).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handshake_record(message: &HandshakeMessage, epoch: u16) -> DtlsRecord {
+        DtlsRecord::new(
+            ContentType::Handshake,
+            epoch,
+            1,
+            message.encode().expect("encode handshake message"),
+        )
+        .expect("build handshake record")
+    }
+
+    #[test]
+    fn duplicate_client_hello_requires_the_expected_epoch_zero_handshake() {
+        let expected = HandshakeMessage {
+            message_type: HandshakeType::ClientHello,
+            message_seq: 1,
+            payload: vec![1, 2, 3],
+        };
+        let record = handshake_record(&expected, 0);
+        assert!(contains_client_hello(
+            core::slice::from_ref(&record),
+            &expected
+        ));
+
+        let wrong_epoch = handshake_record(&expected, 1);
+        assert!(!contains_client_hello(&[wrong_epoch], &expected));
+        let wrong_content = DtlsRecord::new(
+            ContentType::ApplicationData,
+            0,
+            1,
+            expected.encode().expect("encode handshake message"),
+        )
+        .expect("build wrong-content record");
+        assert!(!contains_client_hello(&[wrong_content], &expected));
+    }
+
+    #[test]
+    fn recognizes_each_meaningful_client_finished_flight_record() {
+        let key_exchange = HandshakeMessage {
+            message_type: HandshakeType::ClientKeyExchange,
+            message_seq: 2,
+            payload: Vec::new(),
+        };
+        assert!(is_client_finished_flight(&[handshake_record(
+            &key_exchange,
+            0
+        )]));
+
+        let server_hello = HandshakeMessage {
+            message_type: HandshakeType::ServerHello,
+            message_seq: 1,
+            payload: Vec::new(),
+        };
+        assert!(!is_client_finished_flight(&[handshake_record(
+            &server_hello,
+            0
+        )]));
+        let encrypted_finished =
+            DtlsRecord::new(ContentType::Handshake, 1, 1, vec![0xaa]).expect("finished record");
+        assert!(is_client_finished_flight(&[encrypted_finished]));
+        let change_cipher_spec =
+            DtlsRecord::new(ContentType::ChangeCipherSpec, 0, 2, vec![1]).expect("CCS record");
+        assert!(!is_client_finished_flight(&[change_cipher_spec]));
+    }
 }

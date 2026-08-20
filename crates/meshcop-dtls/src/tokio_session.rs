@@ -7,7 +7,7 @@ use tokio::net::UdpSocket;
 
 use crate::{
     Result, ThreadDtlsKeyMaterial, client_driver,
-    driver::{SessionRole, SessionState, recv_application_data, send_records},
+    driver::{SessionState, recv_application_data, send_records},
     tokio_transport::{BorrowedTokioUdpTransport, TokioDelay},
 };
 
@@ -18,25 +18,24 @@ pub struct DtlsSession {
 }
 
 impl DtlsSession {
-    /// Creates a session from already-derived key material.
-    pub fn new(key_material: ThreadDtlsKeyMaterial) -> Self {
-        Self {
-            state: SessionState::new(key_material, SessionRole::Client),
-        }
-    }
-
     /// Returns the derived key material.
     pub const fn key_material(&self) -> &ThreadDtlsKeyMaterial {
         self.state.key_material()
     }
 
     /// Runs the Thread PSKc/ECJPAKE DTLS handshake over a connected UDP socket.
+    ///
+    /// `timeout` is an absolute deadline for the complete, automatically
+    /// retransmitted handshake.
     pub async fn connect(socket: &UdpSocket, pskc: &[u8], timeout: Duration) -> Result<Self> {
         let mut rng = rand_core::OsRng;
         Self::connect_with_rng(&mut rng, socket, pskc, timeout).await
     }
 
     /// Runs the handshake using cryptographic randomness supplied by the caller.
+    ///
+    /// `timeout` is an absolute deadline for the complete, automatically
+    /// retransmitted handshake.
     pub async fn connect_with_rng(
         rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng),
         socket: &UdpSocket,
@@ -95,8 +94,8 @@ impl DtlsSession {
     ) -> Result<Vec<u8>> {
         let peer = socket.peer_addr()?;
         let mut transport = BorrowedTokioUdpTransport::new(socket);
-        let mut delay = TokioDelay;
-        recv_application_data(&mut self.state, &mut transport, &mut delay, peer, timeout)
+        let delay = TokioDelay;
+        recv_application_data(&mut self.state, &mut transport, &delay, peer, timeout)
             .await
             .map_err(crate::Error::from)
     }

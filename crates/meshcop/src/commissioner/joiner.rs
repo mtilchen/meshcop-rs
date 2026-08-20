@@ -33,6 +33,7 @@ use meshcop_dtls::{
 /// The IID of a joiner is its randomized link-local interface identifier; the
 /// joiner ID restores the universal/local bit.
 const LOCAL_EXTERNAL_ADDR_MASK: u8 = 1 << 1;
+pub(crate) const MAX_DUPLICATE_FLIGHT_RETRANSMISSIONS: u8 = 4;
 
 /// How long a joiner session may live before it is swept: the maximum DTLS
 /// handshake time plus the JOIN_FIN.req wait, matching the C++ reference.
@@ -187,6 +188,49 @@ enum JoinerSessionPhase {
     Finalized,
 }
 
+#[derive(Debug, Default)]
+struct JoinerReplayWindow {
+    newest_sequence: Option<u64>,
+    seen: u64,
+}
+
+impl JoinerReplayWindow {
+    fn has_seen(&self, sequence: u64) -> bool {
+        let Some(newest) = self.newest_sequence else {
+            return false;
+        };
+        if sequence > newest {
+            return false;
+        }
+        let offset = newest - sequence;
+        offset >= u64::BITS as u64 || ((self.seen >> offset) & 1) == 1
+    }
+
+    fn mark_seen(&mut self, sequence: u64) {
+        match self.newest_sequence {
+            None => {
+                self.newest_sequence = Some(sequence);
+                self.seen = 1;
+            }
+            Some(newest) if sequence > newest => {
+                let shift = sequence - newest;
+                self.seen = if shift >= u64::BITS as u64 {
+                    1
+                } else {
+                    (self.seen << shift) | 1
+                };
+                self.newest_sequence = Some(sequence);
+            }
+            Some(newest) => {
+                let offset = newest - sequence;
+                if offset < u64::BITS as u64 {
+                    self.seen |= 1 << offset;
+                }
+            }
+        }
+    }
+}
+
 /// One in-progress joiner commissioning session.
 #[derive(Debug)]
 pub(crate) struct JoinerSession {
@@ -198,8 +242,14 @@ pub(crate) struct JoinerSession {
     handshake: ThreadDtlsServerHandshake,
     cookie: DtlsCookieGenerator,
     key_material: Option<ThreadDtlsKeyMaterial>,
-    /// Cached server flight so a retransmitted ClientHello can be answered.
-    server_flight: Vec<u8>,
+    /// Cached handshake messages so retransmissions can use fresh records.
+    accepted_client_hello: Option<HandshakeMessage>,
+    accepted_client_key_exchange: Option<HandshakeMessage>,
+    server_flight: Vec<DtlsRecord>,
+    server_finished: Vec<u8>,
+    server_flight_retransmissions: u8,
+    server_finished_retransmissions: u8,
+    replay_window: JoinerReplayWindow,
     epoch0_sequence: u64,
     epoch1_sequence: u64,
     saw_client_change_cipher_spec: bool,
@@ -226,7 +276,13 @@ impl JoinerSession {
             handshake: ThreadDtlsServerHandshake::new(pskd.as_bytes(), rng),
             cookie: DtlsCookieGenerator::new(rng),
             key_material: None,
+            accepted_client_hello: None,
+            accepted_client_key_exchange: None,
             server_flight: Vec::new(),
+            server_finished: Vec::new(),
+            server_flight_retransmissions: 0,
+            server_finished_retransmissions: 0,
+            replay_window: JoinerReplayWindow::default(),
             epoch0_sequence: 0,
             epoch1_sequence: 0,
             saw_client_change_cipher_spec: false,
@@ -267,12 +323,35 @@ impl JoinerSession {
         handler: &mut dyn JoinerHandler,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<Vec<JoinerSessionEvent>> {
+        let records = DtlsRecord::parse_datagram(encapsulated)?;
+        let was_established = matches!(
+            self.phase,
+            JoinerSessionPhase::Connected | JoinerSessionPhase::Finalized
+        );
         let mut events = Vec::new();
-        for record in DtlsRecord::parse_datagram(encapsulated)? {
+        if was_established
+            && !self.server_finished.is_empty()
+            && is_client_finished_flight(&records)
+            && self.server_finished_retransmissions < MAX_DUPLICATE_FLIGHT_RETRANSMISSIONS
+        {
+            self.server_finished_retransmissions =
+                self.server_finished_retransmissions.saturating_add(1);
+            events.push(JoinerSessionEvent::Transmit {
+                datagram: self.build_server_finished_flight()?,
+                include_kek: false,
+            });
+        }
+
+        for record in records {
             match (record.header.epoch, record.header.content_type) {
-                (0, ContentType::Handshake) => {
+                (0, ContentType::Handshake) if !was_established => {
                     for message in parse_unfragmented_handshake_messages(&record)? {
-                        self.handle_plaintext_handshake(&message, &mut events, rng)?;
+                        self.handle_plaintext_handshake(
+                            &message,
+                            record.header.sequence_number,
+                            &mut events,
+                            rng,
+                        )?;
                     }
                 }
                 (0, ContentType::ChangeCipherSpec) => {
@@ -289,11 +368,26 @@ impl JoinerSession {
                 (1, ContentType::ApplicationData) => {
                     self.handle_application_data(&record, handler, &mut events)?;
                 }
-                (_, ContentType::Alert) => {
+                (0, ContentType::Alert)
+                    if !matches!(
+                        self.phase,
+                        JoinerSessionPhase::Connected | JoinerSessionPhase::Finalized
+                    ) =>
+                {
                     return Err(Error::Crypto(format!(
                         "joiner DTLS alert epoch={} seq={}",
                         record.header.epoch, record.header.sequence_number
                     )));
+                }
+                (1, ContentType::Alert) => {
+                    if let Ok(Some(plaintext)) = self.open_record(&record) {
+                        return Err(Error::Crypto(format!(
+                            "joiner DTLS alert epoch=1 seq={} level={} description={}",
+                            record.header.sequence_number,
+                            plaintext.first().copied().unwrap_or_default(),
+                            plaintext.get(1).copied().unwrap_or_default()
+                        )));
+                    }
                 }
                 _ => {}
             }
@@ -304,6 +398,7 @@ impl JoinerSession {
     fn handle_plaintext_handshake(
         &mut self,
         message: &HandshakeMessage,
+        record_sequence: u64,
         events: &mut Vec<JoinerSessionEvent>,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<()> {
@@ -320,7 +415,13 @@ impl JoinerSession {
                         }
                         .encode()?,
                     };
-                    let datagram = self.plaintext_record(verify.encode()?)?;
+                    let datagram = DtlsRecord::new(
+                        ContentType::Handshake,
+                        0,
+                        record_sequence,
+                        verify.encode()?,
+                    )?
+                    .encode()?;
                     events.push(JoinerSessionEvent::Transmit {
                         datagram,
                         include_kek: false,
@@ -329,14 +430,22 @@ impl JoinerSession {
                 }
 
                 self.handshake.handle_client_hello(message)?;
-                let server_hello = self.handshake.build_server_hello(1)?;
-                let key_exchange = self.handshake.build_server_key_exchange(2, rng)?;
-                let hello_done = self.handshake.build_server_hello_done(3)?;
-                let mut datagram = Vec::new();
-                datagram.extend_from_slice(&self.plaintext_record(server_hello.encode()?)?);
-                datagram.extend_from_slice(&self.plaintext_record(key_exchange.encode()?)?);
-                datagram.extend_from_slice(&self.plaintext_record(hello_done.encode()?)?);
-                self.server_flight = datagram.clone();
+                self.accepted_client_hello = Some(message.clone());
+                self.epoch0_sequence = record_sequence;
+                let server_message_sequence = message.message_seq;
+                let server_hello = self.handshake.build_server_hello(server_message_sequence)?;
+                let key_exchange = self
+                    .handshake
+                    .build_server_key_exchange(server_message_sequence.wrapping_add(1), rng)?;
+                let hello_done = self
+                    .handshake
+                    .build_server_hello_done(server_message_sequence.wrapping_add(2))?;
+                self.server_flight = vec![
+                    self.plaintext_record(server_hello.encode()?)?,
+                    self.plaintext_record(key_exchange.encode()?)?,
+                    self.plaintext_record(hello_done.encode()?)?,
+                ];
+                let datagram = encode_records(&self.server_flight)?;
                 self.phase = JoinerSessionPhase::AwaitingClientFlight;
                 events.push(JoinerSessionEvent::Transmit {
                     datagram,
@@ -345,16 +454,26 @@ impl JoinerSession {
                 Ok(())
             }
             (HandshakeType::ClientHello, JoinerSessionPhase::AwaitingClientFlight) => {
-                // The server flight was lost; repeat it for the retried hello.
-                events.push(JoinerSessionEvent::Transmit {
-                    datagram: self.server_flight.clone(),
-                    include_kek: false,
-                });
+                if self.accepted_client_hello.as_ref() == Some(message)
+                    && self.server_flight_retransmissions < MAX_DUPLICATE_FLIGHT_RETRANSMISSIONS
+                {
+                    self.server_flight_retransmissions =
+                        self.server_flight_retransmissions.saturating_add(1);
+                    renumber_epoch_zero_flight(&mut self.server_flight, &mut self.epoch0_sequence);
+                    events.push(JoinerSessionEvent::Transmit {
+                        datagram: encode_records(&self.server_flight)?,
+                        include_kek: false,
+                    });
+                }
                 Ok(())
             }
             (HandshakeType::ClientKeyExchange, JoinerSessionPhase::AwaitingClientFlight) => {
+                if self.accepted_client_key_exchange.as_ref() == Some(message) {
+                    return Ok(());
+                }
                 self.handshake.handle_client_key_exchange(message)?;
                 self.key_material = Some(self.handshake.derive_key_material()?);
+                self.accepted_client_key_exchange = Some(message.clone());
                 Ok(())
             }
             _ => Err(Error::Crypto(format!(
@@ -377,7 +496,9 @@ impl JoinerSession {
                 "joiner Finished arrived before ChangeCipherSpec".to_string(),
             ));
         }
-        let plaintext = self.open_record(record)?;
+        let Some(plaintext) = self.open_record(record)? else {
+            return Ok(());
+        };
         let plain_record = DtlsRecord::new(ContentType::Handshake, 1, 0, plaintext)?;
         for message in parse_unfragmented_handshake_messages(&plain_record)? {
             if message.message_type != HandshakeType::Finished {
@@ -386,19 +507,16 @@ impl JoinerSession {
             let key_material = self.key_material_required()?.clone();
             self.handshake
                 .verify_client_finished(&message, &key_material)?;
-            let server_finished = self.handshake.build_server_finished(4, &key_material)?;
-
-            let mut datagram = self.plaintext_change_cipher_spec()?;
-            let finished_record = protect_aes_128_ccm_8_record(
-                ContentType::Handshake,
-                1,
-                self.epoch1_sequence,
-                RecordProtectionKey::new(key_material.key_block.server_write_key),
-                &key_material.key_block.server_write_iv,
-                &server_finished.encode()?,
-            )?;
-            self.epoch1_sequence = self.epoch1_sequence.wrapping_add(1);
-            datagram.extend_from_slice(&finished_record.encode()?);
+            let server_message_sequence = self
+                .accepted_client_hello
+                .as_ref()
+                .ok_or(Error::InvalidState("accepted ClientHello is missing"))?
+                .message_seq;
+            let server_finished = self
+                .handshake
+                .build_server_finished(server_message_sequence.wrapping_add(3), &key_material)?;
+            self.server_finished = server_finished.encode()?;
+            let datagram = self.build_server_finished_flight()?;
             self.phase = JoinerSessionPhase::Connected;
             events.push(JoinerSessionEvent::Transmit {
                 datagram,
@@ -423,7 +541,10 @@ impl JoinerSession {
                 "joiner application data before handshake completion".to_string(),
             ));
         }
-        let plaintext = self.open_record(record)?;
+        let Some(plaintext) = self.open_record(record)? else {
+            return Ok(());
+        };
+        self.server_finished.clear();
         let request = CoapMessage::decode(&plaintext)?;
         if request.uri_path()?.as_deref() != Some(meshcop::uri::JOIN_FIN) {
             return Ok(());
@@ -489,23 +610,29 @@ impl JoinerSession {
             .ok_or(Error::InvalidState("joiner key material is not derived"))
     }
 
-    fn open_record(&self, record: &DtlsRecord) -> Result<Vec<u8>> {
-        let key_material = self.key_material_required()?;
-        open_aes_128_ccm_8_record(
-            record,
-            RecordProtectionKey::new(key_material.key_block.client_write_key),
-            &key_material.key_block.client_write_iv,
-        )
-        .map_err(Error::from)
+    fn open_record(&mut self, record: &DtlsRecord) -> Result<Option<Vec<u8>>> {
+        if self.replay_window.has_seen(record.header.sequence_number) {
+            return Ok(None);
+        }
+        let plaintext = {
+            let key_material = self.key_material_required()?;
+            open_aes_128_ccm_8_record(
+                record,
+                RecordProtectionKey::new(key_material.key_block.client_write_key),
+                &key_material.key_block.client_write_iv,
+            )?
+        };
+        self.replay_window.mark_seen(record.header.sequence_number);
+        Ok(Some(plaintext))
     }
 
-    fn plaintext_record(&mut self, payload: Vec<u8>) -> Result<Vec<u8>> {
+    fn plaintext_record(&mut self, payload: Vec<u8>) -> Result<DtlsRecord> {
         let record = DtlsRecord::new(ContentType::Handshake, 0, self.epoch0_sequence, payload)?;
         self.epoch0_sequence = self.epoch0_sequence.wrapping_add(1);
-        record.encode().map_err(Error::from)
+        Ok(record)
     }
 
-    fn plaintext_change_cipher_spec(&mut self) -> Result<Vec<u8>> {
+    fn plaintext_change_cipher_spec(&mut self) -> Result<DtlsRecord> {
         let record = DtlsRecord::new(
             ContentType::ChangeCipherSpec,
             0,
@@ -513,8 +640,61 @@ impl JoinerSession {
             vec![1],
         )?;
         self.epoch0_sequence = self.epoch0_sequence.wrapping_add(1);
-        record.encode().map_err(Error::from)
+        Ok(record)
     }
+
+    fn build_server_finished_flight(&mut self) -> Result<Vec<u8>> {
+        let key_material = self.key_material_required()?.clone();
+        let change_cipher_spec = self.plaintext_change_cipher_spec()?;
+        let finished = protect_aes_128_ccm_8_record(
+            ContentType::Handshake,
+            1,
+            self.epoch1_sequence,
+            RecordProtectionKey::new(key_material.key_block.server_write_key),
+            &key_material.key_block.server_write_iv,
+            &self.server_finished,
+        )?;
+        self.epoch1_sequence = self.epoch1_sequence.wrapping_add(1);
+        encode_records(&[change_cipher_spec, finished])
+    }
+}
+
+pub(crate) fn is_client_finished_flight(records: &[DtlsRecord]) -> bool {
+    records.iter().any(
+        |record| match (record.header.epoch, record.header.content_type) {
+            (0, ContentType::Handshake) => {
+                parse_unfragmented_handshake_messages(record).is_ok_and(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message.message_type == HandshakeType::ClientKeyExchange)
+                })
+            }
+            (1, ContentType::Handshake) => true,
+            _ => false,
+        },
+    )
+}
+
+fn renumber_epoch_zero_flight(records: &mut [DtlsRecord], next_sequence: &mut u64) {
+    for record in records {
+        if record.header.epoch == 0 {
+            record.header.sequence_number = take_record_sequence(next_sequence);
+        }
+    }
+}
+
+fn take_record_sequence(next_sequence: &mut u64) -> u64 {
+    let sequence = *next_sequence;
+    *next_sequence = next_sequence.wrapping_add(1);
+    sequence
+}
+
+fn encode_records(records: &[DtlsRecord]) -> Result<Vec<u8>> {
+    let mut datagram = Vec::new();
+    for record in records {
+        datagram.extend_from_slice(&record.encode()?);
+    }
+    Ok(datagram)
 }
 
 impl JoinerFinalizeInfo {
@@ -571,4 +751,49 @@ impl JoinerFinalizeInfo {
 /// Parses a JOIN_FIN.req message.
 pub(crate) fn parse_join_fin(request: &CoapMessage) -> Result<JoinerFinalizeInfo> {
     JoinerFinalizeInfo::from_payload(&request.payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JoinerReplayWindow;
+
+    #[test]
+    fn replay_window_preserves_gaps_and_marks_older_sequences() {
+        let mut window = JoinerReplayWindow::default();
+        assert!(!window.has_seen(10));
+        window.mark_seen(10);
+        window.mark_seen(12);
+        assert!(window.has_seen(10));
+        assert!(!window.has_seen(11));
+        assert!(window.has_seen(12));
+        assert!(!window.has_seen(13));
+
+        window.mark_seen(11);
+        assert!(window.has_seen(10));
+        assert!(window.has_seen(11));
+        assert!(window.has_seen(12));
+        window.mark_seen(10);
+        assert!(window.has_seen(10));
+        assert!(window.has_seen(12));
+    }
+
+    #[test]
+    fn replay_window_handles_both_edges_of_its_bitmap() {
+        let width = u64::BITS as u64;
+        let mut window = JoinerReplayWindow::default();
+        window.mark_seen(1);
+        window.mark_seen(1 + width);
+        assert!(window.has_seen(1 + width));
+        assert!(window.has_seen(1));
+        assert!(!window.has_seen(2));
+        window.mark_seen(1);
+        assert!(!window.has_seen(2));
+
+        let mut nearby = JoinerReplayWindow::default();
+        nearby.mark_seen(20);
+        nearby.mark_seen(18);
+        assert!(nearby.has_seen(18));
+        assert!(!nearby.has_seen(19));
+        assert!(nearby.has_seen(20));
+    }
 }

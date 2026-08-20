@@ -200,7 +200,8 @@ write_summary() {
             echo "| OpenThread \`${openthread_ref}\` (posix ot-daemon, simulated RCP) | border agent + leader | DTLS/EC-J-PAKE over UDP | ${result} |"
             echo
             echo "Covered: successful and wrong-PSKc DTLS 1.2 + EC J-PAKE handshakes,"
-            echo "recovery after authentication failure, commissioner contention and"
+            echo "recovery after authentication failure, loss of every DTLS flight and"
+            echo "the first CoAP petition request/response, commissioner contention and"
             echo "takeover, COMM_PET, COMM_KA, MGMT_ACTIVE_GET (full dataset compare),"
             echo "MGMT_COMMISSIONER_GET and unicast/asynchronous network diagnostics via"
             echo "the UDP_TX/UDP_RX proxy, and resign. Joiner coverage commissions a"

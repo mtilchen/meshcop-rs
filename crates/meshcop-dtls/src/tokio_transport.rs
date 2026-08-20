@@ -99,7 +99,7 @@ impl From<DriverError<std::io::Error>> for Error {
         match error {
             DriverError::Protocol(error) => error,
             DriverError::Transport(error) => Self::Io(error),
-            DriverError::Timeout => Self::Timeout("DTLS receive timed out"),
+            DriverError::Timeout => Self::Timeout("DTLS operation timed out"),
         }
     }
 }
@@ -119,6 +119,9 @@ impl DtlsServer<TokioUdpTransport, TokioDelay> {
     }
 
     /// Accepts the first cookie-validated peer using OS randomness.
+    ///
+    /// `timeout` is an absolute deadline for the complete, automatically
+    /// retransmitted handshake.
     pub async fn accept(
         self,
         pskc: &[u8],

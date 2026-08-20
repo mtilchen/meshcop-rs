@@ -17,7 +17,7 @@ it once against a device on the bench" are very different claims:
 
 | Peer | Roles exercised | Assurance | Where |
 | --- | --- | --- | --- |
-| **OpenThread** `v2026.06.0` — posix `ot-daemon` (border agent + leader) + simulated RCP | Commissioner authentication, arbitration, diagnostics, and joiner commissioning | Continuous (every PR/push + weekly) | [interop.yml](../.github/workflows/interop.yml), [tools/ci/interop.sh](../tools/ci/interop.sh) |
+| **OpenThread** `v2026.06.0` — posix `ot-daemon` (border agent + leader) + simulated RCP | Commissioner authentication, loss recovery, arbitration, diagnostics, and joiner commissioning | Continuous (every PR/push + weekly) | [interop.yml](../.github/workflows/interop.yml), [tools/ci/interop.sh](../tools/ci/interop.sh) |
 | **Physical Thread border router** (Espressif ESP-Matter) | Commissioner session + dataset/commissioner-dataset reads | Manual, author-run, point-in-time | [tests/live_border_router.rs](../crates/meshcop/tests/live_border_router.rs) |
 | **mbedTLS / OpenSSL / Thread spec / OpenThread** | Crypto primitives + key schedule | Vector (every build) | [VECTORS.md](VECTORS.md) |
 
@@ -26,7 +26,7 @@ it once against a device on the bench" are very different claims:
 The [interop gate](../.github/workflows/interop.yml) builds OpenThread at a
 pinned release (a posix `ot-daemon` border router driven by a simulated RCP over
 forkpty — the arrangement the C++ `ot-commissioner` integration suite uses),
-forms a Thread network, and runs five gated tests against the live border agent
+forms a Thread network, and runs six gated tests against the live border agent
 on loopback:
 
 - **Commissioner session:** DTLS 1.2 + EC J-PAKE handshake (PSKc), `COMM_PET`
@@ -36,6 +36,11 @@ on loopback:
 - **Authentication failure and recovery:** a commissioner using the wrong PSKc
   must fail during DTLS authentication, after which a fresh commissioner using
   the correct PSKc must immediately petition and resign successfully.
+- **Packet-loss recovery:** a protocol-aware loopback UDP fault proxy recognizes
+  handshake messages rather than assuming fixed packet ordinals. In separate
+  sessions it drops one datagram from each of the three commissioner and three
+  border-agent flight positions, then the first CoAP petition request and
+  response. Every case must still petition and resign against OpenThread.
 - **Commissioner arbitration:** while one commissioner is active, a second
   commissioner must receive a petition rejection naming the incumbent. After
   the incumbent resigns, that same contender must petition successfully.

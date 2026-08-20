@@ -12,6 +12,11 @@
 //! - `MESHCOP_MUTATE_OK=1` — explicit authorization for the joiner test to
 //!   update steering data on the disposable network.
 //!
+//! A protocol-aware loopback UDP fault proxy also drops one datagram from each
+//! DTLS handshake flight position and the first confirmable CoAP
+//! request/response once, proving recovery against the live OpenThread
+//! implementation rather than only the in-process peer.
+//!
 //! The dataset for this network is disposable CI test data (the fixed vectors
 //! from the C++ `ot-commissioner` integration suite), but the test still never
 //! prints TLV values on failure — only types and lengths — so it stays safe to
@@ -21,6 +26,10 @@ use std::collections::BTreeSet;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use meshcop::{
@@ -36,6 +45,7 @@ use meshcop::{
     },
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::net::UdpSocket;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 #[tokio::test]
@@ -57,6 +67,170 @@ async fn interop_commissioner_session_against_openthread() -> meshcop::Result<()
     let resign = commissioner.resign().await;
     session?;
     resign
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultTarget {
+    InitialClientHello,
+    HelloVerifyRequest,
+    CookieClientHello,
+    ServerHandshake,
+    ClientFinished,
+    ServerFinished,
+    PetitionRequest,
+    PetitionResponse,
+}
+
+#[tokio::test]
+#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
+async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()> {
+    let (border_agent, expected) = interop_inputs()?;
+    for target in [
+        FaultTarget::InitialClientHello,
+        FaultTarget::HelloVerifyRequest,
+        FaultTarget::CookieClientHello,
+        FaultTarget::ServerHandshake,
+        FaultTarget::ClientFinished,
+        FaultTarget::ServerFinished,
+        FaultTarget::PetitionRequest,
+        FaultTarget::PetitionResponse,
+    ] {
+        run_packet_loss_case(border_agent, &expected, target).await?;
+    }
+    Ok(())
+}
+
+async fn run_packet_loss_case(
+    border_agent: SocketAddr,
+    dataset: &Dataset,
+    target: FaultTarget,
+) -> meshcop::Result<()> {
+    let proxy = UdpSocket::bind("[::1]:0").await?;
+    let proxy_addr = proxy.local_addr()?;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let proxy_dropped = Arc::clone(&dropped);
+    let proxy_task =
+        tokio::spawn(
+            async move { run_fault_proxy(proxy, border_agent, target, proxy_dropped).await },
+        );
+
+    let config = CommissionerConfig::from_dataset("meshcop-loss", dataset)?;
+    let mut commissioner = Commissioner::connect(config, proxy_addr).await?;
+    let petition = commissioner.petition().await;
+    let resign = resign_if_active(&mut commissioner).await;
+    proxy_task.abort();
+    match proxy_task.await {
+        Err(error) if error.is_cancelled() => {}
+        Err(_) => return Err(Error::InvalidState("fault proxy task panicked")),
+        Ok(Err(error)) => return Err(error),
+        Ok(Ok(())) => return Err(Error::InvalidState("fault proxy exited unexpectedly")),
+    }
+
+    petition?;
+    resign?;
+    if !dropped.load(Ordering::Relaxed) {
+        return Err(Error::Dataset(format!(
+            "fault proxy did not observe and drop {target:?}"
+        )));
+    }
+    Ok(())
+}
+
+async fn run_fault_proxy(
+    socket: UdpSocket,
+    border_agent: SocketAddr,
+    target: FaultTarget,
+    dropped: Arc<AtomicBool>,
+) -> meshcop::Result<()> {
+    let mut commissioner_addr = None;
+    let mut buffer = [0u8; meshcop_dtls::driver::MAX_DATAGRAM_SIZE];
+    loop {
+        let (length, source) = socket.recv_from(&mut buffer).await?;
+        let (from_commissioner, destination) = if source == border_agent {
+            let Some(commissioner_addr) = commissioner_addr else {
+                continue;
+            };
+            (false, commissioner_addr)
+        } else {
+            match commissioner_addr {
+                None => commissioner_addr = Some(source),
+                Some(expected) if source != expected => continue,
+                Some(_) => {}
+            }
+            (true, border_agent)
+        };
+
+        let observed = classify_fault_target(&buffer[..length], from_commissioner);
+        if observed == Some(target) && !dropped.swap(true, Ordering::Relaxed) {
+            continue;
+        }
+        socket.send_to(&buffer[..length], destination).await?;
+    }
+}
+
+fn classify_fault_target(datagram: &[u8], from_commissioner: bool) -> Option<FaultTarget> {
+    use meshcop_dtls::{
+        ClientHello, ContentType, DtlsRecord, HandshakeType, parse_unfragmented_handshake_messages,
+    };
+
+    let Ok(records) = DtlsRecord::parse_datagram(datagram) else {
+        return None;
+    };
+    if records.iter().any(|record| {
+        record.header.epoch == 1 && record.header.content_type == ContentType::ApplicationData
+    }) {
+        return Some(if from_commissioner {
+            FaultTarget::PetitionRequest
+        } else {
+            FaultTarget::PetitionResponse
+        });
+    }
+
+    for record in &records {
+        if record.header.epoch != 0 || record.header.content_type != ContentType::Handshake {
+            continue;
+        }
+        let Ok(messages) = parse_unfragmented_handshake_messages(record) else {
+            continue;
+        };
+        for message in messages {
+            match message.message_type {
+                HandshakeType::ClientHello => {
+                    let Ok(hello) = ClientHello::decode(&message.payload) else {
+                        continue;
+                    };
+                    return Some(if hello.cookie.is_empty() {
+                        FaultTarget::InitialClientHello
+                    } else {
+                        FaultTarget::CookieClientHello
+                    });
+                }
+                HandshakeType::HelloVerifyRequest => {
+                    return Some(FaultTarget::HelloVerifyRequest);
+                }
+                HandshakeType::ServerHello
+                | HandshakeType::ServerKeyExchange
+                | HandshakeType::ServerHelloDone => {
+                    return Some(FaultTarget::ServerHandshake);
+                }
+                HandshakeType::ClientKeyExchange => {
+                    return Some(FaultTarget::ClientFinished);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if records.iter().any(|record| {
+        record.header.epoch == 1 && record.header.content_type == ContentType::Handshake
+    }) {
+        return Some(if from_commissioner {
+            FaultTarget::ClientFinished
+        } else {
+            FaultTarget::ServerFinished
+        });
+    }
+    None
 }
 
 const PRIMARY_COMMISSIONER_ID: &str = "meshcop-primary";

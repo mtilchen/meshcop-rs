@@ -14,10 +14,17 @@
 //! adapter, socket buffers, and executor policy while this crate owns only
 //! DTLS state.
 //!
-//! Tokio support uses small adapters for the same traits. The receive policy
-//! deliberately matches the original Tokio client: each expected flight gets
-//! the caller's timeout and sent flights are not automatically retransmitted.
-//! No additional retry or backoff policy is imposed here.
+//! Tokio support uses small adapters for the same traits. Handshakes retain
+//! each outbound flight and retransmit the same handshake messages in records
+//! with fresh sequence numbers after an initial one-second timeout, doubling
+//! the interval up to 60 seconds. A duplicate of the peer's preceding flight
+//! triggers an immediate retransmission, capped at four duplicate-triggered
+//! responses per wait to bound reflection. The caller's timeout is an absolute
+//! deadline for the complete handshake rather than a fresh allowance for
+//! every receive. Handshake and receive methods clone the [`DelayNs`] value so
+//! an absolute deadline and an inner receive/retransmission timer can remain
+//! live concurrently; embedded timer adapters therefore need cheap,
+//! independent `Clone` semantics and enough timer capacity for both futures.
 
 use alloc::{format, vec::Vec};
 use core::{
@@ -39,6 +46,10 @@ use crate::{
 /// Maximum UDP datagram accepted by the async drivers.
 pub const MAX_DATAGRAM_SIZE: usize = 4096;
 
+pub(crate) const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_DUPLICATE_RETRANSMISSIONS: u8 = 4;
+
 /// Error produced by a runtime-neutral DTLS driver.
 #[derive(Debug)]
 pub enum DriverError<E> {
@@ -46,7 +57,7 @@ pub enum DriverError<E> {
     Protocol(Error),
     /// The datagram transport failed.
     Transport(E),
-    /// A receive did not complete within the supplied timeout.
+    /// A DTLS operation did not complete before its supplied deadline.
     Timeout,
 }
 
@@ -61,7 +72,7 @@ impl<E: fmt::Display> fmt::Display for DriverError<E> {
         match self {
             Self::Protocol(error) => error.fmt(formatter),
             Self::Transport(error) => write!(formatter, "datagram transport error: {error}"),
-            Self::Timeout => formatter.write_str("DTLS receive timed out"),
+            Self::Timeout => formatter.write_str("DTLS operation timed out"),
         }
     }
 }
@@ -83,6 +94,46 @@ where
 pub type DriverResult<T, E> = core::result::Result<T, DriverError<E>>;
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct RetransmitSchedule {
+    timeout: Duration,
+}
+
+impl RetransmitSchedule {
+    pub(crate) const fn new() -> Self {
+        Self {
+            timeout: INITIAL_RETRANSMIT_TIMEOUT,
+        }
+    }
+
+    pub(crate) const fn timeout(self) -> Duration {
+        self.timeout
+    }
+
+    pub(crate) fn back_off(&mut self) {
+        self.timeout = self.timeout.saturating_mul(2).min(MAX_RETRANSMIT_TIMEOUT);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DuplicateRetransmitBudget {
+    used: u8,
+}
+
+impl DuplicateRetransmitBudget {
+    pub(crate) const fn new() -> Self {
+        Self { used: 0 }
+    }
+
+    pub(crate) fn take(&mut self) -> bool {
+        if self.used >= MAX_DUPLICATE_RETRANSMISSIONS {
+            return false;
+        }
+        self.used = self.used.saturating_add(1);
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum SessionRole {
     Client,
     Server,
@@ -97,11 +148,24 @@ pub(crate) struct SessionState {
 }
 
 impl SessionState {
+    #[cfg(test)]
     pub(crate) fn new(key_material: ThreadDtlsKeyMaterial, role: SessionRole) -> Self {
+        Self::with_next_application_sequence(key_material, role, 1)
+    }
+
+    pub(crate) fn during_handshake(key_material: ThreadDtlsKeyMaterial, role: SessionRole) -> Self {
+        Self::with_next_application_sequence(key_material, role, 0)
+    }
+
+    fn with_next_application_sequence(
+        key_material: ThreadDtlsKeyMaterial,
+        role: SessionRole,
+        next_application_sequence: u64,
+    ) -> Self {
         Self {
             key_material,
             role,
-            next_application_sequence: 1,
+            next_application_sequence,
             application_replay: DtlsReplayWindow::new(),
         }
     }
@@ -112,6 +176,14 @@ impl SessionState {
 
     pub(crate) fn protect_application_data(
         &mut self,
+        plaintext: &[u8],
+    ) -> crate::Result<DtlsRecord> {
+        self.protect_record(ContentType::ApplicationData, plaintext)
+    }
+
+    pub(crate) fn protect_record(
+        &mut self,
+        content_type: ContentType,
         plaintext: &[u8],
     ) -> crate::Result<DtlsRecord> {
         let (key, iv) = match self.role {
@@ -125,7 +197,7 @@ impl SessionState {
             ),
         };
         let record = protect_aes_128_ccm_8_record(
-            ContentType::ApplicationData,
+            content_type,
             1,
             self.next_application_sequence,
             RecordProtectionKey::new(key),
@@ -137,6 +209,13 @@ impl SessionState {
     }
 
     pub(crate) fn open_application_data(
+        &mut self,
+        record: &DtlsRecord,
+    ) -> crate::Result<Option<Vec<u8>>> {
+        self.open_protected_record(record)
+    }
+
+    pub(crate) fn open_protected_record(
         &mut self,
         record: &DtlsRecord,
     ) -> crate::Result<Option<Vec<u8>>> {
@@ -182,6 +261,7 @@ where
         .map_err(DriverError::Transport)
 }
 
+#[cfg(test)]
 pub(crate) async fn recv_records<U, D>(
     transport: &mut U,
     delay: &mut D,
@@ -191,43 +271,113 @@ where
     U: UnconnectedUdp,
     D: DelayNs,
 {
+    with_timeout(recv_records_unbounded(transport), delay, duration).await
+}
+
+pub(crate) async fn recv_records_from<U, D>(
+    transport: &mut U,
+    delay: &D,
+    peer: SocketAddr,
+    duration: Duration,
+) -> DriverResult<(Vec<DtlsRecord>, SocketAddr, SocketAddr), U::Error>
+where
+    U: UnconnectedUdp,
+    D: DelayNs + Clone,
+{
+    let receive = recv_records_from_unbounded(transport, peer);
+    with_timeout(receive, delay.clone(), duration).await
+}
+
+pub(crate) async fn recv_records_from_unbounded<U>(
+    transport: &mut U,
+    peer: SocketAddr,
+) -> DriverResult<(Vec<DtlsRecord>, SocketAddr, SocketAddr), U::Error>
+where
+    U: UnconnectedUdp,
+{
+    loop {
+        let (datagram, local, remote) = recv_datagram_unbounded(transport).await?;
+        if remote == peer {
+            return Ok((DtlsRecord::parse_datagram(&datagram)?, local, remote));
+        }
+    }
+}
+
+pub(crate) async fn recv_records_unbounded<U>(
+    transport: &mut U,
+) -> DriverResult<(Vec<DtlsRecord>, SocketAddr, SocketAddr), U::Error>
+where
+    U: UnconnectedUdp,
+{
+    let (datagram, local, remote) = recv_datagram_unbounded(transport).await?;
+    Ok((DtlsRecord::parse_datagram(&datagram)?, local, remote))
+}
+
+async fn recv_datagram_unbounded<U>(
+    transport: &mut U,
+) -> DriverResult<(Vec<u8>, SocketAddr, SocketAddr), U::Error>
+where
+    U: UnconnectedUdp,
+{
     let mut buffer = [0u8; MAX_DATAGRAM_SIZE];
-    let (length, local, remote) =
-        recv_with_timeout(transport, delay, &mut buffer, duration).await?;
+    let (length, local, remote) = transport
+        .receive_into(&mut buffer)
+        .await
+        .map_err(DriverError::Transport)?;
     if length > buffer.len() {
         return Err(Error::Crypto("DTLS datagram is too long".into()).into());
     }
-    Ok((
-        DtlsRecord::parse_datagram(&buffer[..length])?,
-        local,
-        remote,
-    ))
+    Ok((buffer[..length].to_vec(), local, remote))
 }
 
 pub(crate) async fn recv_application_data<U, D>(
     state: &mut SessionState,
     transport: &mut U,
-    delay: &mut D,
+    delay: &D,
     peer: SocketAddr,
     duration: Duration,
 ) -> DriverResult<Vec<u8>, U::Error>
 where
     U: UnconnectedUdp,
-    D: DelayNs,
+    D: DelayNs + Clone,
+{
+    let deadline = delay.clone();
+    with_timeout(
+        recv_application_data_inner(state, transport, peer),
+        deadline,
+        duration,
+    )
+    .await
+}
+
+async fn recv_application_data_inner<U>(
+    state: &mut SessionState,
+    transport: &mut U,
+    peer: SocketAddr,
+) -> DriverResult<Vec<u8>, U::Error>
+where
+    U: UnconnectedUdp,
 {
     loop {
-        let (records, _, source) = recv_records(transport, delay, duration).await?;
-        if source != peer {
-            continue;
-        }
+        let (records, _, _) = recv_records_from_unbounded(transport, peer).await?;
         for record in records {
             match (record.header.epoch, record.header.content_type) {
                 (1, ContentType::ApplicationData) => {
-                    if let Some(plaintext) = state.open_application_data(&record)? {
+                    if let Ok(Some(plaintext)) = state.open_application_data(&record) {
                         return Ok(plaintext);
                     }
                 }
-                (_, ContentType::Alert) => return Err(decode_alert_error(&record).into()),
+                (1, ContentType::Alert) => {
+                    if let Ok(Some(plaintext)) = state.open_protected_record(&record) {
+                        let alert = DtlsRecord::new(
+                            ContentType::Alert,
+                            1,
+                            record.header.sequence_number,
+                            plaintext,
+                        )?;
+                        return Err(decode_alert_error(&alert).into());
+                    }
+                }
                 _ => {}
             }
         }
@@ -251,24 +401,22 @@ pub(crate) fn decode_alert_error(record: &DtlsRecord) -> Error {
     }
 }
 
-async fn recv_with_timeout<U, D>(
-    transport: &mut U,
-    delay: &mut D,
-    buffer: &mut [u8],
+pub(crate) async fn with_timeout<F, D, T, E>(
+    future: F,
+    mut delay: D,
     duration: Duration,
-) -> DriverResult<(usize, SocketAddr, SocketAddr), U::Error>
+) -> DriverResult<T, E>
 where
-    U: UnconnectedUdp,
+    F: Future<Output = DriverResult<T, E>>,
     D: DelayNs,
 {
-    let receive = transport.receive_into(buffer);
-    let timeout = delay_duration(delay, duration);
-    let mut receive = core::pin::pin!(receive);
+    let timeout = delay_duration(&mut delay, duration);
+    let mut future = core::pin::pin!(future);
     let mut timeout = core::pin::pin!(timeout);
 
     poll_fn(|context| {
-        if let Poll::Ready(result) = receive.as_mut().poll(context) {
-            return Poll::Ready(result.map_err(DriverError::Transport));
+        if let Poll::Ready(result) = future.as_mut().poll(context) {
+            return Poll::Ready(result);
         }
         if timeout.as_mut().poll(context).is_ready() {
             return Poll::Ready(Err(DriverError::Timeout));
@@ -391,6 +539,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
     struct PendingDelay;
 
     impl DelayNs for PendingDelay {
@@ -462,6 +611,7 @@ mod tests {
     /// `delay_duration` test below: a mutated termination condition or
     /// accumulator would otherwise spin the test binary forever instead of
     /// failing it.
+    #[derive(Clone)]
     struct BudgetedDelay {
         calls: u32,
         total_nanoseconds: u128,
@@ -524,7 +674,7 @@ mod tests {
         );
 
         let timeout = DriverError::<MockTransportError>::Timeout;
-        assert_eq!(format!("{timeout}"), "DTLS receive timed out");
+        assert_eq!(format!("{timeout}"), "DTLS operation timed out");
     }
 
     #[test]
@@ -699,21 +849,67 @@ mod tests {
     }
 
     #[test]
-    fn recv_application_data_ignores_plain_records_and_reports_alerts() {
+    fn retransmit_schedule_doubles_and_caps_at_sixty_seconds() {
+        let mut schedule = RetransmitSchedule::new();
+        let expected = [1, 2, 4, 8, 16, 32, 60, 60];
+        for seconds in expected {
+            assert_eq!(schedule.timeout(), Duration::from_secs(seconds));
+            schedule.back_off();
+        }
+    }
+
+    #[test]
+    fn duplicate_retransmit_budget_stops_after_four_responses() {
+        let mut budget = DuplicateRetransmitBudget::new();
+        for _ in 0..MAX_DUPLICATE_RETRANSMISSIONS {
+            assert!(budget.take());
+        }
+        assert!(!budget.take());
+    }
+
+    #[test]
+    fn with_timeout_bounds_a_pending_operation() {
+        let pending = async { poll_fn(|_| Poll::<DriverResult<(), Infallible>>::Pending).await };
+        let result = futures_lite_for_test::block_on(with_timeout(
+            pending,
+            BudgetedDelay::new(),
+            Duration::from_nanos(1),
+        ));
+        assert!(matches!(result, Err(DriverError::Timeout)));
+    }
+
+    #[test]
+    fn recv_application_data_ignores_unauthenticated_records_and_reports_protected_alerts() {
         let ignored = DtlsRecord::new(ContentType::Handshake, 0, 0, vec![0xde]).expect("ignored");
-        let alert = DtlsRecord::new(ContentType::Alert, 1, 1, vec![2, 40]).expect("alert");
+        let unauthenticated =
+            DtlsRecord::new(ContentType::Alert, 1, 1, vec![2, 40]).expect("unauthenticated");
+        let key_material = test_key_material();
+        let alert = protect_aes_128_ccm_8_record(
+            ContentType::Alert,
+            1,
+            1,
+            RecordProtectionKey::new(key_material.key_block.server_write_key),
+            &key_material.key_block.server_write_iv,
+            &[2, 40],
+        )
+        .expect("protected alert");
         let mut datagram = ignored.encode().expect("ignored record encodes");
+        datagram.extend_from_slice(
+            &unauthenticated
+                .encode()
+                .expect("unauthenticated record encodes"),
+        );
         datagram.extend_from_slice(&alert.encode().expect("alert record encodes"));
 
         let mut transport = QueuedUdp {
             queue: VecDeque::from([(datagram, LOCAL_ADDR, PEER_ADDR)]),
         };
-        let mut delay = PendingDelay;
-        let mut state = SessionState::new(test_key_material(), SessionRole::Client);
+        let delay = PendingDelay;
+        let mut state = SessionState::new(key_material, SessionRole::Client);
         let err = futures_lite_for_test::block_on(recv_application_data(
             &mut state,
             &mut transport,
-            &mut delay,
+            &delay,
             PEER_ADDR,
             Duration::from_secs(1),
         ))
@@ -752,7 +948,7 @@ mod tests {
         .expect("protect second record");
 
         let mut state = SessionState::new(key_material, SessionRole::Client);
-        let mut delay = PendingDelay;
+        let delay = PendingDelay;
 
         let mut transport = QueuedUdp {
             queue: VecDeque::from([(
@@ -764,7 +960,7 @@ mod tests {
         let first = futures_lite_for_test::block_on(recv_application_data(
             &mut state,
             &mut transport,
-            &mut delay,
+            &delay,
             PEER_ADDR,
             Duration::from_secs(1),
         ))
@@ -779,7 +975,7 @@ mod tests {
         let second = futures_lite_for_test::block_on(recv_application_data(
             &mut state,
             &mut transport,
-            &mut delay,
+            &delay,
             PEER_ADDR,
             Duration::from_secs(1),
         ))
@@ -792,12 +988,12 @@ mod tests {
         let mut transport = QueuedUdp {
             queue: VecDeque::new(),
         };
-        let mut delay = BudgetedDelay::new();
+        let delay = BudgetedDelay::new();
         let mut state = SessionState::new(test_key_material(), SessionRole::Client);
         let err = futures_lite_for_test::block_on(recv_application_data(
             &mut state,
             &mut transport,
-            &mut delay,
+            &delay,
             PEER_ADDR,
             Duration::from_millis(10),
         ))

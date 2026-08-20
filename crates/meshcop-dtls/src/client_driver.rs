@@ -9,11 +9,12 @@ use crate::{
     ContentType, DtlsClientHelloState, DtlsRecord, Error, HandshakeType, RecordProtectionKey,
     ThreadDtlsHandshake, ThreadDtlsKeyMaterial,
     driver::{
-        DelayNs, DriverResult, SessionRole, SessionState, UnconnectedUdp, decode_alert_error,
-        recv_application_data, recv_records, send_records,
+        DelayNs, DriverError, DriverResult, DuplicateRetransmitBudget, RetransmitSchedule,
+        SessionRole, SessionState, UnconnectedUdp, decode_alert_error, recv_application_data,
+        recv_records_from, send_records, with_timeout,
     },
     open_aes_128_ccm_8_record, parse_unfragmented_handshake_messages,
-    parse_unfragmented_handshake_record, protect_aes_128_ccm_8_record,
+    parse_unfragmented_handshake_record,
     util::dtls_trace,
 };
 
@@ -45,12 +46,19 @@ where
     }
 
     /// Runs the Thread PSKc/ECJPAKE handshake with caller-supplied randomness.
+    ///
+    /// `timeout` is an absolute deadline for the complete handshake. Outbound
+    /// flights are retransmitted with bounded exponential backoff inside that
+    /// deadline.
     pub async fn connect_with_rng(
         mut self,
         rng: &mut (impl RngCore + CryptoRng),
         pskc: &[u8],
         timeout: Duration,
-    ) -> DriverResult<DtlsClientSession<U, D>, U::Error> {
+    ) -> DriverResult<DtlsClientSession<U, D>, U::Error>
+    where
+        D: Clone,
+    {
         let state = connect_with_rng(
             rng,
             &mut self.transport,
@@ -106,11 +114,14 @@ where
     pub async fn recv_application_data(
         &mut self,
         timeout: Duration,
-    ) -> DriverResult<Vec<u8>, U::Error> {
+    ) -> DriverResult<Vec<u8>, U::Error>
+    where
+        D: Clone,
+    {
         recv_application_data(
             &mut self.state,
             &mut self.transport,
-            &mut self.delay,
+            &self.delay,
             self.peer,
             timeout,
         )
@@ -122,7 +133,10 @@ where
         &mut self,
         plaintext: &[u8],
         timeout: Duration,
-    ) -> DriverResult<Vec<u8>, U::Error> {
+    ) -> DriverResult<Vec<u8>, U::Error>
+    where
+        D: Clone,
+    {
         self.send_application_data(plaintext).await?;
         self.recv_application_data(timeout).await
     }
@@ -144,30 +158,77 @@ pub(crate) async fn connect_with_rng<U, D>(
 ) -> DriverResult<SessionState, U::Error>
 where
     U: UnconnectedUdp,
-    D: DelayNs,
+    D: DelayNs + Clone,
+{
+    let deadline = delay.clone();
+    with_timeout(
+        connect_inner(rng, transport, delay, local, peer, pskc),
+        deadline,
+        timeout,
+    )
+    .await
+}
+
+async fn connect_inner<U, D>(
+    rng: &mut (impl RngCore + CryptoRng),
+    transport: &mut U,
+    delay: &mut D,
+    local: SocketAddr,
+    peer: SocketAddr,
+    pskc: &[u8],
+) -> DriverResult<SessionState, U::Error>
+where
+    U: UnconnectedUdp,
+    D: DelayNs + Clone,
 {
     let mut handshake = ThreadDtlsHandshake::new_with_rng(rng, pskc);
     let mut hello_state = handshake.client_hello_state()?;
+    let mut next_epoch_zero_record = 0u64;
 
-    let first_client_hello = hello_state.next_client_hello_record()?;
+    let mut first_client_flight = vec![hello_state.next_client_hello_record()?];
+    renumber_epoch_zero_flight(&mut first_client_flight, &mut next_epoch_zero_record);
     dtls_trace(format_args!(
         "send first ClientHello record_seq={}",
-        first_client_hello.header.sequence_number
+        first_client_flight[0].header.sequence_number
     ));
-    send_records(transport, local, peer, &[first_client_hello]).await?;
-    wait_for_hello_verify(transport, delay, peer, &mut hello_state, timeout).await?;
+    send_records(transport, local, peer, &first_client_flight).await?;
+    wait_for_hello_verify(
+        ClientHandshakeIo {
+            transport,
+            delay,
+            local,
+            peer,
+            next_epoch_zero_record: &mut next_epoch_zero_record,
+        },
+        &mut first_client_flight,
+        &mut hello_state,
+    )
+    .await?;
 
-    let second_client_hello = hello_state.next_client_hello_record()?;
-    let client_hello_message =
-        parse_unfragmented_handshake_record(&second_client_hello, HandshakeType::ClientHello)?;
+    let mut second_client_flight = vec![hello_state.next_client_hello_record()?];
+    renumber_epoch_zero_flight(&mut second_client_flight, &mut next_epoch_zero_record);
+    let mut client_hello_message =
+        parse_unfragmented_handshake_record(&second_client_flight[0], HandshakeType::ClientHello)?;
     dtls_trace(format_args!(
         "send second ClientHello record_seq={} message_seq={}",
-        second_client_hello.header.sequence_number, client_hello_message.message_seq
+        second_client_flight[0].header.sequence_number, client_hello_message.message_seq
     ));
-    handshake.record_client_hello(&client_hello_message)?;
-    send_records(transport, local, peer, &[second_client_hello]).await?;
+    send_records(transport, local, peer, &second_client_flight).await?;
 
-    wait_for_server_flight(transport, delay, peer, &mut handshake, timeout).await?;
+    let server_flight = wait_for_server_flight(
+        ClientHandshakeIo {
+            transport,
+            delay,
+            local,
+            peer,
+            next_epoch_zero_record: &mut next_epoch_zero_record,
+        },
+        &mut second_client_flight,
+        &mut hello_state,
+        &mut client_hello_message,
+        &mut handshake,
+    )
+    .await?;
 
     let client_key_exchange_seq = hello_state.next_message_sequence();
     let client_key_exchange = handshake.build_client_key_exchange(client_key_exchange_seq, rng)?;
@@ -175,74 +236,71 @@ where
     let client_finished =
         handshake.build_client_finished(client_key_exchange_seq.wrapping_add(1))?;
 
-    let next_epoch_zero_record = hello_state.next_record_sequence();
-    let client_key_exchange_record = DtlsRecord::new(
-        ContentType::Handshake,
-        0,
-        next_epoch_zero_record,
-        client_key_exchange.encode()?,
-    )?;
-    let change_cipher_spec = DtlsRecord::new(
-        ContentType::ChangeCipherSpec,
-        0,
-        next_epoch_zero_record.wrapping_add(1),
-        vec![1],
-    )?;
-    let client_finished_record = protect_aes_128_ccm_8_record(
-        ContentType::Handshake,
-        1,
-        0,
-        RecordProtectionKey::new(key_material.key_block.client_write_key),
-        &key_material.key_block.client_write_iv,
-        &client_finished.encode()?,
+    let mut state = SessionState::during_handshake(key_material, SessionRole::Client);
+    let mut client_finished_flight = build_client_finished_flight(
+        &client_key_exchange,
+        &client_finished,
+        &mut state,
+        &mut next_epoch_zero_record,
     )?;
     dtls_trace(format_args!(
         "send ClientKeyExchange message_seq={} record_seq={}, CCS record_seq={}, Finished message_seq={} epoch1_record_seq=0",
         client_key_exchange.message_seq,
-        client_key_exchange_record.header.sequence_number,
-        change_cipher_spec.header.sequence_number,
+        client_finished_flight[0].header.sequence_number,
+        client_finished_flight[1].header.sequence_number,
         client_finished.message_seq
     ));
-    send_records(
-        transport,
-        local,
-        peer,
-        &[
-            client_key_exchange_record,
-            change_cipher_spec,
-            client_finished_record,
-        ],
-    )
-    .await?;
+    send_records(transport, local, peer, &client_finished_flight).await?;
 
     wait_for_server_finished(
-        transport,
-        delay,
-        peer,
+        ClientHandshakeIo {
+            transport,
+            delay,
+            local,
+            peer,
+            next_epoch_zero_record: &mut next_epoch_zero_record,
+        },
+        &mut client_finished_flight,
+        &client_key_exchange,
+        &client_finished,
+        &server_flight,
         &mut handshake,
-        &key_material,
-        timeout,
+        &mut state,
     )
     .await?;
-    Ok(SessionState::new(key_material, SessionRole::Client))
+    Ok(state)
+}
+
+struct ClientHandshakeIo<'a, U, D> {
+    transport: &'a mut U,
+    delay: &'a D,
+    local: SocketAddr,
+    peer: SocketAddr,
+    next_epoch_zero_record: &'a mut u64,
 }
 
 async fn wait_for_hello_verify<U, D>(
-    transport: &mut U,
-    delay: &mut D,
-    peer: SocketAddr,
+    io: ClientHandshakeIo<'_, U, D>,
+    client_flight: &mut [DtlsRecord],
     hello_state: &mut DtlsClientHelloState,
-    duration: Duration,
 ) -> DriverResult<(), U::Error>
 where
     U: UnconnectedUdp,
-    D: DelayNs,
+    D: DelayNs + Clone,
 {
+    let mut schedule = RetransmitSchedule::new();
     loop {
-        let (records, _, source) = recv_records(transport, delay, duration).await?;
-        if source != peer {
-            continue;
-        }
+        let (records, _, _) =
+            match recv_records_from(io.transport, io.delay, io.peer, schedule.timeout()).await {
+                Ok(received) => received,
+                Err(DriverError::Timeout) => {
+                    renumber_epoch_zero_flight(client_flight, io.next_epoch_zero_record);
+                    send_records(io.transport, io.local, io.peer, client_flight).await?;
+                    schedule.back_off();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         for record in records {
             match record.header.content_type {
                 ContentType::Handshake => {
@@ -267,25 +325,39 @@ where
 }
 
 async fn wait_for_server_flight<U, D>(
-    transport: &mut U,
-    delay: &mut D,
-    peer: SocketAddr,
+    io: ClientHandshakeIo<'_, U, D>,
+    client_flight: &mut Vec<DtlsRecord>,
+    hello_state: &mut DtlsClientHelloState,
+    client_hello_message: &mut crate::HandshakeMessage,
     handshake: &mut ThreadDtlsHandshake,
-    duration: Duration,
-) -> DriverResult<(), U::Error>
+) -> DriverResult<Vec<crate::HandshakeMessage>, U::Error>
 where
     U: UnconnectedUdp,
-    D: DelayNs,
+    D: DelayNs + Clone,
 {
-    loop {
-        let (records, _, source) = recv_records(transport, delay, duration).await?;
-        if source != peer {
-            continue;
-        }
+    let mut schedule = RetransmitSchedule::new();
+    let mut duplicate_retransmissions = DuplicateRetransmitBudget::new();
+    let mut recorded_client_hello = false;
+    let mut server_flight = Vec::new();
+    'receive: loop {
+        let (records, _, _) =
+            match recv_records_from(io.transport, io.delay, io.peer, schedule.timeout()).await {
+                Ok(received) => received,
+                Err(DriverError::Timeout) => {
+                    renumber_epoch_zero_flight(client_flight, io.next_epoch_zero_record);
+                    send_records(io.transport, io.local, io.peer, client_flight).await?;
+                    schedule.back_off();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         for record in records {
             match record.header.content_type {
                 ContentType::Handshake => {
                     for message in parse_unfragmented_handshake_messages(&record)? {
+                        if server_flight.contains(&message) {
+                            continue;
+                        }
                         dtls_trace(format_args!(
                             "recv handshake {:?} message_seq={} len={}",
                             message.message_type,
@@ -294,6 +366,10 @@ where
                         ));
                         match message.message_type {
                             HandshakeType::ServerHello => {
+                                if !recorded_client_hello {
+                                    handshake.record_client_hello(client_hello_message)?;
+                                    recorded_client_hello = true;
+                                }
                                 let hello = handshake.handle_server_hello(&message)?;
                                 dtls_trace(format_args!(
                                     "server extensions={:?}",
@@ -303,19 +379,47 @@ where
                                         .map(|extension| extension.extension_type)
                                         .collect::<Vec<_>>()
                                 ));
+                                server_flight.push(message);
                             }
                             HandshakeType::ServerKeyExchange => {
                                 handshake.handle_server_key_exchange(&message)?;
+                                server_flight.push(message);
                             }
                             HandshakeType::ServerHelloDone => {
                                 handshake.handle_server_hello_done(&message)?;
-                                return Ok(());
+                                server_flight.push(message);
+                                return Ok(server_flight);
                             }
                             HandshakeType::HelloVerifyRequest => {
-                                return Err(Error::Crypto(
-                                    "received unexpected second HelloVerifyRequest".to_string(),
-                                )
-                                .into());
+                                // Once ServerHello has committed the peer to
+                                // this cookie exchange, a reordered HVR is
+                                // stale and must not rewrite the transcript.
+                                if recorded_client_hello {
+                                    continue;
+                                }
+                                if !duplicate_retransmissions.take() {
+                                    continue;
+                                }
+                                if hello_state.handle_hello_verify_request(&record).is_ok() {
+                                    *client_flight = vec![hello_state.next_client_hello_record()?];
+                                    renumber_epoch_zero_flight(
+                                        client_flight,
+                                        io.next_epoch_zero_record,
+                                    );
+                                    *client_hello_message = parse_unfragmented_handshake_record(
+                                        &client_flight[0],
+                                        HandshakeType::ClientHello,
+                                    )?;
+                                    schedule = RetransmitSchedule::new();
+                                } else {
+                                    renumber_epoch_zero_flight(
+                                        client_flight,
+                                        io.next_epoch_zero_record,
+                                    );
+                                }
+                                send_records(io.transport, io.local, io.peer, client_flight)
+                                    .await?;
+                                continue 'receive;
                             }
                             _ => {
                                 return Err(Error::Crypto(format!(
@@ -335,26 +439,54 @@ where
 }
 
 async fn wait_for_server_finished<U, D>(
-    transport: &mut U,
-    delay: &mut D,
-    peer: SocketAddr,
+    io: ClientHandshakeIo<'_, U, D>,
+    client_flight: &mut Vec<DtlsRecord>,
+    client_key_exchange: &crate::HandshakeMessage,
+    client_finished: &crate::HandshakeMessage,
+    server_flight: &[crate::HandshakeMessage],
     handshake: &mut ThreadDtlsHandshake,
-    key_material: &ThreadDtlsKeyMaterial,
-    duration: Duration,
+    state: &mut SessionState,
 ) -> DriverResult<(), U::Error>
 where
     U: UnconnectedUdp,
-    D: DelayNs,
+    D: DelayNs + Clone,
 {
+    let mut schedule = RetransmitSchedule::new();
+    let mut duplicate_retransmissions = DuplicateRetransmitBudget::new();
     let mut saw_change_cipher_spec = false;
     loop {
-        let (records, _, source) = recv_records(transport, delay, duration).await?;
-        if source != peer {
+        let (records, _, _) =
+            match recv_records_from(io.transport, io.delay, io.peer, schedule.timeout()).await {
+                Ok(received) => received,
+                Err(DriverError::Timeout) => {
+                    *client_flight = build_client_finished_flight(
+                        client_key_exchange,
+                        client_finished,
+                        state,
+                        io.next_epoch_zero_record,
+                    )?;
+                    send_records(io.transport, io.local, io.peer, client_flight).await?;
+                    schedule.back_off();
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+
+        if is_retransmitted_server_flight(&records, server_flight) {
+            if duplicate_retransmissions.take() {
+                *client_flight = build_client_finished_flight(
+                    client_key_exchange,
+                    client_finished,
+                    state,
+                    io.next_epoch_zero_record,
+                )?;
+                send_records(io.transport, io.local, io.peer, client_flight).await?;
+            }
             continue;
         }
         for record in records {
             match (record.header.epoch, record.header.content_type) {
-                (_, ContentType::ChangeCipherSpec) => {
+                (0, ContentType::ChangeCipherSpec) => {
                     if record.payload != [1] {
                         return Err(
                             Error::Crypto("invalid ChangeCipherSpec payload".to_string()).into(),
@@ -375,8 +507,8 @@ where
                     }
                     let plaintext = open_aes_128_ccm_8_record(
                         &record,
-                        RecordProtectionKey::new(key_material.key_block.server_write_key),
-                        &key_material.key_block.server_write_iv,
+                        RecordProtectionKey::new(state.key_material().key_block.server_write_key),
+                        &state.key_material().key_block.server_write_iv,
                     )?;
                     let plain_record = DtlsRecord::new(ContentType::Handshake, 1, 0, plaintext)?;
                     for message in parse_unfragmented_handshake_messages(&plain_record)? {
@@ -387,14 +519,128 @@ where
                             message.payload.len()
                         ));
                         if message.message_type == HandshakeType::Finished {
-                            handshake.verify_server_finished(&message, key_material)?;
+                            handshake.verify_server_finished(&message, state.key_material())?;
                             return Ok(());
                         }
                     }
                 }
-                (_, ContentType::Alert) => return Err(decode_alert_error(&record).into()),
+                (0, ContentType::Alert) => return Err(decode_alert_error(&record).into()),
+                (1, ContentType::Alert) => {
+                    let plaintext = open_aes_128_ccm_8_record(
+                        &record,
+                        RecordProtectionKey::new(state.key_material().key_block.server_write_key),
+                        &state.key_material().key_block.server_write_iv,
+                    )?;
+                    let alert = DtlsRecord::new(
+                        ContentType::Alert,
+                        1,
+                        record.header.sequence_number,
+                        plaintext,
+                    )?;
+                    return Err(decode_alert_error(&alert).into());
+                }
                 _ => {}
             }
         }
+    }
+}
+
+fn is_retransmitted_server_flight(
+    records: &[DtlsRecord],
+    expected: &[crate::HandshakeMessage],
+) -> bool {
+    let mut messages = Vec::new();
+    for record in records {
+        if record.header.epoch != 0 || record.header.content_type != ContentType::Handshake {
+            continue;
+        }
+        let Ok(parsed) = parse_unfragmented_handshake_messages(record) else {
+            return false;
+        };
+        messages.extend(parsed);
+    }
+    messages == expected
+}
+
+fn renumber_epoch_zero_flight(records: &mut [DtlsRecord], next_sequence: &mut u64) {
+    for record in records {
+        if record.header.epoch == 0 {
+            record.header.sequence_number = take_record_sequence(next_sequence);
+        }
+    }
+}
+
+fn build_client_finished_flight(
+    client_key_exchange: &crate::HandshakeMessage,
+    client_finished: &crate::HandshakeMessage,
+    state: &mut SessionState,
+    next_epoch_zero_record: &mut u64,
+) -> crate::Result<Vec<DtlsRecord>> {
+    Ok(vec![
+        DtlsRecord::new(
+            ContentType::Handshake,
+            0,
+            take_record_sequence(next_epoch_zero_record),
+            client_key_exchange.encode()?,
+        )?,
+        DtlsRecord::new(
+            ContentType::ChangeCipherSpec,
+            0,
+            take_record_sequence(next_epoch_zero_record),
+            vec![1],
+        )?,
+        state.protect_record(ContentType::Handshake, &client_finished.encode()?)?,
+    ])
+}
+
+fn take_record_sequence(next_sequence: &mut u64) -> u64 {
+    let sequence = *next_sequence;
+    *next_sequence = next_sequence.wrapping_add(1);
+    sequence
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::HandshakeMessage;
+
+    #[test]
+    fn identifies_only_the_expected_epoch_zero_server_handshake_flight() {
+        let server_hello = HandshakeMessage {
+            message_type: HandshakeType::ServerHello,
+            message_seq: 1,
+            payload: Vec::new(),
+        };
+        let server_record = DtlsRecord::new(
+            ContentType::Handshake,
+            0,
+            1,
+            server_hello.clone().encode().expect("encode server hello"),
+        )
+        .expect("build server record");
+        assert!(is_retransmitted_server_flight(
+            core::slice::from_ref(&server_record),
+            core::slice::from_ref(&server_hello)
+        ));
+
+        let mut wrong_epoch = server_record;
+        wrong_epoch.header.epoch = 1;
+        assert!(!is_retransmitted_server_flight(
+            &[wrong_epoch],
+            core::slice::from_ref(&server_hello)
+        ));
+        let application = DtlsRecord::new(ContentType::ApplicationData, 1, 1, Vec::new())
+            .expect("build application record");
+        assert!(!is_retransmitted_server_flight(
+            &[application],
+            core::slice::from_ref(&server_hello)
+        ));
+
+        let malformed = DtlsRecord::new(ContentType::Handshake, 0, 2, vec![0xff])
+            .expect("build malformed handshake record");
+        assert!(!is_retransmitted_server_flight(
+            &[malformed],
+            core::slice::from_ref(&server_hello)
+        ));
     }
 }
