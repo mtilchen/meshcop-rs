@@ -178,13 +178,18 @@ jobs:
           if-no-files-found: warn
 
   mutants:
-    name: Mutation Testing
+    name: Mutation Testing (${{ matrix.shard }})
     runs-on: ubuntu-latest
     needs: verify
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [meshcop, dtls]
     env:
       MUTANTS_SCOPE: ${{ github.event.inputs.mutants_scope || 'targeted' }}
-      CARGO_MUTANTS_JOBS: 4
+      MUTANTS_SHARD: ${{ matrix.shard }}
+      CARGO_MUTANTS_JOBS: 2
       CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT: 20
       # Used only when MUTANTS_SCOPE=custom. Space-separated globs are passed to
       # cargo-mutants as repeated --file filters.
@@ -206,8 +211,9 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin
             target
-          key: mutants-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: mutants-${{ matrix.shard }}-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            mutants-${{ matrix.shard }}-${{ runner.os }}-
             mutants-${{ runner.os }}-
             cargo-${{ runner.os }}-
 
@@ -224,6 +230,6 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: cargo-mutants
+          name: cargo-mutants-${{ matrix.shard }}
           path: target/cargo-mutants/mutants.out/
           if-no-files-found: warn
