@@ -18,6 +18,12 @@ use crate::{
     util::dtls_trace,
 };
 
+// Both peers normally arm a one-second timer after the cookie ClientHello.
+// Waiting a little longer for the server's cached-flight retransmission avoids
+// racing it with a duplicate ClientHello, while a genuinely lost ClientHello
+// still recovers promptly.
+const SERVER_FLIGHT_INITIAL_TIMEOUT: Duration = Duration::from_millis(1_500);
+
 /// A runtime-neutral DTLS client before its handshake is run.
 ///
 /// The transport must already be bound. `local` is the address the transport
@@ -335,7 +341,7 @@ where
     U: UnconnectedUdp,
     D: DelayNs + Clone,
 {
-    let mut schedule = RetransmitSchedule::new();
+    let mut schedule = RetransmitSchedule::with_initial(SERVER_FLIGHT_INITIAL_TIMEOUT);
     let mut duplicate_retransmissions = DuplicateRetransmitBudget::new();
     let mut recorded_client_hello = false;
     let mut server_flight = Vec::new();

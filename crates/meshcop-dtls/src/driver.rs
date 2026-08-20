@@ -17,7 +17,8 @@
 //! Tokio support uses small adapters for the same traits. Handshakes retain
 //! each outbound flight and retransmit the same handshake messages in records
 //! with fresh sequence numbers after an initial one-second timeout, doubling
-//! the interval up to 60 seconds. A duplicate of the peer's preceding flight
+//! the interval up to 60 seconds. The client gives the server-flight timer a
+//! 500 ms grace window so both peers do not retransmit simultaneously. A duplicate of the peer's preceding flight
 //! triggers an immediate retransmission, capped at four duplicate-triggered
 //! responses per wait to bound reflection. The caller's timeout is an absolute
 //! deadline for the complete handshake rather than a fresh allowance for
@@ -100,9 +101,11 @@ pub(crate) struct RetransmitSchedule {
 
 impl RetransmitSchedule {
     pub(crate) const fn new() -> Self {
-        Self {
-            timeout: INITIAL_RETRANSMIT_TIMEOUT,
-        }
+        Self::with_initial(INITIAL_RETRANSMIT_TIMEOUT)
+    }
+
+    pub(crate) const fn with_initial(timeout: Duration) -> Self {
+        Self { timeout }
     }
 
     pub(crate) const fn timeout(self) -> Duration {
@@ -856,6 +859,11 @@ mod tests {
             assert_eq!(schedule.timeout(), Duration::from_secs(seconds));
             schedule.back_off();
         }
+
+        let mut delayed = RetransmitSchedule::with_initial(Duration::from_millis(1_500));
+        assert_eq!(delayed.timeout(), Duration::from_millis(1_500));
+        delayed.back_off();
+        assert_eq!(delayed.timeout(), Duration::from_secs(3));
     }
 
     #[test]
