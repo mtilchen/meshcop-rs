@@ -129,8 +129,8 @@ process.
   border agent (posix `ot-daemon` at a pinned release, driven by a simulated
   RCP) via [interop.yml](.github/workflows/interop.yml): successful and
   wrong-credential DTLS authentication, commissioner petition/arbitration and
-  takeover, protocol-aware loss injection at every DTLS handshake flight
-  position and for the first CoAP petition request/response, keep-alive,
+  takeover, protocol-aware DTLS and CoAP loss injection (including an explicit
+  sentinel for one pinned OpenThread server-flight limitation), keep-alive,
   dataset reads, synchronous and asynchronous network diagnostics, and a
   complete joiner commissioning of a simulated OpenThread node through
   JOIN_FIN, KEK entrustment, and attachment.

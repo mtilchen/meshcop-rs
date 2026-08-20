@@ -14,8 +14,11 @@
 //!
 //! A protocol-aware loopback UDP fault proxy also drops one datagram from each
 //! DTLS handshake flight position and the first confirmable CoAP
-//! request/response once, proving recovery against the live OpenThread
-//! implementation rather than only the in-process peer.
+//! request/response once. Seven positions recover against OpenThread. A final
+//! test pins an observed OpenThread v2026.06.0 limitation: after its server
+//! handshake flight is dropped, OpenThread retransmits the same logical flight
+//! but rejects the client's Finished. Deterministic in-process tests cover
+//! successful recovery at that position for both MeshCoP roles.
 //!
 //! The dataset for this network is disposable CI test data (the fixed vectors
 //! from the C++ `ot-commissioner` integration suite), but the test still never
@@ -81,6 +84,12 @@ enum FaultTarget {
     PetitionResponse,
 }
 
+#[derive(Default)]
+struct FaultObservation {
+    dropped: AtomicBool,
+    server_handshake_retry_unchanged: AtomicBool,
+}
+
 #[tokio::test]
 #[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
 async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()> {
@@ -89,7 +98,6 @@ async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()
         FaultTarget::InitialClientHello,
         FaultTarget::HelloVerifyRequest,
         FaultTarget::CookieClientHello,
-        FaultTarget::ServerHandshake,
         FaultTarget::ClientFinished,
         FaultTarget::ServerFinished,
         FaultTarget::PetitionRequest,
@@ -103,6 +111,31 @@ async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
+// Keep this alphabetically last: the observed failure leaves this pinned
+// OpenThread border agent unable to accept another commissioner immediately.
+async fn interop_z_openthread_server_handshake_retransmission_limit() -> meshcop::Result<()> {
+    let (border_agent, expected) = interop_inputs()?;
+    let error = run_packet_loss_case(border_agent, &expected, FaultTarget::ServerHandshake)
+        .await
+        .expect_err(
+            "update this limitation test when OpenThread accepts a client Finished after retransmitting its server handshake",
+        );
+    let is_observed_failure = matches!(
+        &error,
+        Error::Dtls(meshcop_dtls::Error::Crypto(message))
+            if message.contains("DTLS alert")
+                && message.contains("level=2")
+                && message.contains("description=40")
+    );
+    assert!(
+        is_observed_failure,
+        "OpenThread's server-handshake retransmission behavior changed: {error}"
+    );
+    Ok(())
+}
+
 async fn run_packet_loss_case(
     border_agent: SocketAddr,
     dataset: &Dataset,
@@ -110,12 +143,11 @@ async fn run_packet_loss_case(
 ) -> meshcop::Result<()> {
     let proxy = UdpSocket::bind("[::1]:0").await?;
     let proxy_addr = proxy.local_addr()?;
-    let dropped = Arc::new(AtomicBool::new(false));
-    let proxy_dropped = Arc::clone(&dropped);
-    let proxy_task =
-        tokio::spawn(
-            async move { run_fault_proxy(proxy, border_agent, target, proxy_dropped).await },
-        );
+    let observation = Arc::new(FaultObservation::default());
+    let proxy_observation = Arc::clone(&observation);
+    let proxy_task = tokio::spawn(async move {
+        run_fault_proxy(proxy, border_agent, target, proxy_observation).await
+    });
 
     let config = CommissionerConfig::from_dataset("meshcop-loss", dataset)?;
     let mut commissioner = Commissioner::connect(config, proxy_addr).await?;
@@ -129,13 +161,22 @@ async fn run_packet_loss_case(
         Ok(Ok(())) => return Err(Error::InvalidState("fault proxy exited unexpectedly")),
     }
 
-    petition?;
-    resign?;
-    if !dropped.load(Ordering::Relaxed) {
+    if !observation.dropped.load(Ordering::Relaxed) {
         return Err(Error::Dataset(format!(
             "fault proxy did not observe and drop {target:?}"
         )));
     }
+    if target == FaultTarget::ServerHandshake
+        && !observation
+            .server_handshake_retry_unchanged
+            .load(Ordering::Relaxed)
+    {
+        return Err(Error::InvalidState(
+            "OpenThread did not retransmit the unchanged logical server handshake",
+        ));
+    }
+    petition?;
+    resign?;
     Ok(())
 }
 
@@ -143,7 +184,7 @@ async fn run_fault_proxy(
     socket: UdpSocket,
     border_agent: SocketAddr,
     target: FaultTarget,
-    dropped: Arc<AtomicBool>,
+    observation: Arc<FaultObservation>,
 ) -> meshcop::Result<()> {
     let mut commissioner_addr = None;
     let mut dropped_server_handshake = None;
@@ -166,7 +207,7 @@ async fn run_fault_proxy(
 
         let observed = classify_fault_target(&buffer[..length], from_commissioner);
         if observed == Some(target) {
-            if !dropped.swap(true, Ordering::Relaxed) {
+            if !observation.dropped.swap(true, Ordering::Relaxed) {
                 if target == FaultTarget::ServerHandshake {
                     dropped_server_handshake = server_handshake_messages(&buffer[..length]);
                 }
@@ -174,9 +215,16 @@ async fn run_fault_proxy(
             }
             if target == FaultTarget::ServerHandshake {
                 let retransmitted = server_handshake_messages(&buffer[..length]);
+                let unchanged = dropped_server_handshake
+                    .as_ref()
+                    .zip(retransmitted.as_ref())
+                    .is_some_and(|(dropped, retransmitted)| dropped == retransmitted);
+                observation
+                    .server_handshake_retry_unchanged
+                    .store(unchanged, Ordering::Relaxed);
                 eprintln!(
                     "OpenThread retransmitted an unchanged logical server handshake: {}",
-                    dropped_server_handshake.as_ref() == retransmitted.as_ref()
+                    unchanged
                 );
             }
         }

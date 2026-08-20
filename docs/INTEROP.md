@@ -26,7 +26,7 @@ it once against a device on the bench" are very different claims:
 The [interop gate](../.github/workflows/interop.yml) builds OpenThread at a
 pinned release (a posix `ot-daemon` border router driven by a simulated RCP over
 forkpty — the arrangement the C++ `ot-commissioner` integration suite uses),
-forms a Thread network, and runs six gated tests against the live border agent
+forms a Thread network, and runs seven gated tests against the live border agent
 on loopback:
 
 - **Commissioner session:** DTLS 1.2 + EC J-PAKE handshake (PSKc), `COMM_PET`
@@ -38,9 +38,20 @@ on loopback:
   the correct PSKc must immediately petition and resign successfully.
 - **Packet-loss recovery:** a protocol-aware loopback UDP fault proxy recognizes
   handshake messages rather than assuming fixed packet ordinals. In separate
-  sessions it drops one datagram from each of the three commissioner and three
-  border-agent flight positions, then the first CoAP petition request and
-  response. Every case must still petition and resign against OpenThread.
+  sessions it drops the initial ClientHello, HelloVerifyRequest, cookie-bearing
+  ClientHello, client key-exchange/Finished flight, server Finished flight, and
+  first CoAP petition request and response. Every one of these seven cases must
+  still petition and resign against OpenThread.
+- **Pinned server-flight limitation:** a final sentinel drops OpenThread's
+  ServerHello/key-exchange flight. OpenThread v2026.06.0, whose
+  `SecureTransport` configures an [eight-second minimum DTLS timeout](https://github.com/openthread/openthread/blob/v2026.06.0/src/core/meshcop/secure_transport.cpp#L256),
+  retransmits an unchanged logical flight but then rejects the client's
+  Finished with fatal `handshake_failure`. CI asserts that exact observed
+  behavior so a future peer change is visible rather than silently skipped.
+  Deterministic MeshCoP-client/MeshCoP-server tests prove successful recovery
+  for the same loss position in both library roles. The evidence localizes the
+  remaining failure to the pinned reference-peer path, but it has not yet been
+  confirmed as an upstream OpenThread or Mbed TLS defect.
 - **Commissioner arbitration:** while one commissioner is active, a second
   commissioner must receive a petition rejection naming the incumbent. After
   the incumbent resigns, that same contender must petition successfully.

@@ -18,12 +18,6 @@ use crate::{
     util::dtls_trace,
 };
 
-// OpenThread's Thread SecureTransport configures an eight-second minimum
-// handshake timeout. Waiting just beyond that peer timer avoids racing its
-// cached server-flight retransmission with a duplicate ClientHello, while a
-// genuinely lost ClientHello still recovers within the absolute deadline.
-const SERVER_FLIGHT_INITIAL_TIMEOUT: Duration = Duration::from_millis(8_500);
-
 /// A runtime-neutral DTLS client before its handshake is run.
 ///
 /// The transport must already be bound. `local` is the address the transport
@@ -341,7 +335,7 @@ where
     U: UnconnectedUdp,
     D: DelayNs + Clone,
 {
-    let mut schedule = RetransmitSchedule::with_initial(SERVER_FLIGHT_INITIAL_TIMEOUT);
+    let mut schedule = RetransmitSchedule::new();
     let mut duplicate_retransmissions = DuplicateRetransmitBudget::new();
     let mut recorded_client_hello = false;
     let mut server_flight = Vec::new();
