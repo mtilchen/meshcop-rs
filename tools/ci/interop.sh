@@ -181,7 +181,8 @@ run_interop_test() {
     echo "Border agent on port ${ba_port}; commissioning..."
     # Serial test threads: every live case shares one border agent, which can
     # serve only one active commissioner at a time.
-    MESHCOP_MUTATE_OK=1 \
+    MESHCOP_TRACE=1 \
+        MESHCOP_MUTATE_OK=1 \
         MESHCOP_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
         MESHCOP_INTEROP_DATASET_HEX="${dataset_hex}" \
         MESHCOP_INTEROP_JOINER_CLI="${ot_cli_ftd}" \

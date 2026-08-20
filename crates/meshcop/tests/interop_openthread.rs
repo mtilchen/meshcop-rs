@@ -12,10 +12,11 @@
 //! - `MESHCOP_MUTATE_OK=1` — explicit authorization for the joiner test to
 //!   update steering data on the disposable network.
 //!
-//! A protocol-aware loopback UDP fault proxy also drops one datagram from each
-//! DTLS handshake flight position and the first confirmable CoAP
-//! request/response once, proving recovery against the live OpenThread
-//! implementation rather than only the in-process peer.
+//! A protocol-aware loopback UDP fault proxy also drops each DTLS handshake
+//! flight position and the first confirmable CoAP request/response once,
+//! proving recovery against the live OpenThread implementation rather than
+//! only the in-process peer. Multi-datagram server flights are suppressed in
+//! full until the client's retry begins.
 //!
 //! The dataset for this network is disposable CI test data (the fixed vectors
 //! from the C++ `ot-commissioner` integration suite), but the test still never
@@ -146,6 +147,8 @@ async fn run_fault_proxy(
     dropped: Arc<AtomicBool>,
 ) -> meshcop::Result<()> {
     let mut commissioner_addr = None;
+    let mut server_handshake_was_dropped = false;
+    let mut server_handshake_retry_started = false;
     let mut buffer = [0u8; meshcop_dtls::driver::MAX_DATAGRAM_SIZE];
     loop {
         let (length, source) = socket.recv_from(&mut buffer).await?;
@@ -164,6 +167,16 @@ async fn run_fault_proxy(
         };
 
         let observed = classify_fault_target(&buffer[..length], from_commissioner);
+        if target == FaultTarget::ServerHandshake {
+            if observed == Some(FaultTarget::CookieClientHello) && server_handshake_was_dropped {
+                server_handshake_retry_started = true;
+            }
+            if observed == Some(FaultTarget::ServerHandshake) && !server_handshake_retry_started {
+                server_handshake_was_dropped = true;
+                dropped.store(true, Ordering::Relaxed);
+                continue;
+            }
+        }
         if observed == Some(target) && !dropped.swap(true, Ordering::Relaxed) {
             continue;
         }
