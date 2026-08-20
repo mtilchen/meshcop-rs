@@ -146,6 +146,7 @@ async fn run_fault_proxy(
     dropped: Arc<AtomicBool>,
 ) -> meshcop::Result<()> {
     let mut commissioner_addr = None;
+    let mut dropped_server_handshake = None;
     let mut buffer = [0u8; meshcop_dtls::driver::MAX_DATAGRAM_SIZE];
     loop {
         let (length, source) = socket.recv_from(&mut buffer).await?;
@@ -164,11 +165,36 @@ async fn run_fault_proxy(
         };
 
         let observed = classify_fault_target(&buffer[..length], from_commissioner);
-        if observed == Some(target) && !dropped.swap(true, Ordering::Relaxed) {
-            continue;
+        if observed == Some(target) {
+            if !dropped.swap(true, Ordering::Relaxed) {
+                if target == FaultTarget::ServerHandshake {
+                    dropped_server_handshake = server_handshake_messages(&buffer[..length]);
+                }
+                continue;
+            }
+            if target == FaultTarget::ServerHandshake {
+                let retransmitted = server_handshake_messages(&buffer[..length]);
+                eprintln!(
+                    "OpenThread retransmitted an unchanged logical server handshake: {}",
+                    dropped_server_handshake.as_ref() == retransmitted.as_ref()
+                );
+            }
         }
         socket.send_to(&buffer[..length], destination).await?;
     }
+}
+
+fn server_handshake_messages(datagram: &[u8]) -> Option<Vec<meshcop_dtls::HandshakeMessage>> {
+    use meshcop_dtls::{ContentType, DtlsRecord, parse_unfragmented_handshake_messages};
+
+    let records = DtlsRecord::parse_datagram(datagram).ok()?;
+    let mut messages = Vec::new();
+    for record in records {
+        if record.header.epoch == 0 && record.header.content_type == ContentType::Handshake {
+            messages.extend(parse_unfragmented_handshake_messages(&record).ok()?);
+        }
+    }
+    Some(messages)
 }
 
 fn classify_fault_target(datagram: &[u8], from_commissioner: bool) -> Option<FaultTarget> {
