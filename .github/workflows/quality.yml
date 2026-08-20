@@ -181,10 +181,10 @@ jobs:
     name: Mutation Testing
     runs-on: ubuntu-latest
     needs: verify
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       MUTANTS_SCOPE: ${{ github.event.inputs.mutants_scope || 'targeted' }}
-      CARGO_MUTANTS_JOBS: 2
+      CARGO_MUTANTS_JOBS: 4
       CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT: 20
       # Used only when MUTANTS_SCOPE=custom. Space-separated globs are passed to
       # cargo-mutants as repeated --file filters.

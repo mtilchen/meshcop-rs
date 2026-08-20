@@ -634,7 +634,7 @@ fn require_success_response(response: meshcop::CoapMessage) -> Result<meshcop::C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commissioner::CommissionerConfig;
+    use crate::commissioner::{CommissionerConfig, harness::ScriptedMeshcopTransport};
     use crate::meshcop::{CoapCode, CoapMessage, CoapType, TLV_UDP_ENCAPSULATION};
     use crate::tlv::TlvSet;
     use meshcop_dtls::DtlsServer;
@@ -681,6 +681,42 @@ mod tests {
         }
         assert_eq!(schedule.timeout(), None);
         assert_eq!(schedule.retransmissions, COAP_MAX_RETRANSMIT);
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_returns_a_matching_direct_response() {
+        let mut commissioner = Commissioner::connect_scripted(
+            CommissionerConfig::pskc("incoming-response", [0x42; 16]),
+            "127.0.0.1:49191".parse().expect("border agent address"),
+            ScriptedMeshcopTransport::new([]),
+            [],
+        )
+        .await
+        .expect("scripted commissioner");
+        let request = CoapMessage {
+            ty: CoapType::Confirmable,
+            code: CoapCode::POST,
+            message_id: 0x1234,
+            token: vec![0x12, 0x34],
+            options: Vec::new(),
+            payload: Vec::new(),
+        };
+        let response = CoapMessage {
+            ty: CoapType::Acknowledgement,
+            code: CoapCode::CHANGED,
+            message_id: request.message_id,
+            token: request.token.clone(),
+            options: Vec::new(),
+            payload: Vec::new(),
+        };
+
+        assert_eq!(
+            commissioner
+                .handle_incoming(Some(&request), &response)
+                .await
+                .expect("route response"),
+            Some(response)
+        );
     }
 
     #[tokio::test]
