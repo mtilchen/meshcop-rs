@@ -26,9 +26,10 @@ it once against a device on the bench" are very different claims:
 The [interop gate](../.github/workflows/interop.yml) builds OpenThread at a
 pinned release (a posix `ot-daemon` border router driven by a simulated RCP over
 forkpty — the arrangement the C++ `ot-commissioner` integration suite uses),
-forms a Thread network, and runs eight gated tests against the live border agent
-on loopback. The two limitation sentinels each receive a freshly started daemon
-and newly formed network so a rejected session cannot mask later coverage:
+forms a Thread network, and runs the gated suite against the live border agent
+on loopback. Each of the eight fault scenarios receives a freshly started
+daemon and newly formed network so peer session cleanup or a rejected session
+cannot mask later coverage:
 
 - **Commissioner session:** DTLS 1.2 + EC J-PAKE handshake (PSKc), `COMM_PET`
   petition, `COMM_KA` keep-alive, `MGMT_ACTIVE_GET` with a full, order-insensitive

@@ -9,6 +9,8 @@
 //!   `ot-ctl dataset active -x`, including the PSKc used to authenticate.
 //! - `MESHCOP_INTEROP_JOINER_CLI` — a simulated OpenThread FTD used as a
 //!   real joiner peer.
+//! - `MESHCOP_INTEROP_FAULT_TARGET` — optional single fault selected by the CI
+//!   harness when isolating loss scenarios in fresh daemon instances.
 //! - `MESHCOP_MUTATE_OK=1` — explicit authorization for the joiner test to
 //!   update steering data on the disposable network.
 //!
@@ -16,10 +18,10 @@
 //! DTLS handshake flight position and the first confirmable CoAP
 //! request/response once. Six positions recover against OpenThread. Two tests
 //! pin observed OpenThread v2026.06.0 limitations around the remaining
-//! key-exchange flights. The CI harness gives each limitation a fresh daemon
-//! because the rejected handshake temporarily prevents another commissioner
-//! session. Deterministic in-process tests cover successful recovery at both
-//! positions for the MeshCoP roles.
+//! key-exchange flights. The CI harness gives every fault scenario a fresh
+//! daemon and Thread network, preventing session cleanup or a rejected
+//! handshake from affecting another result. Deterministic in-process tests
+//! cover successful recovery at both limited positions for the MeshCoP roles.
 //!
 //! The dataset for this network is disposable CI test data (the fixed vectors
 //! from the C++ `ot-commissioner` integration suite), but the test still never
@@ -96,20 +98,40 @@ struct FaultObservation {
 #[ignore = "requires a live OpenThread border agent; run via tools/ci/interop.sh"]
 async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()> {
     let (border_agent, expected) = interop_inputs()?;
-    for target in [
+    let all_targets = [
         FaultTarget::InitialClientHello,
         FaultTarget::HelloVerifyRequest,
         FaultTarget::CookieClientHello,
         FaultTarget::ServerFinished,
         FaultTarget::PetitionRequest,
         FaultTarget::PetitionResponse,
-    ] {
+    ];
+    let selected = std::env::var("MESHCOP_INTEROP_FAULT_TARGET").ok();
+    let targets: Vec<_> = match selected.as_deref() {
+        None => all_targets.to_vec(),
+        Some(value) => vec![parse_recovery_fault_target(value).ok_or_else(|| {
+            Error::Dataset(format!("unknown MESHCOP_INTEROP_FAULT_TARGET {value:?}"))
+        })?],
+    };
+    for target in targets {
         eprintln!("injecting OpenThread fault: {target:?}");
         run_packet_loss_case(border_agent, &expected, target)
             .await
             .map_err(|error| Error::Dataset(format!("{target:?} recovery failed: {error}")))?;
     }
     Ok(())
+}
+
+fn parse_recovery_fault_target(value: &str) -> Option<FaultTarget> {
+    match value {
+        "initial-client-hello" => Some(FaultTarget::InitialClientHello),
+        "hello-verify-request" => Some(FaultTarget::HelloVerifyRequest),
+        "cookie-client-hello" => Some(FaultTarget::CookieClientHello),
+        "server-finished" => Some(FaultTarget::ServerFinished),
+        "petition-request" => Some(FaultTarget::PetitionRequest),
+        "petition-response" => Some(FaultTarget::PetitionResponse),
+        _ => None,
+    }
 }
 
 #[tokio::test]

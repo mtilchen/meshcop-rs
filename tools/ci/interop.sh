@@ -42,6 +42,14 @@ readonly NETWORK_KEY=00112233445566778899aabbccddeeff
 readonly PSKC=3aa55f91ca47d1e4e71a08cb35e91591
 readonly MESH_LOCAL_PREFIX="fd00:db8::"
 readonly SECURITY_POLICY=(672 onrc)
+readonly RECOVERY_FAULT_TARGETS=(
+    initial-client-hello
+    hello-verify-request
+    cookie-client-hello
+    server-finished
+    petition-request
+    petition-response
+)
 
 ot_daemon="${openthread_dir}/build/posix/src/posix/ot-daemon"
 ot_ctl="${openthread_dir}/build/posix/src/posix/ot-ctl"
@@ -170,6 +178,7 @@ form_network() {
 
 run_interop_selection() {
     local test_filter=${1:-}
+    local fault_target=${2:-}
     local ba_port dataset_hex
     local -a cargo_args=(cargo test -p meshcop --test interop_openthread --all-features)
     # Recent OpenThread versions gate the border agent behind a runtime
@@ -190,10 +199,9 @@ run_interop_selection() {
     if [[ -n "${test_filter}" ]]; then
         cargo_args+=(--exact)
     else
-        # The observed limitation cases leave this pinned OpenThread peer
-        # unable to accept another commissioner immediately. Each runs below
-        # against a freshly started daemon and newly formed network.
-        cargo_args+=(--skip interop_limit_)
+        # Fault cases run below against separate, freshly formed networks so
+        # peer session cleanup cannot affect the following scenario.
+        cargo_args+=(--skip interop_limit_ --skip interop_packet_loss_)
     fi
 
     # Serial test threads: every live case shares one border agent, which can
@@ -203,6 +211,7 @@ run_interop_selection() {
         MESHCOP_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
         MESHCOP_INTEROP_DATASET_HEX="${dataset_hex}" \
         MESHCOP_INTEROP_JOINER_CLI="${ot_cli_ftd}" \
+        MESHCOP_INTEROP_FAULT_TARGET="${fault_target}" \
         "${cargo_args[@]}"
 }
 
@@ -257,6 +266,12 @@ main() {
     phase start-daemon start_daemon
     phase form-network form_network
     phase interop-test run_interop_selection
+    local fault_target
+    for fault_target in "${RECOVERY_FAULT_TARGETS[@]}"; do
+        phase "restart-${fault_target}" restart_network
+        phase "fault-${fault_target}" run_interop_selection \
+            interop_packet_loss_recovery_against_openthread "${fault_target}"
+    done
     phase restart-client-finished-limit restart_network
     phase client-finished-limit run_interop_selection \
         interop_limit_client_finished_flight_retransmission_is_rejected
