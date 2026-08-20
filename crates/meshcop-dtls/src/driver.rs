@@ -48,13 +48,13 @@ pub const MAX_DATAGRAM_SIZE: usize = 4096;
 
 pub(crate) const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(not(test))]
-const DRIVER_INITIAL_RETRANSMIT_TIMEOUT: Duration = INITIAL_RETRANSMIT_TIMEOUT;
+pub(crate) const DRIVER_INITIAL_RETRANSMIT_TIMEOUT: Duration = INITIAL_RETRANSMIT_TIMEOUT;
 // Loopback state-machine tests exercise the same timer/backoff transitions at
 // a smaller scale so mutation runs do not spend seconds sleeping per mutant.
 #[cfg(test)]
-const DRIVER_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const DRIVER_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_DUPLICATE_RETRANSMISSIONS: u8 = 4;
+pub(crate) const MAX_DUPLICATE_RETRANSMISSIONS: u8 = 4;
 
 /// Error produced by a runtime-neutral DTLS driver.
 #[derive(Debug)]
@@ -122,6 +122,20 @@ impl RetransmitSchedule {
 
     pub(crate) fn back_off(&mut self) {
         self.timeout = self.timeout.saturating_mul(2).min(MAX_RETRANSMIT_TIMEOUT);
+    }
+}
+
+pub(crate) fn take_record_sequence(next_sequence: &mut u64) -> u64 {
+    let sequence = *next_sequence;
+    *next_sequence = next_sequence.wrapping_add(1);
+    sequence
+}
+
+pub(crate) fn renumber_epoch_zero_flight(records: &mut [DtlsRecord], next_sequence: &mut u64) {
+    for record in records {
+        if record.header.epoch == 0 {
+            record.header.sequence_number = take_record_sequence(next_sequence);
+        }
     }
 }
 
@@ -438,11 +452,18 @@ where
 }
 
 async fn delay_duration(delay: &mut impl DelayNs, duration: Duration) {
-    let mut nanoseconds = duration.as_nanos();
-    while nanoseconds > 0 {
-        let chunk = nanoseconds.min(u32::MAX as u128) as u32;
-        delay.delay_ns(chunk).await;
-        nanoseconds -= u128::from(chunk);
+    const MAX_DELAY_NANOSECONDS: u128 = u32::MAX as u128;
+
+    let nanoseconds = duration.as_nanos();
+    let full_chunks = nanoseconds
+        .checked_div(MAX_DELAY_NANOSECONDS)
+        .unwrap_or_default();
+    for _ in 0..full_chunks {
+        delay.delay_ns(u32::MAX).await;
+    }
+    let remainder = nanoseconds % MAX_DELAY_NANOSECONDS;
+    if remainder != 0 {
+        delay.delay_ns(remainder as u32).await;
     }
 }
 
@@ -844,23 +865,25 @@ mod tests {
 
     #[test]
     fn delay_duration_splits_large_durations_into_bounded_chunks() {
-        // One nanosecond past u32::MAX forces exactly two chunks: a full
-        // u32::MAX-sized chunk, then a one-nanosecond remainder. A mutated
-        // termination test or accumulator update either stops too early
-        // (wrong totals below) or never terminates (caught by the delay's
-        // own call budget).
-        let requested_nanos = u64::from(u32::MAX) + 1;
+        // One nanosecond past two full u32::MAX chunks forces exactly three
+        // calls. Mutated chunk arithmetic changes the counts/totals below or
+        // trips the delay's own call budget.
+        let requested_nanos = 2 * u64::from(u32::MAX) + 1;
         let mut delay = BudgetedDelay::new();
         futures_lite_for_test::block_on(delay_duration(
             &mut delay,
             Duration::from_nanos(requested_nanos),
         ));
-        assert_eq!(delay.calls, 2);
+        assert_eq!(delay.calls, 3);
         assert_eq!(delay.total_nanoseconds, u128::from(requested_nanos));
     }
 
     #[test]
     fn retransmit_schedule_doubles_and_caps_at_sixty_seconds() {
+        assert_eq!(
+            RetransmitSchedule::new().timeout(),
+            Duration::from_millis(100)
+        );
         let mut schedule = RetransmitSchedule::with_initial(INITIAL_RETRANSMIT_TIMEOUT);
         let expected = [1, 2, 4, 8, 16, 32, 60, 60];
         for seconds in expected {

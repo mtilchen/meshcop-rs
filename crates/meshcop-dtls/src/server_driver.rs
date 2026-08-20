@@ -12,7 +12,8 @@ use crate::{
     driver::{
         DelayNs, DriverError, DriverResult, DuplicateRetransmitBudget, RetransmitSchedule,
         SessionRole, SessionState, UnconnectedUdp, decode_alert_error, recv_records_from,
-        recv_records_from_unbounded, recv_records_unbounded, send_records, with_timeout,
+        recv_records_from_unbounded, recv_records_unbounded, renumber_epoch_zero_flight,
+        send_records, take_record_sequence, with_timeout,
     },
     open_aes_128_ccm_8_record, parse_unfragmented_handshake_messages,
     parse_unfragmented_handshake_record,
@@ -136,10 +137,11 @@ where
         loop {
             let (records, _, _) =
                 recv_records_from_unbounded(&mut self.transport, self.peer).await?;
-            if !self.server_finished.is_empty()
-                && is_client_finished_flight(&records)
-                && duplicate_retransmissions.take()
-            {
+            if take_server_finished_retry(
+                &self.server_finished,
+                &records,
+                &mut duplicate_retransmissions,
+            ) {
                 let flight = build_server_finished_flight(
                     &mut self.state,
                     &self.server_finished,
@@ -346,10 +348,7 @@ where
                 }
                 (1, ContentType::Handshake) => {
                     if !saw_change_cipher_spec {
-                        return Err(Error::Crypto(
-                            "client Finished before ChangeCipherSpec".to_string(),
-                        )
-                        .into());
+                        continue;
                     }
                     let keys = key_material
                         .as_ref()
@@ -441,6 +440,14 @@ fn is_client_finished_flight(records: &[DtlsRecord]) -> bool {
     )
 }
 
+fn take_server_finished_retry(
+    server_finished: &[u8],
+    records: &[DtlsRecord],
+    budget: &mut DuplicateRetransmitBudget,
+) -> bool {
+    !server_finished.is_empty() && is_client_finished_flight(records) && budget.take()
+}
+
 fn build_server_finished_flight(
     state: &mut SessionState,
     server_finished: &[u8],
@@ -455,20 +462,6 @@ fn build_server_finished_flight(
         )?,
         state.protect_record(ContentType::Handshake, server_finished)?,
     ])
-}
-
-fn renumber_epoch_zero_flight(records: &mut [DtlsRecord], next_sequence: &mut u64) {
-    for record in records {
-        if record.header.epoch == 0 {
-            record.header.sequence_number = take_record_sequence(next_sequence);
-        }
-    }
-}
-
-fn take_record_sequence(next_sequence: &mut u64) -> u64 {
-    let sequence = *next_sequence;
-    *next_sequence = next_sequence.wrapping_add(1);
-    sequence
 }
 
 async fn send_fatal_handshake_alert<U>(
@@ -555,5 +548,41 @@ mod tests {
         let change_cipher_spec =
             DtlsRecord::new(ContentType::ChangeCipherSpec, 0, 2, vec![1]).expect("CCS record");
         assert!(!is_client_finished_flight(&[change_cipher_spec]));
+    }
+
+    #[test]
+    fn server_finished_retry_requires_cached_data_client_flight_and_budget() {
+        let key_exchange = HandshakeMessage {
+            message_type: HandshakeType::ClientKeyExchange,
+            message_seq: 2,
+            payload: Vec::new(),
+        };
+        let client_finished = handshake_record(&key_exchange, 0);
+        let application = DtlsRecord::new(ContentType::ApplicationData, 1, 1, vec![0xaa])
+            .expect("application record");
+
+        let mut budget = DuplicateRetransmitBudget::new();
+        assert!(!take_server_finished_retry(
+            &[],
+            core::slice::from_ref(&client_finished),
+            &mut budget,
+        ));
+        assert!(!take_server_finished_retry(
+            b"cached Finished",
+            &[application],
+            &mut budget,
+        ));
+        for _ in 0..crate::driver::MAX_DUPLICATE_RETRANSMISSIONS {
+            assert!(take_server_finished_retry(
+                b"cached Finished",
+                core::slice::from_ref(&client_finished),
+                &mut budget,
+            ));
+        }
+        assert!(!take_server_finished_retry(
+            b"cached Finished",
+            &[client_finished],
+            &mut budget,
+        ));
     }
 }

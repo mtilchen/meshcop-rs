@@ -11,7 +11,8 @@ use crate::{
     driver::{
         DelayNs, DriverError, DriverResult, DuplicateRetransmitBudget, RetransmitSchedule,
         SessionRole, SessionState, UnconnectedUdp, decode_alert_error, recv_application_data,
-        recv_records_from, send_records, with_timeout,
+        recv_records_from, renumber_epoch_zero_flight, send_records, take_record_sequence,
+        with_timeout,
     },
     open_aes_128_ccm_8_record, parse_unfragmented_handshake_messages,
     parse_unfragmented_handshake_record,
@@ -382,10 +383,19 @@ where
                                 server_flight.push(message);
                             }
                             HandshakeType::ServerKeyExchange => {
+                                if !recorded_client_hello {
+                                    continue;
+                                }
                                 handshake.handle_server_key_exchange(&message)?;
                                 server_flight.push(message);
                             }
                             HandshakeType::ServerHelloDone => {
+                                let has_server_key_exchange = server_flight.iter().any(|message| {
+                                    message.message_type == HandshakeType::ServerKeyExchange
+                                });
+                                if !recorded_client_hello || !has_server_key_exchange {
+                                    continue;
+                                }
                                 handshake.handle_server_hello_done(&message)?;
                                 server_flight.push(message);
                                 return Ok(server_flight);
@@ -500,10 +510,7 @@ where
                 }
                 (1, ContentType::Handshake) => {
                     if !saw_change_cipher_spec {
-                        return Err(Error::Crypto(
-                            "received encrypted Finished before ChangeCipherSpec".to_string(),
-                        )
-                        .into());
+                        continue;
                     }
                     let plaintext = open_aes_128_ccm_8_record(
                         &record,
@@ -562,14 +569,6 @@ fn is_retransmitted_server_flight(
     messages == expected
 }
 
-fn renumber_epoch_zero_flight(records: &mut [DtlsRecord], next_sequence: &mut u64) {
-    for record in records {
-        if record.header.epoch == 0 {
-            record.header.sequence_number = take_record_sequence(next_sequence);
-        }
-    }
-}
-
 fn build_client_finished_flight(
     client_key_exchange: &crate::HandshakeMessage,
     client_finished: &crate::HandshakeMessage,
@@ -591,12 +590,6 @@ fn build_client_finished_flight(
         )?,
         state.protect_record(ContentType::Handshake, &client_finished.encode()?)?,
     ])
-}
-
-fn take_record_sequence(next_sequence: &mut u64) -> u64 {
-    let sequence = *next_sequence;
-    *next_sequence = next_sequence.wrapping_add(1);
-    sequence
 }
 
 #[cfg(test)]

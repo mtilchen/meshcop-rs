@@ -105,7 +105,9 @@ async fn interop_packet_loss_recovery_against_openthread() -> meshcop::Result<()
         FaultTarget::PetitionRequest,
         FaultTarget::PetitionResponse,
     ];
-    let selected = std::env::var("MESHCOP_INTEROP_FAULT_TARGET").ok();
+    let selected = std::env::var("MESHCOP_INTEROP_FAULT_TARGET")
+        .ok()
+        .filter(|value| !value.is_empty());
     let targets: Vec<_> = match selected.as_deref() {
         None => all_targets.to_vec(),
         Some(value) => vec![parse_recovery_fault_target(value).ok_or_else(|| {

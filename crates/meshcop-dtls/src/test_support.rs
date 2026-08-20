@@ -18,6 +18,15 @@ use super::{
     parse_unfragmented_handshake_record, protect_aes_128_ccm_8_record,
 };
 
+/// Returns the initial retransmit interval compiled into this driver build.
+///
+/// This accessor lets cross-crate and integration tests gate the production
+/// default while unit tests scale the same state machines to a shorter wall
+/// clock interval.
+pub const fn driver_initial_retransmit_timeout() -> core::time::Duration {
+    crate::driver::DRIVER_INITIAL_RETRANSMIT_TIMEOUT
+}
+
 /// How the loopback server finishes the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopbackEnd {
@@ -25,8 +34,10 @@ pub enum LoopbackEnd {
     Complete,
     /// Replace the first cookie, then complete the handshake.
     ReplaceCookieThenComplete,
-    /// Send a fatal alert instead of the ChangeCipherSpec + Finished flight.
+    /// Send a plaintext fatal alert instead of the ChangeCipherSpec + Finished flight.
     AlertInsteadOfFinished,
+    /// Send a protected fatal alert instead of the ChangeCipherSpec + Finished flight.
+    ProtectedAlertInsteadOfFinished,
 }
 
 /// Serves one commissioner DTLS handshake over a connected UDP socket.
@@ -149,9 +160,23 @@ pub async fn loopback_dtls_server_with_rng(
                             "client Finished before ChangeCipherSpec".to_string(),
                         ));
                     }
-                    if end == LoopbackEnd::AlertInsteadOfFinished {
-                        let alert =
-                            DtlsRecord::new(ContentType::Alert, 0, epoch0_seq, vec![2, 40])?;
+                    if matches!(
+                        end,
+                        LoopbackEnd::AlertInsteadOfFinished
+                            | LoopbackEnd::ProtectedAlertInsteadOfFinished
+                    ) {
+                        let alert = if end == LoopbackEnd::ProtectedAlertInsteadOfFinished {
+                            protect_aes_128_ccm_8_record(
+                                ContentType::Alert,
+                                1,
+                                0,
+                                RecordProtectionKey::new(keys.key_block.server_write_key),
+                                &keys.key_block.server_write_iv,
+                                &[2, 40],
+                            )?
+                        } else {
+                            DtlsRecord::new(ContentType::Alert, 0, epoch0_seq, vec![2, 40])?
+                        };
                         socket.send(&alert.encode()?).await?;
                         return Ok(None);
                     }

@@ -304,6 +304,9 @@ enum FlightDirection {
 enum FlightFault {
     Drop,
     ForwardFirstRecord,
+    ForwardAllButFirstRecord,
+    ForwardAllButSecondRecord,
+    ReverseRecords,
 }
 
 #[derive(Debug, Default)]
@@ -335,6 +338,37 @@ async fn dtls_handshake_recovers_from_a_partially_delivered_client_flight() -> c
         FlightFault::ForwardFirstRecord,
     )
     .await
+}
+
+#[tokio::test]
+async fn dtls_handshake_recovers_without_initial_server_hello() -> crate::Result<()> {
+    run_flight_fault_case(
+        FlightDirection::ServerToClient,
+        2,
+        FlightFault::ForwardAllButFirstRecord,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn dtls_handshake_recovers_without_server_key_exchange() -> crate::Result<()> {
+    run_flight_fault_case(
+        FlightDirection::ServerToClient,
+        2,
+        FlightFault::ForwardAllButSecondRecord,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn dtls_handshake_recovers_from_reordered_finished_flights() -> crate::Result<()> {
+    for direction in [
+        FlightDirection::ClientToServer,
+        FlightDirection::ServerToClient,
+    ] {
+        run_flight_fault_case(direction, 3, FlightFault::ReverseRecords).await?;
+    }
+    Ok(())
 }
 
 async fn run_flight_fault_case(
@@ -459,14 +493,51 @@ async fn run_lossy_proxy(
         }
         if !should_drop {
             socket.send_to(datagram, destination).await?;
-        } else if fault == FlightFault::ForwardFirstRecord {
-            let records = DtlsRecord::parse_datagram(datagram)?;
-            let first = records
-                .first()
-                .ok_or(Error::Crypto("faulted DTLS flight is empty".into()))?;
-            socket.send_to(&first.encode()?, destination).await?;
+            continue;
+        }
+
+        let mut records = DtlsRecord::parse_datagram(datagram)?;
+        match fault {
+            FlightFault::Drop => {}
+            FlightFault::ForwardFirstRecord => {
+                let first = records
+                    .first()
+                    .ok_or(Error::Crypto("faulted DTLS flight is empty".into()))?;
+                socket.send_to(&first.encode()?, destination).await?;
+            }
+            FlightFault::ForwardAllButFirstRecord => {
+                let remaining = records
+                    .get(1..)
+                    .filter(|remaining| !remaining.is_empty())
+                    .ok_or(Error::Crypto("faulted DTLS flight is empty".into()))?;
+                let partial = encode_record_datagram(remaining)?;
+                socket.send_to(&partial, destination).await?;
+            }
+            FlightFault::ForwardAllButSecondRecord => {
+                if records.len() < 3 {
+                    return Err(Error::Crypto(
+                        "faulted DTLS flight has fewer than three records".into(),
+                    ));
+                }
+                records.remove(1);
+                let partial = encode_record_datagram(&records)?;
+                socket.send_to(&partial, destination).await?;
+            }
+            FlightFault::ReverseRecords => {
+                records.reverse();
+                let reordered = encode_record_datagram(&records)?;
+                socket.send_to(&reordered, destination).await?;
+            }
         }
     }
+}
+
+fn encode_record_datagram(records: &[DtlsRecord]) -> crate::Result<Vec<u8>> {
+    let mut datagram = Vec::new();
+    for record in records {
+        datagram.extend_from_slice(&record.encode()?);
+    }
+    Ok(datagram)
 }
 
 fn record_sequences_are_fresh(previous: &[u8], retransmission: &[u8]) -> bool {
@@ -844,28 +915,28 @@ async fn connect_completes_after_the_server_replaces_its_cookie() -> crate::Resu
 
 #[tokio::test]
 async fn connect_reports_alert_instead_of_server_finished() -> crate::Result<()> {
-    let (client, server) = loopback_pair().await?;
-    let alerting_server = tokio::spawn(async move {
-        test_support::loopback_dtls_server(
-            &server,
-            &[0x42; 16],
-            test_support::LoopbackEnd::AlertInsteadOfFinished,
-        )
-        .await
-    });
-    let err = DtlsSession::connect(&client, &[0x42; 16], core::time::Duration::from_secs(2))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&err, crate::Error::Crypto(message) if message.contains("alert")),
-        "expected an alert error, got {err:?}"
-    );
-    assert!(
-        alerting_server
+    for end in [
+        test_support::LoopbackEnd::AlertInsteadOfFinished,
+        test_support::LoopbackEnd::ProtectedAlertInsteadOfFinished,
+    ] {
+        let (client, server) = loopback_pair().await?;
+        let alerting_server = tokio::spawn(async move {
+            test_support::loopback_dtls_server(&server, &[0x42; 16], end).await
+        });
+        let err = DtlsSession::connect(&client, &[0x42; 16], core::time::Duration::from_secs(2))
             .await
-            .expect("server task panicked")?
-            .is_none()
-    );
+            .unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Crypto(message) if message.contains("alert")),
+            "expected an alert error, got {err:?}"
+        );
+        assert!(
+            alerting_server
+                .await
+                .expect("server task panicked")?
+                .is_none()
+        );
+    }
     Ok(())
 }
 

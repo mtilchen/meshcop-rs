@@ -29,6 +29,7 @@ openthread_ref="${MESHCOP_INTEROP_OPENTHREAD_REF:-${default_openthread_ref}}"
 runtime_dir="${MESHCOP_INTEROP_RUNTIME_DIR:-/tmp/meshcop-interop}"
 openthread_dir="${runtime_dir}/openthread"
 daemon_log="${runtime_dir}/ot-daemon.log"
+daemon_pid=""
 readonly OPENTHREAD_REPOSITORY=https://github.com/openthread/openthread.git
 
 # Fixed, non-secret network parameters: the test vectors from the C++
@@ -148,15 +149,31 @@ start_daemon() {
     mkdir -p "${runtime_dir}/daemon-settings"
     (
         cd "${runtime_dir}/daemon-settings"
-        sudo "${ot_daemon}" -I wpan0 -d4 \
+        exec sudo "${ot_daemon}" -I wpan0 -d4 \
             "spinel+hdlc+uart://${ot_rcp}?forkpty-arg=1" \
-            >"${daemon_log}" 2>&1 &
-    )
-    wait_for "ot-daemon to accept commands" 30 sudo "${ot_ctl}" state
+            >"${daemon_log}" 2>&1
+    ) &
+    daemon_pid=$!
+    wait_for "new ot-daemon to accept commands" 30 daemon_is_ready
 }
 
 stop_daemon() {
     sudo killall ot-daemon 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        if ! pgrep -x ot-daemon >/dev/null 2>&1; then
+            daemon_pid=""
+            return 0
+        fi
+        sleep 1
+    done
+    echo "ot-daemon did not exit within 30 seconds" >&2
+    return 1
+}
+
+daemon_is_ready() {
+    [[ -n "${daemon_pid}" ]] \
+        && kill -0 "${daemon_pid}" 2>/dev/null \
+        && sudo "${ot_ctl}" state
 }
 
 form_network() {
@@ -249,7 +266,7 @@ write_summary() {
 
 cleanup() {
     local exit_code=$?
-    stop_daemon
+    stop_daemon || true
     if [[ ${exit_code} -ne 0 ]]; then
         write_summary "❌ failed"
         echo "=== ot-daemon log (tail) ==="
