@@ -362,7 +362,9 @@ pub fn parse_unfragmented_handshake_messages(record: &DtlsRecord) -> Result<Vec<
                 "DTLS handshake message is fragmented".to_string(),
             ));
         }
-        let consumed = HandshakeHeader::LEN + fragment.fragment.len();
+        let consumed = HandshakeHeader::LEN
+            .checked_add(fragment.fragment.len())
+            .ok_or_else(|| Error::Crypto("DTLS handshake message length overflow".to_string()))?;
         messages.push(HandshakeMessage {
             message_type: fragment.header.message_type,
             message_seq: fragment.header.message_seq,
