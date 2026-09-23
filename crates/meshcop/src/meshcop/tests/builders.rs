@@ -111,36 +111,51 @@ fn coap_decodes_reset_type_and_rejects_truncated_two_byte_extension() {
     );
 }
 
-#[test]
-fn coap_empty_ack_predicate_requires_every_field() {
-    let ack = CoapMessage::empty_ack(0x0102);
-    assert!(ack.is_empty_ack_for(0x0102));
-
-    let mut wrong_type = ack.clone();
+/// One-field deviations from an empty `message`, each named for failures.
+fn empty_message_deviations(message: &CoapMessage) -> Vec<(&'static str, CoapMessage)> {
+    let mut wrong_type = message.clone();
     wrong_type.ty = CoapType::Confirmable;
-    let mut wrong_code = ack.clone();
+    let mut wrong_code = message.clone();
     wrong_code.code = CoapCode::CHANGED;
-    let mut wrong_id = ack.clone();
-    wrong_id.message_id = 0x0103;
-    let mut with_token = ack.clone();
+    let mut wrong_id = message.clone();
+    wrong_id.message_id = message.message_id.wrapping_add(1);
+    let mut with_token = message.clone();
     with_token.token = vec![0xab];
-    let mut with_option = ack.clone();
+    let mut with_option = message.clone();
     with_option.options.push(CoapOption {
         number: 11,
         value: Vec::new(),
     });
-    let mut with_payload = ack.clone();
+    let mut with_payload = message.clone();
     with_payload.payload = vec![0x00];
-
-    for (name, message) in [
+    vec![
         ("type", wrong_type),
         ("code", wrong_code),
         ("message id", wrong_id),
         ("token", with_token),
         ("options", with_option),
         ("payload", with_payload),
-    ] {
+    ]
+}
+
+#[test]
+fn coap_empty_ack_predicate_requires_every_field() {
+    let ack = CoapMessage::empty_ack(0x0102);
+    assert!(ack.is_empty_ack_for(0x0102));
+    assert!(!ack.is_reset_for(0x0102));
+    for (name, message) in empty_message_deviations(&ack) {
         assert!(!message.is_empty_ack_for(0x0102), "{name}");
+    }
+}
+
+#[test]
+fn coap_reset_predicate_requires_every_field() {
+    let mut reset = CoapMessage::empty_ack(0x0102);
+    reset.ty = CoapType::Reset;
+    assert!(reset.is_reset_for(0x0102));
+    assert!(!reset.is_empty_ack_for(0x0102));
+    for (name, message) in empty_message_deviations(&reset) {
+        assert!(!message.is_reset_for(0x0102), "{name}");
     }
 }
 

@@ -580,9 +580,9 @@ async fn command_that_could_cross_the_deadline_refreshes_keepalive_first() {
         Duration::from_secs(30)
     );
 
-    // The guard is inclusive: dispatch at exactly 20 seconds remaining
+    // The guard is inclusive: dispatch at exactly 28 seconds remaining
     // also refreshes, preserving the documented processing margin.
-    tokio::time::advance(COMMAND_KEEPALIVE_HEADROOM / 2).await;
+    tokio::time::advance(Duration::from_secs(2)).await;
     interpreter.evaluate_and_print("bbrdataset get").await;
     let observed_operations: Vec<_> = interpreter
         .commissioner

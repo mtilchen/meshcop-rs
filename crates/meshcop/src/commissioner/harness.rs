@@ -112,6 +112,8 @@ pub enum ScriptedResponse {
     },
     /// A raw message for negative tests, such as token mismatches.
     Raw(CoapMessage),
+    /// An empty Reset rejecting the request's message ID.
+    Reset,
     /// A response wrapped in a UDP_RX.ntf encapsulation.
     ///
     /// The inner template is rendered against the request encapsulated in the
@@ -134,6 +136,11 @@ impl ScriptedResponse {
     /// Creates an empty ACK response.
     pub const fn empty_ack() -> Self {
         Self::EmptyAck
+    }
+
+    /// Creates an empty Reset rejecting the request.
+    pub const fn reset() -> Self {
+        Self::Reset
     }
 
     /// Creates an accepting Changed response.
@@ -229,6 +236,11 @@ impl ScriptedResponse {
             } => response(logical_request, CoapCode::CONTENT, payload, confirmable),
             Self::Coded { code, payload } => response(logical_request, code, payload, false),
             Self::Raw(message) => message,
+            Self::Reset => {
+                let mut reset = CoapMessage::empty_ack(logical_request.message_id);
+                reset.ty = CoapType::Reset;
+                reset
+            }
             Self::UdpRx {
                 source_address,
                 source_port,
