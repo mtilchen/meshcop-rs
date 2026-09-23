@@ -3,7 +3,8 @@ use std::time::{Duration, Instant};
 use rand_core::OsRng;
 
 use super::super::joiner::{
-    JOINER_SESSION_TIMEOUT, JoinerSession, JoinerSessionEvent, parse_join_fin,
+    JOINER_SESSION_TIMEOUT, JoinerSession, JoinerSessionEvent,
+    MAX_DUPLICATE_FLIGHT_RETRANSMISSIONS, parse_join_fin,
 };
 use super::*;
 use crate::meshcop::{
@@ -19,6 +20,36 @@ use meshcop_dtls::{
 
 const JOINER_IID: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
 const PSKD: &str = "J01NME";
+
+fn handshake_flight_fingerprint(datagram: &[u8]) -> Vec<(u16, ContentType, Vec<u8>)> {
+    DtlsRecord::parse_datagram(datagram)
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            let payload = if record.header.epoch == 0 {
+                record.payload
+            } else {
+                Vec::new()
+            };
+            (record.header.epoch, record.header.content_type, payload)
+        })
+        .collect()
+}
+
+fn assert_fresh_retransmission(previous: &[u8], retransmission: &[u8]) {
+    assert_ne!(retransmission, previous);
+    assert_eq!(
+        handshake_flight_fingerprint(retransmission),
+        handshake_flight_fingerprint(previous)
+    );
+    let previous = DtlsRecord::parse_datagram(previous).unwrap();
+    let retransmission = DtlsRecord::parse_datagram(retransmission).unwrap();
+    assert_eq!(previous.len(), retransmission.len());
+    for (before, after) in previous.iter().zip(retransmission) {
+        assert_eq!(before.header.epoch, after.header.epoch);
+        assert_ne!(before.header.sequence_number, after.header.sequence_number);
+    }
+}
 
 #[derive(Debug, Default)]
 struct RecordingHandler {
@@ -67,9 +98,104 @@ struct CommissionedJoiner {
     joiner_keys: ThreadDtlsKeyMaterial,
     server_random: [u8; 32],
     client_random: [u8; 32],
+    client_finished_flight: Vec<u8>,
+    server_finished_flight: Vec<u8>,
+}
+
+/// A fake joiner whose client flight is built but not yet delivered.
+struct PendingClientFlight {
+    session: JoinerSession,
+    handler: RecordingHandler,
+    joiner: ThreadDtlsHandshake,
+    joiner_keys: ThreadDtlsKeyMaterial,
+    server_random: [u8; 32],
+    key_exchange_only: Vec<u8>,
+    client_finished_flight: Vec<u8>,
 }
 
 fn commission_fake_joiner(accept: bool) -> CommissionedJoiner {
+    let PendingClientFlight {
+        mut session,
+        mut handler,
+        mut joiner,
+        joiner_keys,
+        server_random,
+        key_exchange_only,
+        client_finished_flight: datagram,
+    } = build_fake_client_flight(accept, PSKD);
+    let mut rng = OsRng;
+    let client_finished_flight = datagram.clone();
+    assert!(
+        session
+            .receive(&key_exchange_only, &mut handler, &mut rng)
+            .unwrap()
+            .is_empty(),
+        "a partial client flight must wait for ChangeCipherSpec and Finished"
+    );
+    // Protected records that arrive before the joiner's ChangeCipherSpec, or
+    // before the handshake completes, cannot be authenticated yet and are
+    // dropped without ending the session.
+    let finished_only = DtlsRecord::parse_datagram(&datagram)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let early_application =
+        DtlsRecord::new(ContentType::ApplicationData, 1, 1, vec![0; 24]).unwrap();
+    for early in [finished_only, early_application] {
+        assert!(
+            session
+                .receive(&early.encode().unwrap(), &mut handler, &mut rng)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let events = session.receive(&datagram, &mut handler, &mut rng).unwrap();
+    let [
+        JoinerSessionEvent::Transmit {
+            datagram,
+            include_kek: false,
+        },
+        JoinerSessionEvent::Connected,
+    ] = events.as_slice()
+    else {
+        panic!("expected the Finished flight and a Connected event, got {events:?}");
+    };
+    let server_finished_flight = datagram.clone();
+    assert_eq!(handler.connected, Vec::<[u8; 8]>::new());
+
+    // The joiner verifies the server's ChangeCipherSpec + Finished.
+    let records = DtlsRecord::parse_datagram(datagram).unwrap();
+    assert_eq!(
+        records[0].header.content_type,
+        ContentType::ChangeCipherSpec
+    );
+    let plaintext = open_aes_128_ccm_8_record(
+        &records[1],
+        RecordProtectionKey::new(joiner_keys.key_block.server_write_key),
+        &joiner_keys.key_block.server_write_iv,
+    )
+    .unwrap();
+    let plain_record = DtlsRecord::new(ContentType::Handshake, 1, 0, plaintext).unwrap();
+    let server_finished =
+        parse_unfragmented_handshake_record(&plain_record, HandshakeType::Finished).unwrap();
+    joiner
+        .verify_server_finished(&server_finished, &joiner_keys)
+        .unwrap();
+
+    CommissionedJoiner {
+        session,
+        handler,
+        client_random: joiner.client_random(),
+        joiner_keys,
+        server_random,
+        client_finished_flight,
+        server_finished_flight,
+    }
+}
+
+/// Runs a fake joiner using `joiner_pskd` against a session expecting
+/// [`PSKD`] up to its ClientKeyExchange/ChangeCipherSpec/Finished flight.
+fn build_fake_client_flight(accept: bool, joiner_pskd: &str) -> PendingClientFlight {
     let mut rng = OsRng;
     let mut handler = RecordingHandler {
         pskd: Some(PSKD.to_string()),
@@ -77,7 +203,7 @@ fn commission_fake_joiner(accept: bool) -> CommissionedJoiner {
         ..RecordingHandler::default()
     };
     let mut session = JoinerSession::new(JOINER_IID, 1000, 0x6800, PSKD, Instant::now(), &mut rng);
-    let mut joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
+    let mut joiner = ThreadDtlsHandshake::new(joiner_pskd.as_bytes(), &mut rng);
     let mut hello_state = joiner.client_hello_state().unwrap();
 
     // First ClientHello: answered by a HelloVerifyRequest.
@@ -154,6 +280,7 @@ fn commission_fake_joiner(accept: bool) -> CommissionedJoiner {
     .unwrap()
     .encode()
     .unwrap();
+    let key_exchange_only = datagram.clone();
     datagram.extend_from_slice(
         &DtlsRecord::new(
             ContentType::ChangeCipherSpec,
@@ -178,44 +305,14 @@ fn commission_fake_joiner(accept: bool) -> CommissionedJoiner {
         .encode()
         .unwrap(),
     );
-    let events = session.receive(&datagram, &mut handler, &mut rng).unwrap();
-    let [
-        JoinerSessionEvent::Transmit {
-            datagram,
-            include_kek: false,
-        },
-        JoinerSessionEvent::Connected,
-    ] = events.as_slice()
-    else {
-        panic!("expected the Finished flight and a Connected event, got {events:?}");
-    };
-    assert_eq!(handler.connected, Vec::<[u8; 8]>::new());
-
-    // The joiner verifies the server's ChangeCipherSpec + Finished.
-    let records = DtlsRecord::parse_datagram(datagram).unwrap();
-    assert_eq!(
-        records[0].header.content_type,
-        ContentType::ChangeCipherSpec
-    );
-    let plaintext = open_aes_128_ccm_8_record(
-        &records[1],
-        RecordProtectionKey::new(joiner_keys.key_block.server_write_key),
-        &joiner_keys.key_block.server_write_iv,
-    )
-    .unwrap();
-    let plain_record = DtlsRecord::new(ContentType::Handshake, 1, 0, plaintext).unwrap();
-    let server_finished =
-        parse_unfragmented_handshake_record(&plain_record, HandshakeType::Finished).unwrap();
-    joiner
-        .verify_server_finished(&server_finished, &joiner_keys)
-        .unwrap();
-
-    CommissionedJoiner {
+    PendingClientFlight {
         session,
         handler,
-        client_random: joiner.client_random(),
+        joiner,
         joiner_keys,
         server_random,
+        key_exchange_only,
+        client_finished_flight: datagram,
     }
 }
 
@@ -264,10 +361,10 @@ fn joiner_session_commissions_and_entrusts_an_accepted_joiner() {
     assert_eq!(joiner.session.joiner_id(), expected_joiner_id);
     assert_eq!(joiner_id_from_iid(&JOINER_IID), expected_joiner_id);
 
-    let datagram = encrypted_join_fin(&joiner, 7);
+    let request_datagram = encrypted_join_fin(&joiner, 7);
     let events = joiner
         .session
-        .receive(&datagram, &mut joiner.handler, &mut OsRng)
+        .receive(&request_datagram, &mut joiner.handler, &mut OsRng)
         .unwrap();
     let [
         JoinerSessionEvent::Transmit {
@@ -307,8 +404,17 @@ fn joiner_session_commissions_and_entrusts_an_accepted_joiner() {
     .unwrap();
     assert_eq!(session_kek, joiner_kek);
 
-    // A retransmitted JOIN_FIN.req is answered with the same decision but
-    // does not re-finalize.
+    // DTLS replay protection discards an identical protected record.
+    assert!(
+        joiner
+            .session
+            .receive(&request_datagram, &mut joiner.handler, &mut OsRng)
+            .unwrap()
+            .is_empty()
+    );
+
+    // A CoAP retransmission arrives in a fresh DTLS record and is answered
+    // with the same decision, but does not re-finalize.
     let retransmission = encrypted_join_fin(&joiner, 8);
     let events = joiner
         .session
@@ -393,26 +499,256 @@ fn retransmitted_client_hello_repeats_the_server_flight() {
     else {
         panic!("expected the server flight");
     };
-    let flight = flight.clone();
+    let mut previous_flight = flight.clone();
 
-    // If the flight is lost, the joiner retransmits its hello and must
-    // receive the identical flight again.
-    let events = session
-        .receive(&second_hello, &mut handler, &mut rng)
-        .unwrap();
-    let [
-        JoinerSessionEvent::Transmit {
-            datagram: repeated, ..
-        },
-    ] = events.as_slice()
-    else {
-        panic!("expected the repeated server flight");
-    };
-    assert_eq!(*repeated, flight);
+    // A different ClientHello is not the preceding flight and must not
+    // trigger reflection of the cached server flight.
+    assert!(
+        session
+            .receive(&first_hello.encode().unwrap(), &mut handler, &mut rng)
+            .unwrap()
+            .is_empty()
+    );
+
+    // If the flight is lost, the joiner retransmits its hello and receives
+    // the same handshake messages in records with fresh sequence numbers,
+    // up to the duplicate-response security cap.
+    for _ in 0..MAX_DUPLICATE_FLIGHT_RETRANSMISSIONS {
+        let events = session
+            .receive(&second_hello, &mut handler, &mut rng)
+            .unwrap();
+        let [
+            JoinerSessionEvent::Transmit {
+                datagram: repeated, ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected the repeated server flight");
+        };
+        assert_fresh_retransmission(&previous_flight, repeated);
+        previous_flight = repeated.clone();
+    }
+    assert!(
+        session
+            .receive(&second_hello, &mut handler, &mut rng)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
-fn joiner_sessions_expire_and_reject_malformed_traffic() {
+fn retransmitted_client_finished_repeats_the_server_finished_flight() {
+    let mut rng = OsRng;
+    let mut joiner = commission_fake_joiner(true);
+    let mut records = DtlsRecord::parse_datagram(&joiner.client_finished_flight).unwrap();
+    let plaintext = open_aes_128_ccm_8_record(
+        &records[2],
+        RecordProtectionKey::new(joiner.joiner_keys.key_block.client_write_key),
+        &joiner.joiner_keys.key_block.client_write_iv,
+    )
+    .unwrap();
+    records[0].header.sequence_number += 10;
+    records[1].header.sequence_number += 10;
+    records[2] = protect_aes_128_ccm_8_record(
+        ContentType::Handshake,
+        1,
+        1,
+        RecordProtectionKey::new(joiner.joiner_keys.key_block.client_write_key),
+        &joiner.joiner_keys.key_block.client_write_iv,
+        &plaintext,
+    )
+    .unwrap();
+    let retransmitted_client_flight = DtlsRecord::encode_datagram(&records).unwrap();
+    let events = joiner
+        .session
+        .receive(&retransmitted_client_flight, &mut joiner.handler, &mut rng)
+        .unwrap();
+    let [
+        JoinerSessionEvent::Transmit {
+            datagram,
+            include_kek: false,
+        },
+    ] = events.as_slice()
+    else {
+        panic!("expected the repeated server Finished flight, got {events:?}");
+    };
+    assert_fresh_retransmission(&joiner.server_finished_flight, datagram);
+}
+
+#[test]
+fn coalesced_client_finished_replay_does_not_discard_join_fin() {
+    let mut rng = OsRng;
+    let mut joiner = commission_fake_joiner(true);
+    let mut coalesced = joiner.client_finished_flight.clone();
+    coalesced.extend_from_slice(&encrypted_join_fin(&joiner, 7));
+
+    let events = joiner
+        .session
+        .receive(&coalesced, &mut joiner.handler, &mut rng)
+        .unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            JoinerSessionEvent::Transmit {
+                include_kek: false,
+                ..
+            },
+            JoinerSessionEvent::Transmit {
+                include_kek: true,
+                ..
+            },
+            JoinerSessionEvent::Finalized { accepted: true, .. }
+        ]
+    ));
+}
+
+#[test]
+fn joiner_finished_replay_responses_stop_at_the_security_cap() {
+    let mut rng = OsRng;
+    let mut joiner = commission_fake_joiner(true);
+    for _ in 0..MAX_DUPLICATE_FLIGHT_RETRANSMISSIONS {
+        let events = joiner
+            .session
+            .receive(
+                &joiner.client_finished_flight,
+                &mut joiner.handler,
+                &mut rng,
+            )
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [JoinerSessionEvent::Transmit { .. }]
+        ));
+    }
+    assert!(
+        joiner
+            .session
+            .receive(
+                &joiner.client_finished_flight,
+                &mut joiner.handler,
+                &mut rng,
+            )
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn joiner_authenticates_alerts_after_the_handshake() {
+    let mut rng = OsRng;
+    let mut joiner = commission_fake_joiner(true);
+    let stale_plaintext = DtlsRecord::new(ContentType::Alert, 0, 99, vec![2, 40])
+        .unwrap()
+        .encode()
+        .unwrap();
+    assert!(
+        joiner
+            .session
+            .receive(&stale_plaintext, &mut joiner.handler, &mut rng)
+            .unwrap()
+            .is_empty()
+    );
+
+    let unauthenticated = DtlsRecord::new(ContentType::Alert, 1, 1, vec![2, 40])
+        .unwrap()
+        .encode()
+        .unwrap();
+    assert!(
+        joiner
+            .session
+            .receive(&unauthenticated, &mut joiner.handler, &mut rng)
+            .unwrap()
+            .is_empty()
+    );
+
+    let authenticated = protect_aes_128_ccm_8_record(
+        ContentType::Alert,
+        1,
+        1,
+        RecordProtectionKey::new(joiner.joiner_keys.key_block.client_write_key),
+        &joiner.joiner_keys.key_block.client_write_iv,
+        &[2, 40],
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    assert!(matches!(
+        joiner
+            .session
+            .receive(&authenticated, &mut joiner.handler, &mut rng)
+            .unwrap_err(),
+        Error::Crypto(message) if message.contains("description=40")
+    ));
+}
+
+#[test]
+fn established_joiner_drops_unauthenticated_traffic_and_still_finalizes() {
+    let mut rng = OsRng;
+    let mut joiner = commission_fake_joiner(true);
+    // The forged record reuses the sequence number of the genuine JOIN_FIN
+    // below, so it must not advance the replay window either.
+    let forged = DtlsRecord::new(ContentType::ApplicationData, 1, 7, vec![0; 24])
+        .unwrap()
+        .encode()
+        .unwrap();
+    for dropped in [forged, vec![0xff, 0x00]] {
+        assert!(
+            joiner
+                .session
+                .receive(&dropped, &mut joiner.handler, &mut rng)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let join_fin = encrypted_join_fin(&joiner, 7);
+    let events = joiner
+        .session
+        .receive(&join_fin, &mut joiner.handler, &mut rng)
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, JoinerSessionEvent::Finalized { accepted: true, .. })),
+        "the genuine JOIN_FIN must still be answered, got {events:?}"
+    );
+}
+
+#[test]
+fn joiner_finished_under_a_different_pskd_fails_the_session() {
+    let mut rng = OsRng;
+    let PendingClientFlight {
+        mut session,
+        mut handler,
+        client_finished_flight,
+        ..
+    } = build_fake_client_flight(true, "WR0NGPSKD");
+    let err = session
+        .receive(&client_finished_flight, &mut handler, &mut rng)
+        .expect_err("a Finished sealed under other keys must fail the session");
+    assert!(matches!(err, Error::Dtls(_)), "unexpected error {err:?}");
+    assert!(handler.connected.is_empty());
+}
+
+#[test]
+fn unrelated_connected_traffic_does_not_replace_the_cached_client_flight() {
+    let mut rng = OsRng;
+    let mut joiner = commission_fake_joiner(true);
+    let change_cipher_spec = DtlsRecord::new(ContentType::ChangeCipherSpec, 0, 99, vec![1])
+        .unwrap()
+        .encode()
+        .unwrap();
+
+    for _ in 0..2 {
+        let events = joiner
+            .session
+            .receive(&change_cipher_spec, &mut joiner.handler, &mut rng)
+            .unwrap();
+        assert!(events.is_empty());
+    }
+}
+
+#[test]
+fn joiner_sessions_expire_and_drop_malformed_traffic() {
     let mut rng = OsRng;
     let now = Instant::now();
     let mut session = JoinerSession::new(JOINER_IID, 1000, 0x6800, PSKD, now, &mut rng);
@@ -425,19 +761,34 @@ fn joiner_sessions_expire_and_reject_malformed_traffic() {
         accept: true,
         ..RecordingHandler::default()
     };
-    // Garbage bytes are not a DTLS record.
-    assert!(
-        session
-            .receive(&[0xff, 0x00], &mut handler, &mut rng)
-            .is_err()
-    );
-    // Application data before the handshake completes is rejected.
-    let early = DtlsRecord::new(ContentType::ApplicationData, 1, 0, vec![0; 24])
+    // Garbage bytes are not a DTLS record, and protected records cannot be
+    // authenticated before the handshake; both are dropped.
+    let early_application = DtlsRecord::new(ContentType::ApplicationData, 1, 0, vec![0; 24])
         .unwrap()
         .encode()
         .unwrap();
-    assert!(session.receive(&early, &mut handler, &mut rng).is_err());
-    // Alerts tear the session down.
+    let early_finished = DtlsRecord::new(ContentType::Handshake, 1, 0, vec![0; 24])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let malformed_handshake = DtlsRecord::new(ContentType::Handshake, 0, 0, vec![0xff])
+        .unwrap()
+        .encode()
+        .unwrap();
+    for dropped in [
+        vec![0xff, 0x00],
+        early_application,
+        early_finished,
+        malformed_handshake,
+    ] {
+        assert!(
+            session
+                .receive(&dropped, &mut handler, &mut rng)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    // Plaintext alerts still tear the session down.
     let alert = DtlsRecord::new(ContentType::Alert, 0, 0, vec![2, 40])
         .unwrap()
         .encode()
@@ -624,9 +975,8 @@ async fn joiner_session_survives_the_expiry_sweep_between_relay_messages() {
         })
         .collect();
 
-    // A persistent session keeps counting epoch-0 record sequence numbers and
-    // keeps its per-session cookie key; a session recreated between the two
-    // messages would restart at sequence zero with a fresh key.
+    // RFC 6347 requires each HelloVerifyRequest record sequence to mirror the
+    // triggering ClientHello. A persistent session still keeps one cookie key.
     let [(first_seq, first_cookie), (second_seq, second_cookie)] = hello_verifies.as_slice() else {
         panic!(
             "expected two relayed HelloVerifyRequests, got {}",
@@ -634,7 +984,7 @@ async fn joiner_session_survives_the_expiry_sweep_between_relay_messages() {
         );
     };
     assert_eq!(*first_seq, 0);
-    assert_eq!(*second_seq, 1);
+    assert_eq!(*second_seq, 0);
     assert_eq!(first_cookie, second_cookie);
 }
 

@@ -38,7 +38,7 @@ mod test_fixtures;
 use collect::Collector;
 
 const DEFAULT_COMMISSIONER_ID: &str = "meshcop-netdiag";
-const DEFAULT_NODE_TIMEOUT_SECS: u64 = 2;
+const DEFAULT_NODE_TIMEOUT_SECS: u64 = 4;
 
 /// Environment variable holding the PSKc, preferred over `--pskc` so the
 /// credential never lands in the process table or shell history.
@@ -60,7 +60,9 @@ struct Args {
     #[argh(option, default = "DEFAULT_COMMISSIONER_ID.to_string()")]
     commissioner_id: String,
 
-    /// per-node diagnostic answer timeout, in seconds
+    /// per-node diagnostic answer timeout, in seconds (default 4; together
+    /// with one 12-second keep-alive exchange it must fit within the
+    /// commissioner keep-alive interval)
     #[argh(option, default = "DEFAULT_NODE_TIMEOUT_SECS")]
     node_timeout: u64,
 

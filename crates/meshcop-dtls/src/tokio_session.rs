@@ -19,6 +19,18 @@ pub struct DtlsSession {
 
 impl DtlsSession {
     /// Creates a session from already-derived key material.
+    ///
+    /// The session's first application record uses epoch-1 sequence number 1,
+    /// assuming the handshake sent exactly one protected record (the client
+    /// Finished at sequence 0). Handshakes now retransmit the Finished under
+    /// later sequence numbers, so that assumption no longer holds in general
+    /// and a later record could reuse an AES-CCM nonce. Use
+    /// [`Self::connect`], which carries the handshake's record sequence into
+    /// the session.
+    #[deprecated(
+        since = "0.1.0",
+        note = "may reuse a record nonce after a retransmitted Finished; use `DtlsSession::connect`"
+    )]
     pub fn new(key_material: ThreadDtlsKeyMaterial) -> Self {
         Self {
             state: SessionState::new(key_material, SessionRole::Client),
@@ -31,12 +43,18 @@ impl DtlsSession {
     }
 
     /// Runs the Thread PSKc/ECJPAKE DTLS handshake over a connected UDP socket.
+    ///
+    /// `timeout` is an absolute deadline for the complete, automatically
+    /// retransmitted handshake.
     pub async fn connect(socket: &UdpSocket, pskc: &[u8], timeout: Duration) -> Result<Self> {
         let mut rng = rand_core::OsRng;
         Self::connect_with_rng(&mut rng, socket, pskc, timeout).await
     }
 
     /// Runs the handshake using cryptographic randomness supplied by the caller.
+    ///
+    /// `timeout` is an absolute deadline for the complete, automatically
+    /// retransmitted handshake.
     pub async fn connect_with_rng(
         rng: &mut (impl rand_core::RngCore + rand_core::CryptoRng),
         socket: &UdpSocket,
@@ -95,8 +113,8 @@ impl DtlsSession {
     ) -> Result<Vec<u8>> {
         let peer = socket.peer_addr()?;
         let mut transport = BorrowedTokioUdpTransport::new(socket);
-        let mut delay = TokioDelay;
-        recv_application_data(&mut self.state, &mut transport, &mut delay, peer, timeout)
+        let delay = TokioDelay;
+        recv_application_data(&mut self.state, &mut transport, &delay, peer, timeout)
             .await
             .map_err(crate::Error::from)
     }

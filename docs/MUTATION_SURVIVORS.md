@@ -8,12 +8,13 @@ each one; every other viable mutant must be killed by the test suite.
 
 ## Equivalent mutants (no input distinguishes them)
 
-- `crates/meshcop-dtls/src/driver.rs` `DtlsReplayWindow::mark_seen`, `>` → `>=`
+- `crates/meshcop-dtls/src/replay.rs` `ReplayWindow::mark_seen`, `>` → `>=`
   and `| 1` → `^ 1`. For `>` → `>=`, an equal sequence takes the slide arm
   with a zero shift instead of the in-window arm; both preserve the bitmap,
   set bit zero, and retain the same newest sequence. For `| 1` → `^ 1`, the
   slide arm has a shift of at least one, so bit zero is clear before the
-  operation and OR and XOR produce the same value.
+  operation and OR and XOR produce the same value. The commissioner's joiner
+  sessions use this same window.
 - `crates/meshcop/src/meshcop/diag/decode.rs`
   `decode_child_table`, `<< 8 | low` → `<< 8 ^ low`. The 9th child-ID bit
   (`<< 8`) and the low byte occupy disjoint bit ranges, so `|` and `^` produce

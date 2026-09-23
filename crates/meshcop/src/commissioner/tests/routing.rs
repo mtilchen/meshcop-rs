@@ -499,3 +499,37 @@ async fn set_commissioner_dataset_strips_managed_tlvs_and_rejects_empty_sets() {
         Error::Dataset(message) if message.contains("no settable TLVs")
     ));
 }
+
+#[tokio::test]
+async fn a_proxied_reset_fails_the_exchange() {
+    let leader_aloc: Ipv6Addr = "fd00:db8::ff:fe00:fc00".parse().unwrap();
+    let script = ScriptedMeshcopTransport::new([
+        exchange(
+            CommissionerOperation::Petition,
+            [ScriptedResponse::petition_accept(0x1234)],
+        ),
+        exchange(
+            CommissionerOperation::GetCommissionerDataset,
+            [
+                ScriptedResponse::proxied(leader_aloc, ScriptedResponse::reset()),
+                ScriptedResponse::proxied(
+                    leader_aloc,
+                    ScriptedResponse::content(dataset_with_name("late").to_bytes().unwrap()),
+                ),
+            ],
+        ),
+    ]);
+    let mut commissioner = scripted_commissioner(script, []).await;
+    commissioner.petition().await.unwrap();
+    let err = commissioner
+        .get_commissioner_dataset(CommissionerDatasetFlags::STEERING_DATA)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::InvalidState("CoAP request was reset by the peer")
+        ),
+        "unexpected error {err:?}"
+    );
+}

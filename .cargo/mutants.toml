@@ -14,7 +14,7 @@ exclude_re = [
     # the catch-up arm, which computes `(seen << 0) | 1` and rewrites
     # `newest_sequence` with the same value — state-identical to the
     # `seen |= 1 << 0` arm the original guard selects.
-    'replace > with >= in DtlsReplayWindow::mark_seen',
+    'replace > with >= in ReplayWindow::mark_seen',
 
     # Equivalent mutants: these default trait-method bodies are already a
     # no-op (`let _ = ...`) and an unconditional `true` respectively, so the
@@ -36,7 +36,7 @@ exclude_re = [
     # Equivalent mutant: the slide arm is only reached when `sequence > newest`,
     # so `shift >= 1` and bit 0 of `seen << shift` is always zero, making
     # `| 1` and `^ 1` identical.
-    'replace \| with \^ in DtlsReplayWindow::mark_seen',
+    'replace \| with \^ in ReplayWindow::mark_seen',
 
     # Equivalent mutants: the CoAP header byte ORs the version (bit 6), type
     # (bits 4-5, type <= 3) and token length (bits 0-3, length <= 8 enforced

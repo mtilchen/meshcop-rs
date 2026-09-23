@@ -26,7 +26,7 @@ use meshcop_dtls::DtlsSession;
 #[cfg(any(test, feature = "test-support"))]
 use super::harness::ScriptedMeshcopTransport;
 use super::{
-    config::CommissionerConfig,
+    config::{CommissionerConfig, MIN_KEEPALIVE_INTERVAL},
     joiner::{JoinerHandler, JoinerSession},
     types::{CommissionerEvent, CommissionerState, PetitionResponse, ResultCode},
 };
@@ -400,14 +400,36 @@ fn commissioner_trace(args: core::fmt::Arguments<'_>) {
     }
 }
 
-/// Timeout applied to each DTLS receive and to an overall MeshCoP response wait.
-const MESHCOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Absolute budget for one CoAP request/response exchange, including its
+/// retransmissions.
+const COAP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(12);
+/// Slack a replacement commissioner keeps between the incumbent session's
+/// keep-alive refresh and the start of its own handshake, covering the
+/// keep-alive response and local processing.
+const SESSION_REPLACEMENT_MARGIN: Duration = Duration::from_secs(3);
 /// Absolute DTLS handshake budget.
 ///
-/// This leaves five seconds for the petition response after a replacement
-/// commissioner refreshes a session using the minimum 30-second keep-alive
-/// interval.
-const DTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// A caller replacing an active session refreshes the incumbent's keep-alive
+/// and then runs a handshake followed by a petition exchange. Both must finish
+/// inside the minimum keep-alive interval so the incumbent stays valid if the
+/// replacement fails, so the handshake receives what that interval leaves
+/// after one CoAP exchange and the replacement margin.
+const DTLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(
+    MIN_KEEPALIVE_INTERVAL.as_secs()
+        - COAP_EXCHANGE_TIMEOUT.as_secs()
+        - SESSION_REPLACEMENT_MARGIN.as_secs(),
+);
+
+impl Commissioner {
+    /// Absolute time budget for one MeshCoP request/response exchange,
+    /// including CoAP retransmissions.
+    ///
+    /// A keep-alive sent less than this long before the session's keep-alive
+    /// deadline may not be delivered in time, so applications scheduling
+    /// keep-alives around other requests should leave at least this much
+    /// headroom per exchange.
+    pub const EXCHANGE_TIMEOUT: Duration = COAP_EXCHANGE_TIMEOUT;
+}
 
 fn result_code_from_meshcop_state(state: MeshcopState) -> ResultCode {
     match state {

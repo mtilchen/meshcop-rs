@@ -42,11 +42,13 @@ mod constants;
 pub mod driver;
 pub mod ecjpake;
 mod error;
+mod flight;
 mod handshake;
 mod hello;
 mod key_schedule;
 mod record;
 mod record_protection;
+mod replay;
 #[cfg(any(feature = "tokio", feature = "embedded"))]
 mod server_driver;
 #[cfg(any(test, feature = "test-support"))]
@@ -67,6 +69,7 @@ pub use ccm::{
 pub use client_driver::{DtlsClient, DtlsClientSession};
 pub use constants::*;
 pub use error::{Error, Result};
+pub use flight::{is_client_finished_flight, renumber_epoch_zero_flight};
 pub use handshake::{
     FinishedRole, HandshakeFragment, HandshakeHeader, HandshakeMessage, HandshakeReassembler,
     HandshakeTranscript, HandshakeType, parse_unfragmented_handshake_messages,
@@ -79,6 +82,7 @@ pub use key_schedule::{
 };
 pub use record::{ContentType, DtlsRecord, RecordHeader};
 pub use record_protection::{open_aes_128_ccm_8_record, protect_aes_128_ccm_8_record};
+pub use replay::ReplayWindow;
 #[cfg(any(feature = "tokio", feature = "embedded"))]
 pub use server_driver::{DtlsServer, DtlsServerSession};
 pub use thread_handshake::ThreadDtlsHandshake;

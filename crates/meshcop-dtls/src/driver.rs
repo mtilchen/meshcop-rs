@@ -14,16 +14,33 @@
 //! adapter, socket buffers, and executor policy while this crate owns only
 //! DTLS state.
 //!
-//! Tokio support uses small adapters for the same traits. The receive policy
-//! deliberately matches the original Tokio client: each expected flight gets
-//! the caller's timeout and sent flights are not automatically retransmitted.
-//! No additional retry or backoff policy is imposed here.
+//! Tokio support uses small adapters for the same traits. Handshakes retain
+//! each outbound flight and retransmit the same handshake messages in records
+//! with fresh sequence numbers after an initial one-second timeout, doubling
+//! the interval up to 60 seconds. The retransmission timer is armed once per
+//! transmitted flight, so datagrams the handshake ignores cannot postpone it.
+//! A duplicate of the peer's preceding flight triggers an immediate
+//! retransmission, capped at four duplicate-triggered responses per wait to
+//! bound reflection. The caller's timeout is an absolute deadline for the
+//! complete handshake rather than a fresh allowance for every receive.
+//! Handshake and receive methods clone the [`DelayNs`] value so an absolute
+//! deadline and an inner receive/retransmission timer can remain live
+//! concurrently; embedded timer adapters therefore need cheap, independent
+//! `Clone` semantics and enough timer capacity for both futures.
+//!
+//! Datagrams that do not parse as DTLS records, and protected records that
+//! fail authentication, are discarded (RFC 6347 §4.1.2.7) rather than ending
+//! the association. The one exception is the peer's Finished during a
+//! handshake: once the peer has switched cipher state, a Finished that fails
+//! authentication means the two sides derived different keys, so it aborts the
+//! handshake the way mbedTLS does instead of waiting for the deadline.
 
 use alloc::{format, vec::Vec};
 use core::{
     fmt,
     future::{Future, poll_fn},
     net::SocketAddr,
+    pin::{Pin, pin},
     task::Poll,
     time::Duration,
 };
@@ -32,12 +49,23 @@ pub use embedded_hal_async::delay::DelayNs;
 pub use embedded_nal_async::UnconnectedUdp;
 
 use crate::{
-    ContentType, DtlsRecord, Error, RecordProtectionKey, ThreadDtlsKeyMaterial,
-    open_aes_128_ccm_8_record, protect_aes_128_ccm_8_record,
+    ContentType, DtlsRecord, Error, RecordHeader, RecordProtectionKey, ReplayWindow,
+    ThreadDtlsKeyMaterial, open_aes_128_ccm_8_record, protect_aes_128_ccm_8_record,
+    util::dtls_trace,
 };
 
 /// Maximum UDP datagram accepted by the async drivers.
 pub const MAX_DATAGRAM_SIZE: usize = 4096;
+
+pub(crate) const INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(not(test))]
+pub(crate) const DRIVER_INITIAL_RETRANSMIT_TIMEOUT: Duration = INITIAL_RETRANSMIT_TIMEOUT;
+// Loopback state-machine tests exercise the same timer/backoff transitions at
+// a smaller scale so mutation runs do not spend seconds sleeping per mutant.
+#[cfg(test)]
+pub(crate) const DRIVER_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const MAX_DUPLICATE_RETRANSMISSIONS: u8 = 4;
 
 /// Error produced by a runtime-neutral DTLS driver.
 #[derive(Debug)]
@@ -46,7 +74,7 @@ pub enum DriverError<E> {
     Protocol(Error),
     /// The datagram transport failed.
     Transport(E),
-    /// A receive did not complete within the supplied timeout.
+    /// A DTLS operation did not complete before its supplied deadline.
     Timeout,
 }
 
@@ -61,7 +89,7 @@ impl<E: fmt::Display> fmt::Display for DriverError<E> {
         match self {
             Self::Protocol(error) => error.fmt(formatter),
             Self::Transport(error) => write!(formatter, "datagram transport error: {error}"),
-            Self::Timeout => formatter.write_str("DTLS receive timed out"),
+            Self::Timeout => formatter.write_str("DTLS operation timed out"),
         }
     }
 }
@@ -83,6 +111,51 @@ where
 pub type DriverResult<T, E> = core::result::Result<T, DriverError<E>>;
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct RetransmitSchedule {
+    timeout: Duration,
+}
+
+impl RetransmitSchedule {
+    pub(crate) const fn new() -> Self {
+        Self {
+            timeout: DRIVER_INITIAL_RETRANSMIT_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    const fn with_initial(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    pub(crate) const fn timeout(self) -> Duration {
+        self.timeout
+    }
+
+    pub(crate) fn back_off(&mut self) {
+        self.timeout = self.timeout.saturating_mul(2).min(MAX_RETRANSMIT_TIMEOUT);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DuplicateRetransmitBudget {
+    used: u8,
+}
+
+impl DuplicateRetransmitBudget {
+    pub(crate) const fn new() -> Self {
+        Self { used: 0 }
+    }
+
+    pub(crate) fn take(&mut self) -> bool {
+        if self.used >= MAX_DUPLICATE_RETRANSMISSIONS {
+            return false;
+        }
+        self.used = self.used.saturating_add(1);
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum SessionRole {
     Client,
     Server,
@@ -93,16 +166,30 @@ pub(crate) struct SessionState {
     key_material: ThreadDtlsKeyMaterial,
     role: SessionRole,
     next_application_sequence: u64,
-    application_replay: DtlsReplayWindow,
+    application_replay: ReplayWindow,
 }
 
 impl SessionState {
+    /// Builds a session whose own Finished already used epoch-1 sequence 0.
+    #[cfg(any(test, feature = "tokio"))]
     pub(crate) fn new(key_material: ThreadDtlsKeyMaterial, role: SessionRole) -> Self {
+        Self::with_next_application_sequence(key_material, role, 1)
+    }
+
+    pub(crate) fn during_handshake(key_material: ThreadDtlsKeyMaterial, role: SessionRole) -> Self {
+        Self::with_next_application_sequence(key_material, role, 0)
+    }
+
+    fn with_next_application_sequence(
+        key_material: ThreadDtlsKeyMaterial,
+        role: SessionRole,
+        next_application_sequence: u64,
+    ) -> Self {
         Self {
             key_material,
             role,
-            next_application_sequence: 1,
-            application_replay: DtlsReplayWindow::new(),
+            next_application_sequence,
+            application_replay: ReplayWindow::new(),
         }
     }
 
@@ -112,6 +199,14 @@ impl SessionState {
 
     pub(crate) fn protect_application_data(
         &mut self,
+        plaintext: &[u8],
+    ) -> crate::Result<DtlsRecord> {
+        self.protect_record(ContentType::ApplicationData, plaintext)
+    }
+
+    pub(crate) fn protect_record(
+        &mut self,
+        content_type: ContentType,
         plaintext: &[u8],
     ) -> crate::Result<DtlsRecord> {
         let (key, iv) = match self.role {
@@ -125,7 +220,7 @@ impl SessionState {
             ),
         };
         let record = protect_aes_128_ccm_8_record(
-            ContentType::ApplicationData,
+            content_type,
             1,
             self.next_application_sequence,
             RecordProtectionKey::new(key),
@@ -136,7 +231,11 @@ impl SessionState {
         Ok(record)
     }
 
-    pub(crate) fn open_application_data(
+    /// Opens one epoch-1 record from the peer.
+    ///
+    /// Returns `Ok(None)` for a replayed record and an error when the record
+    /// fails authentication; only authenticated records advance the window.
+    pub(crate) fn open_protected_record(
         &mut self,
         record: &DtlsRecord,
     ) -> crate::Result<Option<Vec<u8>>> {
@@ -161,6 +260,37 @@ impl SessionState {
             .mark_seen(record.header.sequence_number);
         Ok(Some(plaintext))
     }
+
+    /// Opens the protected records of one established-session datagram.
+    ///
+    /// Returns the first authenticated application-data plaintext, or the
+    /// error for an authenticated alert. Unauthenticated, replayed, and
+    /// non-application records are discarded, yielding `None` when nothing in
+    /// the datagram is usable.
+    pub(crate) fn open_session_datagram(
+        &mut self,
+        records: &[DtlsRecord],
+    ) -> Option<crate::Result<Vec<u8>>> {
+        for record in records {
+            if record.header.epoch != 1 {
+                continue;
+            }
+            let is_alert = match record.header.content_type {
+                ContentType::ApplicationData => false,
+                ContentType::Alert => true,
+                _ => continue,
+            };
+            let Ok(Some(plaintext)) = self.open_protected_record(record) else {
+                continue;
+            };
+            return Some(if is_alert {
+                Err(decode_alert_error(&record.header, &plaintext))
+            } else {
+                Ok(plaintext)
+            });
+        }
+        None
+    }
 }
 
 pub(crate) async fn send_records<U>(
@@ -172,16 +302,14 @@ pub(crate) async fn send_records<U>(
 where
     U: UnconnectedUdp,
 {
-    let mut datagram = Vec::new();
-    for record in records {
-        datagram.extend_from_slice(&record.encode()?);
-    }
+    let datagram = DtlsRecord::encode_datagram(records)?;
     transport
         .send(local, remote, &datagram)
         .await
         .map_err(DriverError::Transport)
 }
 
+#[cfg(test)]
 pub(crate) async fn recv_records<U, D>(
     transport: &mut U,
     delay: &mut D,
@@ -191,86 +319,142 @@ where
     U: UnconnectedUdp,
     D: DelayNs,
 {
+    with_timeout(recv_records_unbounded(transport), delay, duration).await
+}
+
+/// Receives the next parseable datagram from `peer`, or times out when
+/// `expiry` completes first.
+///
+/// Handshake loops pass the retransmission timer armed for their last
+/// transmitted flight, so the time spent on ignored datagrams still counts
+/// toward it.
+pub(crate) async fn recv_records_before<U, T>(
+    transport: &mut U,
+    peer: SocketAddr,
+    expiry: Pin<&mut T>,
+) -> DriverResult<(Vec<DtlsRecord>, SocketAddr, SocketAddr), U::Error>
+where
+    U: UnconnectedUdp,
+    T: Future<Output = ()>,
+{
+    race_expiry(recv_records_from_unbounded(transport, peer), expiry).await
+}
+
+pub(crate) async fn recv_records_from_unbounded<U>(
+    transport: &mut U,
+    peer: SocketAddr,
+) -> DriverResult<(Vec<DtlsRecord>, SocketAddr, SocketAddr), U::Error>
+where
+    U: UnconnectedUdp,
+{
+    recv_parsed_datagram(transport, Some(peer)).await
+}
+
+pub(crate) async fn recv_records_unbounded<U>(
+    transport: &mut U,
+) -> DriverResult<(Vec<DtlsRecord>, SocketAddr, SocketAddr), U::Error>
+where
+    U: UnconnectedUdp,
+{
+    recv_parsed_datagram(transport, None).await
+}
+
+/// Receives datagrams until one from `peer` (or from anyone when `None`)
+/// parses as DTLS records, discarding everything else.
+async fn recv_parsed_datagram<U>(
+    transport: &mut U,
+    peer: Option<SocketAddr>,
+) -> DriverResult<(Vec<DtlsRecord>, SocketAddr, SocketAddr), U::Error>
+where
+    U: UnconnectedUdp,
+{
     let mut buffer = [0u8; MAX_DATAGRAM_SIZE];
-    let (length, local, remote) =
-        recv_with_timeout(transport, delay, &mut buffer, duration).await?;
-    if length > buffer.len() {
-        return Err(Error::Crypto("DTLS datagram is too long".into()).into());
+    loop {
+        let (length, local, remote) = transport
+            .receive_into(&mut buffer)
+            .await
+            .map_err(DriverError::Transport)?;
+        if peer.is_some_and(|peer| peer != remote) {
+            continue;
+        }
+        // A transport reports the full length of a datagram it truncated.
+        let Some(datagram) = buffer.get(..length) else {
+            dtls_trace(format_args!(
+                "drop oversized datagram from {remote} len={length}"
+            ));
+            continue;
+        };
+        match DtlsRecord::parse_datagram(datagram) {
+            Ok(records) => return Ok((records, local, remote)),
+            Err(error) => dtls_trace(format_args!(
+                "drop malformed datagram from {remote}: {error}"
+            )),
+        }
     }
-    Ok((
-        DtlsRecord::parse_datagram(&buffer[..length])?,
-        local,
-        remote,
-    ))
 }
 
 pub(crate) async fn recv_application_data<U, D>(
     state: &mut SessionState,
     transport: &mut U,
-    delay: &mut D,
+    delay: &D,
     peer: SocketAddr,
     duration: Duration,
 ) -> DriverResult<Vec<u8>, U::Error>
 where
     U: UnconnectedUdp,
-    D: DelayNs,
+    D: DelayNs + Clone,
 {
-    loop {
-        let (records, _, source) = recv_records(transport, delay, duration).await?;
-        if source != peer {
-            continue;
-        }
-        for record in records {
-            match (record.header.epoch, record.header.content_type) {
-                (1, ContentType::ApplicationData) => {
-                    if let Some(plaintext) = state.open_application_data(&record)? {
-                        return Ok(plaintext);
-                    }
-                }
-                (_, ContentType::Alert) => return Err(decode_alert_error(&record).into()),
-                _ => {}
+    let receive = async {
+        loop {
+            let (records, _, _) = recv_records_from_unbounded(transport, peer).await?;
+            if let Some(result) = state.open_session_datagram(&records) {
+                return result.map_err(DriverError::from);
             }
         }
-    }
+    };
+    with_timeout(receive, delay.clone(), duration).await
 }
 
-pub(crate) fn decode_alert_error(record: &DtlsRecord) -> Error {
-    if record.payload.len() >= 2 {
-        Error::Crypto(format!(
-            "DTLS alert epoch={} seq={} level={} description={}",
-            record.header.epoch,
-            record.header.sequence_number,
-            record.payload[0],
-            record.payload[1]
-        ))
-    } else {
-        Error::Crypto(format!(
+/// Converts a received alert's header and plaintext into an error.
+pub(crate) fn decode_alert_error(header: &RecordHeader, payload: &[u8]) -> Error {
+    match payload {
+        [level, description, ..] => Error::Crypto(format!(
+            "DTLS alert epoch={} seq={} level={level} description={description}",
+            header.epoch, header.sequence_number
+        )),
+        _ => Error::Crypto(format!(
             "DTLS alert epoch={} seq={} received",
-            record.header.epoch, record.header.sequence_number
-        ))
+            header.epoch, header.sequence_number
+        )),
     }
 }
 
-async fn recv_with_timeout<U, D>(
-    transport: &mut U,
-    delay: &mut D,
-    buffer: &mut [u8],
+pub(crate) async fn with_timeout<F, D, T, E>(
+    future: F,
+    delay: D,
     duration: Duration,
-) -> DriverResult<(usize, SocketAddr, SocketAddr), U::Error>
+) -> DriverResult<T, E>
 where
-    U: UnconnectedUdp,
+    F: Future<Output = DriverResult<T, E>>,
     D: DelayNs,
 {
-    let receive = transport.receive_into(buffer);
-    let timeout = delay_duration(delay, duration);
-    let mut receive = core::pin::pin!(receive);
-    let mut timeout = core::pin::pin!(timeout);
+    race_expiry(future, pin!(sleep(delay, duration))).await
+}
 
+/// Completes with `future`'s output, or with [`DriverError::Timeout`] once
+/// `expiry` completes first. The expiry is borrowed so a caller can keep one
+/// timer running across several operations.
+async fn race_expiry<F, T, E, X>(future: F, mut expiry: Pin<&mut X>) -> DriverResult<T, E>
+where
+    F: Future<Output = DriverResult<T, E>>,
+    X: Future<Output = ()>,
+{
+    let mut future = pin!(future);
     poll_fn(|context| {
-        if let Poll::Ready(result) = receive.as_mut().poll(context) {
-            return Poll::Ready(result.map_err(DriverError::Transport));
+        if let Poll::Ready(result) = future.as_mut().poll(context) {
+            return Poll::Ready(result);
         }
-        if timeout.as_mut().poll(context).is_ready() {
+        if expiry.as_mut().poll(context).is_ready() {
             return Poll::Ready(Err(DriverError::Timeout));
         }
         Poll::Pending
@@ -278,62 +462,27 @@ where
     .await
 }
 
+/// Sleeps for `duration` on an owned timer handle.
+///
+/// Handshake loops pin one of these per transmitted flight and replace it
+/// only after retransmitting.
+pub(crate) async fn sleep<D: DelayNs>(mut delay: D, duration: Duration) {
+    delay_duration(&mut delay, duration).await;
+}
+
 async fn delay_duration(delay: &mut impl DelayNs, duration: Duration) {
-    let mut nanoseconds = duration.as_nanos();
-    while nanoseconds > 0 {
-        let chunk = nanoseconds.min(u32::MAX as u128) as u32;
-        delay.delay_ns(chunk).await;
-        nanoseconds -= u128::from(chunk);
+    const MAX_DELAY_NANOSECONDS: u128 = u32::MAX as u128;
+
+    let nanoseconds = duration.as_nanos();
+    let full_chunks = nanoseconds
+        .checked_div(MAX_DELAY_NANOSECONDS)
+        .unwrap_or_default();
+    for _ in 0..full_chunks {
+        delay.delay_ns(u32::MAX).await;
     }
-}
-
-#[derive(Debug)]
-struct DtlsReplayWindow {
-    newest_sequence: Option<u64>,
-    seen: u64,
-}
-
-impl DtlsReplayWindow {
-    const fn new() -> Self {
-        Self {
-            newest_sequence: None,
-            seen: 0,
-        }
-    }
-
-    fn has_seen(&self, sequence: u64) -> bool {
-        let Some(newest) = self.newest_sequence else {
-            return false;
-        };
-        if sequence > newest {
-            return false;
-        }
-        let offset = newest - sequence;
-        offset >= u64::BITS as u64 || ((self.seen >> offset) & 1) == 1
-    }
-
-    fn mark_seen(&mut self, sequence: u64) {
-        match self.newest_sequence {
-            None => {
-                self.newest_sequence = Some(sequence);
-                self.seen = 1;
-            }
-            Some(newest) if sequence > newest => {
-                let shift = sequence - newest;
-                self.seen = if shift >= u64::BITS as u64 {
-                    1
-                } else {
-                    (self.seen << shift) | 1
-                };
-                self.newest_sequence = Some(sequence);
-            }
-            Some(newest) => {
-                let offset = newest - sequence;
-                if offset < u64::BITS as u64 {
-                    self.seen |= 1 << offset;
-                }
-            }
-        }
+    let remainder = nanoseconds % MAX_DELAY_NANOSECONDS;
+    if remainder != 0 {
+        delay.delay_ns(remainder as u32).await;
     }
 }
 
@@ -391,6 +540,7 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
     struct PendingDelay;
 
     impl DelayNs for PendingDelay {
@@ -462,6 +612,7 @@ mod tests {
     /// `delay_duration` test below: a mutated termination condition or
     /// accumulator would otherwise spin the test binary forever instead of
     /// failing it.
+    #[derive(Clone)]
     struct BudgetedDelay {
         calls: u32,
         total_nanoseconds: u128,
@@ -524,7 +675,7 @@ mod tests {
         );
 
         let timeout = DriverError::<MockTransportError>::Timeout;
-        assert_eq!(format!("{timeout}"), "DTLS receive timed out");
+        assert_eq!(format!("{timeout}"), "DTLS operation timed out");
     }
 
     #[test]
@@ -551,65 +702,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_window_detects_in_window_replays_and_preserves_bits() {
-        let mut window = DtlsReplayWindow::new();
-        assert!(!window.has_seen(100)); // empty window has seen nothing
-
-        window.mark_seen(10);
-        assert!(window.has_seen(10));
-        assert!(!window.has_seen(11)); // future sequence
-        assert!(!window.has_seen(9)); // older, never marked
-
-        window.mark_seen(12); // newer: window slides left by two, bit 2 holds 10
-        assert!(window.has_seen(12));
-        assert!(window.has_seen(10));
-        assert!(!window.has_seen(11)); // gap stays unseen
-        assert!(!window.has_seen(9)); // beyond the marked bits, still unseen
-        assert!(!window.has_seen(13)); // future
-
-        window.mark_seen(11); // older within window: fills the gap
-        assert!(window.has_seen(11));
-        assert!(window.has_seen(10)); // neighbouring bits untouched
-        assert!(window.has_seen(12));
-    }
-
-    #[test]
-    fn replay_window_handles_window_edges() {
-        // An older sequence two positions back must set bit two, distinguishing
-        // subtraction from division/addition in the offset computation.
-        let mut window = DtlsReplayWindow::new();
-        window.mark_seen(20);
-        window.mark_seen(18);
-        assert!(window.has_seen(18));
-        assert!(!window.has_seen(19));
-        assert!(window.has_seen(20));
-
-        // A jump of exactly the window width resets the bitmap to the newest
-        // sequence only. The boundary checks keep the 64-bit shifts in range.
-        let width = u64::BITS as u64;
-        let mut window = DtlsReplayWindow::new();
-        window.mark_seen(1);
-        window.mark_seen(1 + width); // shift == 64 resets rather than shifting
-        assert!(window.has_seen(1 + width));
-        assert!(window.has_seen(1)); // offset == 64 is treated as too old to trust
-        assert!(!window.has_seen(2)); // within the fresh window but never marked
-        window.mark_seen(1); // offset == 64 must be a no-op, not a 1 << 64 shift
-        assert!(!window.has_seen(2));
-    }
-
-    #[test]
-    fn replay_window_remarking_a_seen_sequence_does_not_clear_its_bit() {
-        // Re-marking an already-seen older sequence must leave its bit set
-        // (`|=`), not toggle it off or wipe out its neighbours.
-        let mut window = DtlsReplayWindow::new();
-        window.mark_seen(10);
-        window.mark_seen(12); // seen = 0b101; bit 2 holds sequence 10
-        window.mark_seen(10); // re-mark the already-set bit
-        assert!(window.has_seen(10));
-        assert!(window.has_seen(12));
-    }
-
-    #[test]
     fn recv_records_accepts_a_datagram_at_the_maximum_size() {
         let payload_len = MAX_DATAGRAM_SIZE - RecordHeader::LEN;
         let record = DtlsRecord::new(ContentType::Handshake, 0, 0, vec![0xab; payload_len])
@@ -633,31 +725,73 @@ mod tests {
     }
 
     #[test]
-    fn recv_records_rejects_a_datagram_longer_than_the_buffer() {
+    fn recv_records_drops_a_datagram_longer_than_the_buffer() {
         // A transport that reports more bytes than fit in the receive buffer
         // mirrors a truncating `recvfrom` on an oversized datagram: real
         // bytes are capped at the buffer size but the reported length is
-        // not. The guard must reject this cleanly rather than slicing the
-        // fixed-size buffer past its end.
-        let oversized = vec![0u8; 5000];
+        // not. The receive must discard it rather than slicing the
+        // fixed-size buffer past its end, then deliver the next datagram.
+        let oversized = vec![0u8; MAX_DATAGRAM_SIZE + 1];
+        let record = DtlsRecord::new(ContentType::Handshake, 0, 1, vec![0x0e]).expect("record");
         let mut transport = QueuedUdp {
-            queue: VecDeque::from([(oversized, LOCAL_ADDR, PEER_ADDR)]),
+            queue: VecDeque::from([
+                (oversized, LOCAL_ADDR, PEER_ADDR),
+                (
+                    record.encode().expect("record encodes"),
+                    LOCAL_ADDR,
+                    PEER_ADDR,
+                ),
+            ]),
         };
         let mut delay = PendingDelay;
-        let result = futures_lite_for_test::block_on(recv_records(
+        let (records, ..) = futures_lite_for_test::block_on(recv_records(
             &mut transport,
             &mut delay,
             Duration::from_secs(1),
-        ));
-        match result {
-            Err(DriverError::Protocol(Error::Crypto(message))) => {
-                assert!(
-                    message.contains("too long"),
-                    "unexpected error message: {message}"
-                );
-            }
-            other => panic!("expected a clean 'too long' error, got {other:?}"),
-        }
+        ))
+        .expect("the oversized datagram must be skipped");
+        assert_eq!(records, vec![record]);
+    }
+
+    #[test]
+    fn peer_receive_drops_malformed_and_foreign_datagrams() {
+        let other_peer = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3000);
+        let record = DtlsRecord::new(ContentType::Handshake, 0, 1, vec![0x0e]).expect("record");
+        let encoded = record.encode().expect("record encodes");
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        let mut transport = QueuedUdp {
+            queue: VecDeque::from([
+                (vec![0x16, 0xfe], LOCAL_ADDR, PEER_ADDR),
+                (truncated, LOCAL_ADDR, PEER_ADDR),
+                (encoded.clone(), LOCAL_ADDR, other_peer),
+                (encoded, LOCAL_ADDR, PEER_ADDR),
+            ]),
+        };
+        let (records, _, remote) =
+            futures_lite_for_test::block_on(recv_records_from_unbounded(&mut transport, PEER_ADDR))
+                .expect("malformed datagrams must not end the receive");
+        assert_eq!(records, vec![record]);
+        assert_eq!(remote, PEER_ADDR);
+        assert!(transport.queue.is_empty());
+    }
+
+    #[test]
+    fn any_source_receive_drops_malformed_datagrams() {
+        let record = DtlsRecord::new(ContentType::Handshake, 0, 1, vec![0x0e]).expect("record");
+        let mut transport = QueuedUdp {
+            queue: VecDeque::from([
+                (vec![0xff; 3], LOCAL_ADDR, PEER_ADDR),
+                (
+                    record.encode().expect("record encodes"),
+                    LOCAL_ADDR,
+                    PEER_ADDR,
+                ),
+            ]),
+        };
+        let (records, ..) = futures_lite_for_test::block_on(recv_records_unbounded(&mut transport))
+            .expect("a malformed datagram must not fail an accept-side receive");
+        assert_eq!(records, vec![record]);
     }
 
     #[test]
@@ -683,37 +817,85 @@ mod tests {
 
     #[test]
     fn delay_duration_splits_large_durations_into_bounded_chunks() {
-        // One nanosecond past u32::MAX forces exactly two chunks: a full
-        // u32::MAX-sized chunk, then a one-nanosecond remainder. A mutated
-        // termination test or accumulator update either stops too early
-        // (wrong totals below) or never terminates (caught by the delay's
-        // own call budget).
-        let requested_nanos = u64::from(u32::MAX) + 1;
+        // One nanosecond past two full u32::MAX chunks forces exactly three
+        // calls. Mutated chunk arithmetic changes the counts/totals below or
+        // trips the delay's own call budget.
+        let requested_nanos = 2 * u64::from(u32::MAX) + 1;
         let mut delay = BudgetedDelay::new();
         futures_lite_for_test::block_on(delay_duration(
             &mut delay,
             Duration::from_nanos(requested_nanos),
         ));
-        assert_eq!(delay.calls, 2);
+        assert_eq!(delay.calls, 3);
         assert_eq!(delay.total_nanoseconds, u128::from(requested_nanos));
     }
 
     #[test]
-    fn recv_application_data_ignores_plain_records_and_reports_alerts() {
+    fn retransmit_schedule_doubles_and_caps_at_sixty_seconds() {
+        assert_eq!(
+            RetransmitSchedule::new().timeout(),
+            Duration::from_millis(100)
+        );
+        let mut schedule = RetransmitSchedule::with_initial(INITIAL_RETRANSMIT_TIMEOUT);
+        let expected = [1, 2, 4, 8, 16, 32, 60, 60];
+        for seconds in expected {
+            assert_eq!(schedule.timeout(), Duration::from_secs(seconds));
+            schedule.back_off();
+        }
+    }
+
+    #[test]
+    fn duplicate_retransmit_budget_stops_after_four_responses() {
+        let mut budget = DuplicateRetransmitBudget::new();
+        for _ in 0..MAX_DUPLICATE_RETRANSMISSIONS {
+            assert!(budget.take());
+        }
+        assert!(!budget.take());
+    }
+
+    #[test]
+    fn with_timeout_bounds_a_pending_operation() {
+        let pending = async { poll_fn(|_| Poll::<DriverResult<(), Infallible>>::Pending).await };
+        let result = futures_lite_for_test::block_on(with_timeout(
+            pending,
+            BudgetedDelay::new(),
+            Duration::from_nanos(1),
+        ));
+        assert!(matches!(result, Err(DriverError::Timeout)));
+    }
+
+    #[test]
+    fn recv_application_data_ignores_unauthenticated_records_and_reports_protected_alerts() {
         let ignored = DtlsRecord::new(ContentType::Handshake, 0, 0, vec![0xde]).expect("ignored");
-        let alert = DtlsRecord::new(ContentType::Alert, 1, 1, vec![2, 40]).expect("alert");
+        let unauthenticated =
+            DtlsRecord::new(ContentType::Alert, 1, 1, vec![2, 40]).expect("unauthenticated");
+        let key_material = test_key_material();
+        let alert = protect_aes_128_ccm_8_record(
+            ContentType::Alert,
+            1,
+            1,
+            RecordProtectionKey::new(key_material.key_block.server_write_key),
+            &key_material.key_block.server_write_iv,
+            &[2, 40],
+        )
+        .expect("protected alert");
         let mut datagram = ignored.encode().expect("ignored record encodes");
+        datagram.extend_from_slice(
+            &unauthenticated
+                .encode()
+                .expect("unauthenticated record encodes"),
+        );
         datagram.extend_from_slice(&alert.encode().expect("alert record encodes"));
 
         let mut transport = QueuedUdp {
             queue: VecDeque::from([(datagram, LOCAL_ADDR, PEER_ADDR)]),
         };
-        let mut delay = PendingDelay;
-        let mut state = SessionState::new(test_key_material(), SessionRole::Client);
+        let delay = PendingDelay;
+        let mut state = SessionState::new(key_material, SessionRole::Client);
         let err = futures_lite_for_test::block_on(recv_application_data(
             &mut state,
             &mut transport,
-            &mut delay,
+            &delay,
             PEER_ADDR,
             Duration::from_secs(1),
         ))
@@ -752,7 +934,7 @@ mod tests {
         .expect("protect second record");
 
         let mut state = SessionState::new(key_material, SessionRole::Client);
-        let mut delay = PendingDelay;
+        let delay = PendingDelay;
 
         let mut transport = QueuedUdp {
             queue: VecDeque::from([(
@@ -764,7 +946,7 @@ mod tests {
         let first = futures_lite_for_test::block_on(recv_application_data(
             &mut state,
             &mut transport,
-            &mut delay,
+            &delay,
             PEER_ADDR,
             Duration::from_secs(1),
         ))
@@ -779,7 +961,7 @@ mod tests {
         let second = futures_lite_for_test::block_on(recv_application_data(
             &mut state,
             &mut transport,
-            &mut delay,
+            &delay,
             PEER_ADDR,
             Duration::from_secs(1),
         ))
@@ -792,12 +974,12 @@ mod tests {
         let mut transport = QueuedUdp {
             queue: VecDeque::new(),
         };
-        let mut delay = BudgetedDelay::new();
+        let delay = BudgetedDelay::new();
         let mut state = SessionState::new(test_key_material(), SessionRole::Client);
         let err = futures_lite_for_test::block_on(recv_application_data(
             &mut state,
             &mut transport,
-            &mut delay,
+            &delay,
             PEER_ADDR,
             Duration::from_millis(10),
         ))

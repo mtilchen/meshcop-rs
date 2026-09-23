@@ -170,4 +170,14 @@ impl DtlsRecord {
         }
         Ok(records)
     }
+
+    /// Encodes records back to back into one datagram, the inverse of
+    /// [`Self::parse_datagram`].
+    pub fn encode_datagram(records: &[Self]) -> Result<Vec<u8>> {
+        let mut datagram = Vec::new();
+        for record in records {
+            datagram.extend_from_slice(&record.encode()?);
+        }
+        Ok(datagram)
+    }
 }

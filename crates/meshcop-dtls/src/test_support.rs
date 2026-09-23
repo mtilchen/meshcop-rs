@@ -18,13 +18,30 @@ use super::{
     parse_unfragmented_handshake_record, protect_aes_128_ccm_8_record,
 };
 
+/// Returns the initial retransmit interval compiled into this driver build.
+///
+/// This accessor lets cross-crate and integration tests gate the production
+/// default while unit tests scale the same state machines to a shorter wall
+/// clock interval.
+pub const fn driver_initial_retransmit_timeout() -> core::time::Duration {
+    crate::driver::DRIVER_INITIAL_RETRANSMIT_TIMEOUT
+}
+
 /// How the loopback server finishes the handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopbackEnd {
     /// Complete the handshake and return the session keys.
     Complete,
-    /// Send a fatal alert instead of the ChangeCipherSpec + Finished flight.
+    /// Replace the first cookie, then complete the handshake.
+    ReplaceCookieThenComplete,
+    /// Send a plaintext fatal alert instead of the ChangeCipherSpec + Finished flight.
     AlertInsteadOfFinished,
+    /// Send a protected fatal alert instead of the ChangeCipherSpec + Finished flight.
+    ProtectedAlertInsteadOfFinished,
+    /// Precede the ChangeCipherSpec + Finished flight with datagrams a client
+    /// must discard: an unparseable datagram, a malformed plaintext handshake
+    /// record, and an epoch-1 alert that fails authentication.
+    NoiseBeforeFinished,
 }
 
 /// Serves one commissioner DTLS handshake over a connected UDP socket.
@@ -52,6 +69,9 @@ pub async fn loopback_dtls_server_with_rng(
     let mut epoch0_seq = 0u64;
     let mut saw_change_cipher_spec = false;
     let mut key_material: Option<ThreadDtlsKeyMaterial> = None;
+    let replacement_cookie = vec![0xca, 0xfe, 0xba, 0xbe];
+    let mut replacement_sent = false;
+    let mut server_message_sequence = 1u16;
 
     loop {
         let len = tokio::time::timeout(core::time::Duration::from_secs(2), socket.recv(&mut buf))
@@ -64,32 +84,52 @@ pub async fn loopback_dtls_server_with_rng(
                         match message.message_type {
                             HandshakeType::ClientHello => {
                                 let hello = ClientHello::decode(&message.payload)?;
-                                if !cookies.verify(&hello.random, &hello.cookie) {
+                                let cookie_is_valid = if replacement_sent {
+                                    hello.cookie == replacement_cookie
+                                } else {
+                                    cookies.verify(&hello.random, &hello.cookie)
+                                };
+                                let replace_cookie = end == LoopbackEnd::ReplaceCookieThenComplete
+                                    && !hello.cookie.is_empty()
+                                    && !replacement_sent;
+                                if !cookie_is_valid || replace_cookie {
+                                    let cookie = if replace_cookie {
+                                        replacement_sent = true;
+                                        replacement_cookie.clone()
+                                    } else {
+                                        cookies.cookie(&hello.random)?.to_vec()
+                                    };
                                     let verify = HandshakeMessage {
                                         message_type: HandshakeType::HelloVerifyRequest,
                                         message_seq: message.message_seq,
                                         payload: HelloVerifyRequest {
                                             server_version: DTLS_1_2_VERSION,
-                                            cookie: cookies.cookie(&hello.random)?.to_vec(),
+                                            cookie,
                                         }
                                         .encode()?,
                                     };
                                     let record = DtlsRecord::new(
                                         ContentType::Handshake,
                                         0,
-                                        epoch0_seq,
+                                        record.header.sequence_number,
                                         verify.encode()?,
                                     )?;
-                                    epoch0_seq += 1;
                                     socket.send(&record.encode()?).await?;
                                     continue;
                                 }
                                 server.handle_client_hello(&message)?;
+                                epoch0_seq = record.header.sequence_number;
+                                server_message_sequence = message.message_seq;
                                 let mut datagram = Vec::new();
                                 for built in [
-                                    server.build_server_hello(1)?,
-                                    server.build_server_key_exchange(2, rng)?,
-                                    server.build_server_hello_done(3)?,
+                                    server.build_server_hello(server_message_sequence)?,
+                                    server.build_server_key_exchange(
+                                        server_message_sequence.wrapping_add(1),
+                                        rng,
+                                    )?,
+                                    server.build_server_hello_done(
+                                        server_message_sequence.wrapping_add(2),
+                                    )?,
                                 ] {
                                     let record = DtlsRecord::new(
                                         ContentType::Handshake,
@@ -124,9 +164,23 @@ pub async fn loopback_dtls_server_with_rng(
                             "client Finished before ChangeCipherSpec".to_string(),
                         ));
                     }
-                    if end == LoopbackEnd::AlertInsteadOfFinished {
-                        let alert =
-                            DtlsRecord::new(ContentType::Alert, 0, epoch0_seq, vec![2, 40])?;
+                    if matches!(
+                        end,
+                        LoopbackEnd::AlertInsteadOfFinished
+                            | LoopbackEnd::ProtectedAlertInsteadOfFinished
+                    ) {
+                        let alert = if end == LoopbackEnd::ProtectedAlertInsteadOfFinished {
+                            protect_aes_128_ccm_8_record(
+                                ContentType::Alert,
+                                1,
+                                0,
+                                RecordProtectionKey::new(keys.key_block.server_write_key),
+                                &keys.key_block.server_write_iv,
+                                &[2, 40],
+                            )?
+                        } else {
+                            DtlsRecord::new(ContentType::Alert, 0, epoch0_seq, vec![2, 40])?
+                        };
                         socket.send(&alert.encode()?).await?;
                         return Ok(None);
                     }
@@ -150,7 +204,11 @@ pub async fn loopback_dtls_server_with_rng(
                         send_fatal_handshake_alert(socket, epoch0_seq).await?;
                         return Err(error);
                     }
-                    let server_finished = server.build_server_finished(4, keys)?;
+                    if end == LoopbackEnd::NoiseBeforeFinished {
+                        send_discardable_noise(socket, epoch0_seq).await?;
+                    }
+                    let server_finished = server
+                        .build_server_finished(server_message_sequence.wrapping_add(3), keys)?;
                     let mut datagram =
                         DtlsRecord::new(ContentType::ChangeCipherSpec, 0, epoch0_seq, vec![1])?
                             .encode()?;
@@ -172,6 +230,18 @@ pub async fn loopback_dtls_server_with_rng(
             }
         }
     }
+}
+
+/// Sends datagrams that a receiver must discard without failing the handshake.
+async fn send_discardable_noise(socket: &UdpSocket, sequence_number: u64) -> Result<()> {
+    const TRUNCATED_RECORD_HEADER: [u8; 3] = [0x16, 0xfe, 0xfd];
+    socket.send(&TRUNCATED_RECORD_HEADER).await?;
+    let malformed_handshake =
+        DtlsRecord::new(ContentType::Handshake, 0, sequence_number, vec![0xff])?;
+    socket.send(&malformed_handshake.encode()?).await?;
+    let forged_alert = DtlsRecord::new(ContentType::Alert, 1, 0, vec![0; 24])?;
+    socket.send(&forged_alert.encode()?).await?;
+    Ok(())
 }
 
 /// Sends a fatal handshake-failure alert, mirroring the production

@@ -11,7 +11,7 @@ use crate::{
     error::Error,
 };
 
-const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(40);
 const DEFAULT_DOMAIN_NAME: &str = "Thread";

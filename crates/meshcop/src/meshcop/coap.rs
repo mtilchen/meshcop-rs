@@ -257,7 +257,21 @@ impl CoapMessage {
             && self.options.is_empty()
             && self.payload.is_empty()
     }
+
+    /// Returns true for a Reset rejecting the message with `message_id`.
+    ///
+    /// RFC 7252 §4.2 requires a Reset to be empty; non-empty Reset messages
+    /// are malformed and do not match.
+    pub fn is_reset_for(&self, message_id: u16) -> bool {
+        self.ty == CoapType::Reset
+            && self.code == CoapCode::EMPTY
+            && self.message_id == message_id
+            && self.token.is_empty()
+            && self.options.is_empty()
+            && self.payload.is_empty()
+    }
 }
+
 fn encode_option_header(delta: u16, length: usize, out: &mut Vec<u8>) -> Result<()> {
     let (delta_nibble, mut delta_extra) = encode_extended_nibble(delta)?;
     let (len_nibble, mut len_extra) = encode_extended_nibble(
