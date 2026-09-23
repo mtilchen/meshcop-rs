@@ -110,9 +110,9 @@ impl<'a> Collector<'a> {
         node_timeout: Duration,
     ) -> meshcop::Result<Collector<'a>> {
         let keep_alive_interval = commissioner.config().keepalive_interval;
-        if node_timeout >= keep_alive_interval {
+        if keep_alive_refresh_window(node_timeout) >= keep_alive_interval {
             return Err(Error::Configuration(
-                "netdiag node timeout must be shorter than the keepalive interval",
+                "a keep-alive exchange plus one netdiag node timeout must fit within the keepalive interval",
             ));
         }
         let petition = commissioner.petition().await?;
@@ -379,12 +379,14 @@ impl<'a> Collector<'a> {
     }
 
     async fn keep_alive_before_request(&mut self) -> meshcop::Result<()> {
-        // Send before the next diagnostic wait could cross the absolute
-        // keep-alive deadline. `start` requires the wait itself to be shorter
-        // than the interval, so one accepted keep-alive creates enough room.
+        // Refresh while a complete keep-alive exchange, including its CoAP
+        // retransmissions, still fits before the deadline once the next
+        // diagnostic wait is accounted for. The exchange carries its own
+        // absolute budget, so it is not cut short at the node timeout. `start`
+        // requires one refresh window to fit inside the interval.
         if request_may_cross_keepalive_deadline(
             self.last_keep_alive.elapsed(),
-            self.node_timeout,
+            keep_alive_refresh_window(self.node_timeout),
             self.keep_alive_interval,
         ) {
             let result = match self.commissioner.keep_alive().await {
@@ -440,6 +442,12 @@ impl<'a> Collector<'a> {
             leader_rloc16: Some(format_rloc16(leader_rloc)),
         })
     }
+}
+
+/// Time from deciding to refresh the keep-alive until the following
+/// diagnostic wait ends: one full keep-alive exchange plus one node timeout.
+fn keep_alive_refresh_window(node_timeout: Duration) -> Duration {
+    Commissioner::EXCHANGE_TIMEOUT.saturating_add(node_timeout)
 }
 
 fn request_may_cross_keepalive_deadline(
@@ -614,6 +622,13 @@ fn unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshcop::{
+        commissioner::{
+            CommissionerConfig,
+            harness::{ScriptedExchange, ScriptedMeshcopTransport, ScriptedResponse},
+        },
+        meshcop::CommissionerOperation,
+    };
 
     #[test]
     fn keepalive_is_sent_before_the_next_request_can_cross_its_deadline() {
@@ -634,5 +649,166 @@ mod tests {
             request_timeout,
             interval
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collector_refreshes_keepalive_before_a_request_crosses_the_deadline() {
+        let script = ScriptedMeshcopTransport::new([
+            ScriptedExchange::new(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0x1234)],
+            ),
+            ScriptedExchange::new(
+                CommissionerOperation::KeepAlive,
+                [ScriptedResponse::accept()],
+            ),
+        ]);
+        let mut commissioner = Commissioner::connect_scripted(
+            CommissionerConfig::pskc("netdiag-test", [0x42; 16]),
+            "127.0.0.1:49191".parse().unwrap(),
+            script,
+            [],
+        )
+        .await
+        .unwrap();
+        commissioner.petition().await.unwrap();
+
+        let mut collector = Collector {
+            commissioner: &mut commissioner,
+            node_timeout: Duration::from_secs(2),
+            keep_alive_interval: Duration::from_secs(30),
+            last_keep_alive: tokio::time::Instant::now() - Duration::from_secs(29),
+            mesh_local_prefix: [0xfd, 0, 0, 0, 0, 0, 0, 0],
+            dataset: Dataset::default(),
+        };
+        collector.keep_alive_before_request().await.unwrap();
+        drop(collector);
+
+        let operations = commissioner
+            .scripted_transport()
+            .unwrap()
+            .observed_requests()
+            .iter()
+            .map(|request| request.operation)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operations,
+            [
+                CommissionerOperation::Petition,
+                CommissionerOperation::KeepAlive
+            ]
+        );
+    }
+
+    #[test]
+    fn keepalive_refresh_leaves_room_for_a_full_exchange_and_node_wait() {
+        let interval = Duration::from_secs(30);
+        let window = keep_alive_refresh_window(Duration::from_secs(4));
+        assert_eq!(
+            window,
+            Commissioner::EXCHANGE_TIMEOUT + Duration::from_secs(4)
+        );
+        let last_quiet = interval - window - Duration::from_secs(1);
+        assert!(!request_may_cross_keepalive_deadline(
+            last_quiet, window, interval
+        ));
+        assert!(request_may_cross_keepalive_deadline(
+            interval - window,
+            window,
+            interval
+        ));
+    }
+
+    #[tokio::test]
+    async fn start_rejects_a_node_timeout_that_leaves_no_room_for_keepalive() {
+        let mut config = CommissionerConfig::pskc("netdiag-test", [0x42; 16]);
+        config.keepalive_interval = Duration::from_secs(30);
+        let mut commissioner = Commissioner::connect_scripted(
+            config,
+            "127.0.0.1:49191".parse().unwrap(),
+            ScriptedMeshcopTransport::new([]),
+            [],
+        )
+        .await
+        .unwrap();
+        let node_timeout = Duration::from_secs(30) - Commissioner::EXCHANGE_TIMEOUT;
+        let err = Collector::start(&mut commissioner, node_timeout)
+            .await
+            .err()
+            .expect("the refresh window must fit inside the keep-alive interval");
+        assert!(matches!(err, Error::Configuration(_)), "unexpected {err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_keepalive_is_retransmitted_past_the_node_timeout() {
+        use meshcop::meshcop::{CoapCode, CoapMessage, CoapType};
+        use meshcop_dtls::DtlsServer;
+
+        const STATE_ACCEPT: [u8; 3] = [meshcop::meshcop::TLV_STATE, 1, 0x01];
+        let node_timeout = Duration::from_secs(1);
+        let pskc = [0x42u8; 16];
+        let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
+        let border_addr = server.local_addr();
+        let agent = async move {
+            let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
+            // Receives the next request and answers it with `payload`, or
+            // drops it (a lost request) when `payload` is `None`.
+            let mut serve = async |payload: Option<Vec<u8>>| {
+                let wire = session
+                    .recv_application_data(Duration::from_secs(10))
+                    .await
+                    .unwrap();
+                if let Some(payload) = payload {
+                    let request = CoapMessage::decode(&wire).unwrap();
+                    let response = CoapMessage {
+                        ty: CoapType::Acknowledgement,
+                        code: CoapCode::CHANGED,
+                        message_id: request.message_id,
+                        token: request.token,
+                        options: Vec::new(),
+                        payload,
+                    };
+                    session
+                        .send_application_data(&response.encode().unwrap())
+                        .await
+                        .unwrap();
+                }
+                wire
+            };
+            let mut petition_accept = STATE_ACCEPT.to_vec();
+            petition_accept.extend_from_slice(&[
+                meshcop::meshcop::TLV_COMMISSIONER_SESSION_ID,
+                2,
+                0x12,
+                0x34,
+            ]);
+            serve(Some(petition_accept)).await;
+            let lost = serve(None).await;
+            let retransmitted = serve(Some(STATE_ACCEPT.to_vec())).await;
+            assert_eq!(retransmitted, lost, "the keep-alive must be retransmitted");
+        };
+
+        let mut commissioner =
+            Commissioner::connect(CommissionerConfig::pskc("netdiag-test", pskc), border_addr)
+                .await
+                .unwrap();
+        let collect = async {
+            commissioner.petition().await.unwrap();
+            let mut collector = Collector {
+                commissioner: &mut commissioner,
+                node_timeout,
+                keep_alive_interval: Duration::from_secs(40),
+                last_keep_alive: tokio::time::Instant::now() - Duration::from_secs(39),
+                mesh_local_prefix: [0xfd, 0, 0, 0, 0, 0, 0, 0],
+                dataset: Dataset::default(),
+            };
+            let started = tokio::time::Instant::now();
+            collector.keep_alive_before_request().await.unwrap();
+            assert!(
+                started.elapsed() > node_timeout,
+                "the refresh only succeeds through a retransmission"
+            );
+        };
+        tokio::join!(agent, collect);
     }
 }
