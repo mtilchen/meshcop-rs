@@ -29,6 +29,7 @@ openthread_ref="${MESHCOP_INTEROP_OPENTHREAD_REF:-${default_openthread_ref}}"
 runtime_dir="${MESHCOP_INTEROP_RUNTIME_DIR:-/tmp/meshcop-interop}"
 openthread_dir="${runtime_dir}/openthread"
 daemon_log="${runtime_dir}/ot-daemon.log"
+daemon_pid=""
 readonly OPENTHREAD_REPOSITORY=https://github.com/openthread/openthread.git
 
 # Fixed, non-secret network parameters: the test vectors from the C++
@@ -42,6 +43,16 @@ readonly NETWORK_KEY=00112233445566778899aabbccddeeff
 readonly PSKC=3aa55f91ca47d1e4e71a08cb35e91591
 readonly MESH_LOCAL_PREFIX="fd00:db8::"
 readonly SECURITY_POLICY=(672 onrc)
+readonly RECOVERY_FAULT_TARGETS=(
+    initial-client-hello
+    hello-verify-request
+    cookie-client-hello
+    server-handshake
+    client-finished
+    server-finished
+    petition-request
+    petition-response
+)
 
 ot_daemon="${openthread_dir}/build/posix/src/posix/ot-daemon"
 ot_ctl="${openthread_dir}/build/posix/src/posix/ot-ctl"
@@ -138,15 +149,31 @@ start_daemon() {
     mkdir -p "${runtime_dir}/daemon-settings"
     (
         cd "${runtime_dir}/daemon-settings"
-        sudo "${ot_daemon}" -I wpan0 -d4 \
+        exec sudo "${ot_daemon}" -I wpan0 -d4 \
             "spinel+hdlc+uart://${ot_rcp}?forkpty-arg=1" \
-            >"${daemon_log}" 2>&1 &
-    )
-    wait_for "ot-daemon to accept commands" 30 sudo "${ot_ctl}" state
+            >"${daemon_log}" 2>&1
+    ) &
+    daemon_pid=$!
+    wait_for "new ot-daemon to accept commands" 30 daemon_is_ready
 }
 
 stop_daemon() {
     sudo killall ot-daemon 2>/dev/null || true
+    for _ in $(seq 1 30); do
+        if ! pgrep -x ot-daemon >/dev/null 2>&1; then
+            daemon_pid=""
+            return 0
+        fi
+        sleep 1
+    done
+    echo "ot-daemon did not exit within 30 seconds" >&2
+    return 1
+}
+
+daemon_is_ready() {
+    [[ -n "${daemon_pid}" ]] \
+        && kill -0 "${daemon_pid}" 2>/dev/null \
+        && sudo "${ot_ctl}" state
 }
 
 form_network() {
@@ -168,8 +195,11 @@ form_network() {
         bash -c "sudo '${ot_ctl}' state | grep -q leader"
 }
 
-run_interop_test() {
+run_interop_selection() {
+    local test_filter=${1:-}
+    local fault_target=${2:-}
     local ba_port dataset_hex
+    local -a cargo_args=(cargo test -p meshcop --test interop_openthread --all-features)
     # Recent OpenThread versions gate the border agent behind a runtime
     # toggle; older ones lack the subcommand and auto-start it instead.
     ctl ba enable || true
@@ -178,15 +208,36 @@ run_interop_test() {
     dataset_hex="$(ctl dataset active -x | grep -o '[0-9a-fA-F]\{16,\}' | head -1)"
     [[ -n "${dataset_hex}" ]] || die "could not read the active dataset"
 
-    echo "Border agent on port ${ba_port}; commissioning..."
+    if [[ -n "${test_filter}" ]]; then
+        echo "Border agent on port ${ba_port}; running ${test_filter}..."
+        cargo_args+=("${test_filter}")
+    else
+        echo "Border agent on port ${ba_port}; commissioning..."
+    fi
+    cargo_args+=(-- --ignored --nocapture --test-threads=1)
+    if [[ -n "${test_filter}" ]]; then
+        cargo_args+=(--exact)
+    else
+        # Fault cases run below against separate, freshly formed networks so
+        # peer session cleanup cannot affect the following scenario.
+        cargo_args+=(--skip interop_packet_loss_)
+    fi
+
     # Serial test threads: every live case shares one border agent, which can
     # serve only one active commissioner at a time.
-    MESHCOP_MUTATE_OK=1 \
+    MESHCOP_TRACE=1 \
+        MESHCOP_MUTATE_OK=1 \
         MESHCOP_INTEROP_BORDER_AGENT="[::1]:${ba_port}" \
         MESHCOP_INTEROP_DATASET_HEX="${dataset_hex}" \
         MESHCOP_INTEROP_JOINER_CLI="${ot_cli_ftd}" \
-        cargo test -p meshcop --test interop_openthread --all-features -- \
-        --ignored --nocapture --test-threads=1
+        MESHCOP_INTEROP_FAULT_TARGET="${fault_target}" \
+        "${cargo_args[@]}"
+}
+
+restart_network() {
+    stop_daemon
+    start_daemon
+    form_network
 }
 
 write_summary() {
@@ -200,7 +251,9 @@ write_summary() {
             echo "| OpenThread \`${openthread_ref}\` (posix ot-daemon, simulated RCP) | border agent + leader | DTLS/EC-J-PAKE over UDP | ${result} |"
             echo
             echo "Covered: successful and wrong-PSKc DTLS 1.2 + EC J-PAKE handshakes,"
-            echo "recovery after authentication failure, commissioner contention and"
+            echo "recovery after authentication failure and all eight DTLS/CoAP loss"
+            echo "positions, each isolated in a fresh daemon and Thread network;"
+            echo "commissioner contention and"
             echo "takeover, COMM_PET, COMM_KA, MGMT_ACTIVE_GET (full dataset compare),"
             echo "MGMT_COMMISSIONER_GET and unicast/asynchronous network diagnostics via"
             echo "the UDP_TX/UDP_RX proxy, and resign. Joiner coverage commissions a"
@@ -213,7 +266,7 @@ write_summary() {
 
 cleanup() {
     local exit_code=$?
-    stop_daemon
+    stop_daemon || true
     if [[ ${exit_code} -ne 0 ]]; then
         write_summary "❌ failed"
         echo "=== ot-daemon log (tail) ==="
@@ -231,7 +284,13 @@ main() {
     stop_daemon
     phase start-daemon start_daemon
     phase form-network form_network
-    phase interop-test run_interop_test
+    phase interop-test run_interop_selection
+    local fault_target
+    for fault_target in "${RECOVERY_FAULT_TARGETS[@]}"; do
+        phase "restart-${fault_target}" restart_network
+        phase "fault-${fault_target}" run_interop_selection \
+            interop_packet_loss_recovery_against_openthread "${fault_target}"
+    done
     write_summary "✅ passed"
 }
 
