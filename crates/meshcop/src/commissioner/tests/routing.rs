@@ -1,8 +1,8 @@
 use super::*;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn proxied_operations_wrap_requests_in_udp_tx_to_the_leader_aloc() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let leader_aloc: Ipv6Addr = "fd00:db8::ff:fe00:fc00".parse().unwrap();
         let script = ScriptedMeshcopTransport::new([
             exchange(
@@ -80,9 +80,9 @@ async fn proxied_operations_wrap_requests_in_udp_tx_to_the_leader_aloc() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn mesh_local_prefix_fetch_rejects_missing_or_invalid_prefixes() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             exchange(
                 CommissionerOperation::Petition,
@@ -129,9 +129,9 @@ async fn mesh_local_prefix_fetch_rejects_missing_or_invalid_prefixes() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn multicast_listener_and_secure_pending_route_to_the_primary_bbr() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let pbbr_aloc: Ipv6Addr = "fd00:db8::ff:fe00:fc38".parse().unwrap();
         let script = ScriptedMeshcopTransport::new([
             exchange(
@@ -181,9 +181,9 @@ async fn multicast_listener_and_secure_pending_route_to_the_primary_bbr() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn udp_rx_notifications_queue_events_and_send_proxied_acks() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let reporter: Ipv6Addr = "fd00:db8::aa".parse().unwrap();
         let mut diag_answer = CoapMessage {
             ty: CoapType::Confirmable,
@@ -257,9 +257,9 @@ async fn udp_rx_notifications_queue_events_and_send_proxied_acks() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn get_diagnostics_returns_unicast_answer_over_dg() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         // The DIAG_GET.req (`/d/dg`) response carries the requested TLVs piggybacked
         // with the request token: MAC Address (1) = 0x8000 and Leader Data (6) =
         // partition 1, weighting 64, versions 10/9, Leader Router ID 5.
@@ -302,9 +302,9 @@ async fn get_diagnostics_returns_unicast_answer_over_dg() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn get_diagnostics_rejects_error_coded_response() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         // A 4.04-coded response must surface an error rather than being decoded as
         // an empty (all-`None`) diagnostic answer.
         let script = ScriptedMeshcopTransport::new([
@@ -333,9 +333,9 @@ async fn get_diagnostics_rejects_error_coded_response() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn get_diagnostics_rejects_multicast_destination() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([exchange(
             CommissionerOperation::Petition,
             [ScriptedResponse::petition_accept(0x1234)],
@@ -362,9 +362,9 @@ async fn get_diagnostics_rejects_multicast_destination() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn proxied_dataset_changed_clears_the_mesh_local_prefix_cache() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut notification = dataset_changed_notification(0x7001, true);
         notification.token = vec![0x77];
         let script = ScriptedMeshcopTransport::new([
@@ -400,9 +400,9 @@ async fn proxied_dataset_changed_clears_the_mesh_local_prefix_cache() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn unproxied_dataset_changed_clears_the_mesh_local_prefix_cache() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         // Same contract as the proxied case above, but for MGMT_DATASET_CHANGED
         // arriving directly on the commissioner session rather than inside UDP_RX.
         let script = ScriptedMeshcopTransport::new([
@@ -435,9 +435,9 @@ async fn unproxied_dataset_changed_clears_the_mesh_local_prefix_cache() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn udp_rx_messages_for_other_ports_are_dropped() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             exchange(
                 CommissionerOperation::Petition,
@@ -478,9 +478,9 @@ async fn udp_rx_messages_for_other_ports_are_dropped() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn set_commissioner_dataset_strips_managed_tlvs_and_rejects_empty_sets() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut dataset = Dataset::default();
         dataset.set_raw(TLV_COMMISSIONER_SESSION_ID, 0xaaaau16.to_be_bytes());
         dataset.set_raw(TLV_BORDER_AGENT_LOCATOR, 0xbbbbu16.to_be_bytes());
@@ -532,9 +532,9 @@ async fn set_commissioner_dataset_strips_managed_tlvs_and_rejects_empty_sets() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_proxied_reset_fails_the_exchange() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let leader_aloc: Ipv6Addr = "fd00:db8::ff:fe00:fc00".parse().unwrap();
         let script = ScriptedMeshcopTransport::new([
             exchange(

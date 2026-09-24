@@ -46,9 +46,9 @@ async fn connected() -> (Commissioner, Events, ScriptedMeshcopTransport) {
     (commissioner, events, transport)
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_retransmitted_response_is_acknowledged_again() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         const RESPONSE_ID: u16 = 0x5001;
         let script =
             ScriptedMeshcopTransport::new([exchange(CommissionerOperation::GetActiveDataset, [])]);
@@ -87,9 +87,9 @@ async fn a_retransmitted_response_is_acknowledged_again() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_retransmitted_notification_is_acknowledged_again_but_published_once() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let (_commissioner, mut events, transport) = connected().await;
         let notification = dataset_changed_notification(0x6001, true);
 
@@ -105,9 +105,9 @@ async fn a_retransmitted_notification_is_acknowledged_again_but_published_once()
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_retransmitted_device_report_is_answered_again_but_published_once() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let (_commissioner, mut events, transport) = connected().await;
         let report = dataset_changed_notification(0x6002, true);
 
@@ -167,9 +167,9 @@ async fn a_message_id_is_new_again_after_the_exchange_lifetime() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn only_the_most_recent_messages_are_remembered() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let (_commissioner, mut events, transport) = connected().await;
         for message_id in 1..=MAX_REMEMBERED + 1 {
             transport.deliver(dataset_changed_notification(message_id, true));
@@ -195,9 +195,9 @@ async fn only_the_most_recent_messages_are_remembered() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_reopened_session_forgets_the_border_agents_message_ids() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let notification = dataset_changed_notification(0x6004, true);
         let script = ScriptedMeshcopTransport::new([
             exchange(

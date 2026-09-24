@@ -12,17 +12,21 @@ const EVENT_WAIT: Duration = Duration::from_secs(5);
 /// expect, and elapsed instantly when a broken session never answers.
 const PAUSED_EVENT_WAIT: Duration = Duration::from_secs(300);
 
-/// Bound on a real-time test's run time. A mutation that stalls the session
-/// then fails the test well inside the mutation-testing timeout instead of
-/// hanging it; baseline tests finish in a fraction of this.
-const TEST_DEADLINE: Duration = Duration::from_secs(3);
+/// Bound on the real-time test's run time. Only the test that runs a real
+/// DTLS session over loopback sockets uses real time: a paused clock jumps
+/// ahead whenever the runtime waits on a socket, which would fire its timers
+/// early.
+const SOCKET_TEST_DEADLINE: Duration = Duration::from_secs(3);
 /// Bound on a paused-time test's virtual run time: longer than any test waits,
 /// and elapsed instantly when a stalled session leaves nothing else to run.
+/// Scripted tests run on paused time so a mutation that stalls the session
+/// fails them at once instead of after a real-time deadline.
 const PAUSED_TEST_DEADLINE: Duration = Duration::from_secs(3600);
 
-/// Runs a real-time test body, failing it if it exceeds [`TEST_DEADLINE`].
-async fn with_test_deadline(body: impl std::future::Future<Output = ()>) {
-    run_with_deadline(TEST_DEADLINE, body).await;
+/// Runs a real-time socket test body, failing it if it exceeds
+/// [`SOCKET_TEST_DEADLINE`].
+async fn with_socket_test_deadline(body: impl std::future::Future<Output = ()>) {
+    run_with_deadline(SOCKET_TEST_DEADLINE, body).await;
 }
 
 /// Runs a paused-time test body, failing it if it exceeds
@@ -199,18 +203,18 @@ fn multi_network_flags_and_known_fields_are_detected() {
     assert!(!is_known_op_field("bogus"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn state_is_disabled_and_active_is_false_before_start() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         assert_eq!(dispatch_line("state").await, "disabled\n[done]");
         assert_eq!(dispatch_line("active").await, "false\n[done]");
     })
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn invalid_command_reports_the_cpp_help_hint() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         assert_eq!(
             dispatch_line("bogus").await,
             "'bogus' is not a valid command, type 'help' to list all commands\n[failed]"
@@ -219,9 +223,9 @@ async fn invalid_command_reports_the_cpp_help_hint() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn session_commands_require_a_started_commissioner() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         assert_eq!(
             dispatch_line("opdataset get active").await,
             format!("{NOT_CONNECTED}\n[failed]")
@@ -234,9 +238,9 @@ async fn session_commands_require_a_started_commissioner() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn out_of_scope_features_fail_with_an_explanation() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         assert!(
             dispatch_line("token print")
                 .await
@@ -256,9 +260,9 @@ async fn out_of_scope_features_fail_with_an_explanation() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn help_lists_every_command_sorted_with_the_footer() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let out = dispatch_line("help").await;
         assert!(out.starts_with("active\nannounce\nbbrdataset\nborderagent\nbr\n"));
         assert!(out.contains("\ntype 'help <command>' for help of specific command.\n[done]"));
@@ -276,9 +280,9 @@ async fn help_lists_every_command_sorted_with_the_footer() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn config_set_then_get_pskc_round_trips() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = Interpreter::new(CliConfig::default());
         let set = interpreter
             .dispatch(&tokenize("config set pskc 00112233445566778899aabbccddeeff").unwrap())
@@ -295,9 +299,9 @@ async fn config_set_then_get_pskc_round_trips() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn too_few_arguments_are_rejected() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         assert_eq!(
             dispatch_line("config get").await,
             format!("{SYNTAX_FEW_ARGS}\n[failed]")
@@ -310,9 +314,9 @@ async fn too_few_arguments_are_rejected() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn evaluate_and_print_handles_blank_bad_and_multi_network_lines() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = Interpreter::new(CliConfig::default());
         // Blank input re-prompts, tokenizer errors and --nwk/--dom report
         // failure, and a normal command dispatches; all print to stdout.
@@ -327,9 +331,9 @@ async fn evaluate_and_print_handles_blank_bad_and_multi_network_lines() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn start_validates_address_and_config_before_any_network_use() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = Interpreter::new(CliConfig::default());
         assert_eq!(
             run_line(&mut interpreter, "start nothost nope").await,
@@ -345,7 +349,7 @@ async fn start_validates_address_and_config_before_any_network_use() {
 
 #[tokio::test]
 async fn start_connect_only_opens_dtls_without_petitioning() {
-    with_test_deadline(async {
+    with_socket_test_deadline(async {
         const PSKC: [u8; 16] = [
             0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
             0xee, 0xff,
@@ -385,9 +389,9 @@ async fn start_connect_only_opens_dtls_without_petitioning() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn scripted_session_reports_state_sessionid_and_stops() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = scripted_interpreter(
             [
                 (
@@ -504,9 +508,9 @@ async fn a_lost_session_is_reported_and_the_state_reads_disabled() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn background_scan_reports_are_recorded_for_later_commands() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = scripted_interpreter(
             [],
             [CommissionerEvent::EnergyReport {
@@ -526,9 +530,9 @@ async fn background_scan_reports_are_recorded_for_later_commands() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn borderagent_get_locator_renders_present_and_missing() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = scripted_interpreter(
             [
                 (
@@ -576,9 +580,9 @@ async fn borderagent_get_locator_renders_present_and_missing() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn joiner_commands_drive_steering_and_port_exchanges() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = active_interpreter(
             [
                 // enable -> read current steering data, then set the updated one
@@ -682,9 +686,9 @@ async fn joiner_commands_drive_steering_and_port_exchanges() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn commdataset_get_and_set_round_trip_json() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut comm_dataset = Dataset::default();
         comm_dataset.set_raw(
             meshcop::meshcop::TLV_BORDER_AGENT_LOCATOR,
@@ -727,9 +731,9 @@ async fn commdataset_get_and_set_round_trip_json() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bbrdataset_get_renders_raw_tlvs() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = scripted_interpreter(
             [(
                 CommissionerOperation::GetBbrDataset,
@@ -754,9 +758,9 @@ async fn bbrdataset_get_renders_raw_tlvs() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn opdataset_get_projects_every_field_like_the_cpp_cli() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let full = full_dataset_bytes();
         let mut pending_dataset = Dataset::default();
         pending_dataset.set_raw(meshcop::dataset::TLV_NETWORK_NAME, b"cli-net".to_vec());
@@ -867,9 +871,9 @@ async fn opdataset_get_projects_every_field_like_the_cpp_cli() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn opdataset_set_builds_field_and_json_updates() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
     // Each per-field set first fetches the current Active Timestamp (to
     // bump it) and then issues the MGMT_ACTIVE_SET.
     let mut with_timestamp = Dataset::default();
@@ -956,9 +960,9 @@ async fn opdataset_set_builds_field_and_json_updates() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn managed_commands_mlr_and_announce_route_through_the_proxy() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = active_interpreter(
             [
                 (
@@ -1106,9 +1110,9 @@ async fn panid_query_and_energy_scan_collect_reports() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn netdiag_query_and_reset_render_diagnostics() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         // MAC Address (1) = 0x8000 and Leader Data (6); then an Ext MAC
         // Address (0) answer; then a reset.
         let mut interpreter = active_interpreter(
@@ -1170,9 +1174,9 @@ async fn netdiag_query_and_reset_render_diagnostics() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn protocol_errors_surface_as_failed_output() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         // A 4.04-coded response fails the exchange and the CLI reports it.
         let mut interpreter = active_interpreter(
             [
@@ -1205,9 +1209,9 @@ async fn protocol_errors_surface_as_failed_output() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn lost_events_are_reported_while_waiting_and_after_a_scan() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         const WARNING: &str =
             "missed 2 commissioner events; energy and PAN ID reports may be incomplete";
         let lagged = CommissionerEvent::Lagged { missed: 2 };
@@ -1223,9 +1227,9 @@ async fn lost_events_are_reported_while_waiting_and_after_a_scan() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn shutdown_resigns_a_running_session() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = active_interpreter(
             [(
                 CommissionerOperation::KeepAlive,
@@ -1253,9 +1257,9 @@ async fn shutdown_resigns_a_running_session() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn shutdown_leaves_a_lost_session_alone() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut interpreter = active_interpreter(
             [(
                 CommissionerOperation::KeepAlive,

@@ -851,9 +851,9 @@ fn static_joiner_handler_matches_ids_and_wildcards() {
     assert_eq!(by_eui.joiner_pskd(&derived).as_deref(), Some("EUIPSK"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn commissioner_routes_relay_rx_into_joiner_sessions() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut rng = OsRng;
         let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
         let mut hello_state = joiner.client_hello_state().unwrap();
@@ -919,9 +919,9 @@ async fn commissioner_routes_relay_rx_into_joiner_sessions() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn joiner_session_survives_the_expiry_sweep_between_relay_messages() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut rng = OsRng;
         let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
         let mut hello_state = joiner.client_hello_state().unwrap();
@@ -995,9 +995,9 @@ async fn joiner_session_survives_the_expiry_sweep_between_relay_messages() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn commissioner_ignores_disabled_joiners_and_keeps_legacy_events() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut rng = OsRng;
         let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
         let mut hello_state = joiner.client_hello_state().unwrap();

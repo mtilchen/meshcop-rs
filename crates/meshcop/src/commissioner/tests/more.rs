@@ -1,8 +1,8 @@
 use super::*;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn steering_helpers_update_the_commissioner_dataset() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let joiner_id = [0x1au8, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81];
         let mut expected_steering = vec![0u8; 16];
         crate::crypto::add_joiner_to_steering_data(&mut expected_steering, &joiner_id);
@@ -124,9 +124,9 @@ fn joiner_handler_default_callbacks_accept_and_ignore() {
     assert!(handler.on_joiner_finalize(&[0u8; 8], &info));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dataset_set_operations_validate_mandatory_tlvs() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([exchange(
             CommissionerOperation::Petition,
             [ScriptedResponse::petition_accept(0xcafe)],
@@ -174,7 +174,7 @@ async fn dataset_set_operations_validate_mandatory_tlvs() {
 
 #[tokio::test]
 async fn commissioner_runs_petition_over_a_real_dtls_session() {
-    with_test_deadline(async {
+    with_socket_test_deadline(async {
         use meshcop_dtls::{ContentType, DtlsRecord, test_support};
 
         const LOOPBACK_PETITION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -260,7 +260,7 @@ async fn commissioner_runs_petition_over_a_real_dtls_session() {
 
 #[tokio::test]
 async fn confirmable_request_is_retransmitted_without_changing_its_coap_identity() {
-    with_slow_test_deadline(async {
+    with_slow_socket_test_deadline(async {
         use meshcop_dtls::DtlsServer;
 
         let pskc = [0x42u8; 16];
@@ -299,7 +299,7 @@ async fn confirmable_request_is_retransmitted_without_changing_its_coap_identity
 
 #[tokio::test]
 async fn empty_ack_stops_retransmission_while_a_separate_response_is_pending() {
-    with_slow_test_deadline(async {
+    with_slow_socket_test_deadline(async {
         use meshcop_dtls::{DtlsServer, driver::DriverError};
 
         let pskc = [0x42u8; 16];
@@ -344,7 +344,7 @@ async fn empty_ack_stops_retransmission_while_a_separate_response_is_pending() {
 
 #[tokio::test]
 async fn reset_fails_the_exchange_without_retransmitting() {
-    with_slow_test_deadline(async {
+    with_slow_socket_test_deadline(async {
         use meshcop_dtls::{DtlsServer, driver::DriverError};
 
         let pskc = [0x42u8; 16];
@@ -420,9 +420,9 @@ fn petition_accept_response(ty: CoapType, message_id: u16, token: Vec<u8>) -> Co
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn multicast_commands_skip_the_response_wait() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         // A multicast announce-begin is non-confirmable: the client must not wait
         // for a response, so a script with no response still succeeds.
         let script = ScriptedMeshcopTransport::new([
@@ -449,9 +449,9 @@ async fn multicast_commands_skip_the_response_wait() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn clear_joiner_handler_drops_sessions_and_restores_raw_events() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut rng = rand_core::OsRng;
         let joiner = meshcop_dtls::ThreadDtlsHandshake::new(b"J01NME", &mut rng);
         let client_hello = joiner
@@ -510,9 +510,9 @@ async fn clear_joiner_handler_drops_sessions_and_restores_raw_events() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn proxied_commands_pick_confirmability_from_the_destination() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         // Unicast destinations are confirmable (the client waits for a response);
         // multicast destinations are non-confirmable (fire-and-forget).
         let script = ScriptedMeshcopTransport::new([
@@ -587,9 +587,9 @@ async fn proxied_commands_pick_confirmability_from_the_destination() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn non_confirmable_proxied_responses_are_not_acknowledged() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let leader: Ipv6Addr = "fd00:db8::ff:fe00:fc00".parse().unwrap();
         let script = ScriptedMeshcopTransport::new([
             exchange(

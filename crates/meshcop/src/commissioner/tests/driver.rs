@@ -158,9 +158,9 @@ async fn an_outstanding_keep_alive_does_not_hold_back_application_requests() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn requests_from_clones_take_turns_and_each_gets_its_own_answer() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             active_get("first"),
@@ -188,9 +188,9 @@ async fn requests_from_clones_take_turns_and_each_gets_its_own_answer() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_rejected_keep_alive_ends_the_session_and_fails_outstanding_requests() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             exchange(CommissionerOperation::GetActiveDataset, []),
@@ -274,9 +274,9 @@ async fn an_unanswered_automatic_keep_alive_ends_the_session() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_unconfirmed_resignation_is_reported_and_still_ends_the_session() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             exchange(
@@ -301,9 +301,9 @@ async fn an_unconfirmed_resignation_is_reported_and_still_ends_the_session() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dropping_every_handle_resigns_the_session() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             exchange(
@@ -333,9 +333,9 @@ async fn dropping_every_handle_resigns_the_session() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_subscriber_that_falls_behind_is_told_how_many_events_it_missed() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let mut config = CommissionerConfig::pskc("meshcop", [0x11; 16]);
         config.event_capacity = 2;
         let (_commissioner, mut events) = Commissioner::connect_scripted(
@@ -368,9 +368,9 @@ async fn a_subscriber_that_falls_behind_is_told_how_many_events_it_missed() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_connect_only_session_closed_by_the_peer_goes_idle_and_reopens_on_demand() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             exchange(
                 CommissionerOperation::GetActiveDataset,
@@ -402,9 +402,9 @@ async fn a_connect_only_session_closed_by_the_peer_goes_idle_and_reopens_on_dema
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_peer_close_ends_an_active_session() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([exchange(
             CommissionerOperation::Petition,
             [
@@ -431,9 +431,9 @@ async fn a_peer_close_ends_an_active_session() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_transport_failure_ends_the_session_and_fails_outstanding_requests() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             exchange(
@@ -468,9 +468,9 @@ async fn a_transport_failure_ends_the_session_and_fails_outstanding_requests() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_send_ends_the_session() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([petition_exchange()]);
         let transport = script.clone();
         let (commissioner, mut events) = scripted_commissioner(script, []).await;
@@ -544,9 +544,9 @@ async fn an_unanswered_confirmable_request_backs_off_between_retransmissions() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_request_that_fails_without_a_transport_error_fails_alone() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             // Scripted for a different operation, so sending the next
@@ -574,9 +574,9 @@ async fn a_request_that_fails_without_a_transport_error_fails_alone() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn connect_returns_a_petition_rejection_and_stops_the_session() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let pskc = [0x11; 16];
         let server = meshcop_dtls::DtlsServer::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr();

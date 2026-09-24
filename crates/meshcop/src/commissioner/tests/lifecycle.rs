@@ -89,9 +89,9 @@ async fn a_request_dropped_in_flight_frees_its_slot_and_is_not_retransmitted() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn only_one_keep_alive_is_outstanding_at_a_time() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             unanswered(CommissionerOperation::KeepAlive),
@@ -115,9 +115,9 @@ async fn only_one_keep_alive_is_outstanding_at_a_time() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_resigning_session_refuses_new_work() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         const RESIGNING: &str = "commissioner is resigning";
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
@@ -220,9 +220,9 @@ async fn a_send_failure_fails_queued_requests_with_the_session() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn concurrent_enable_joiner_calls_keep_every_joiner() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let joiner_ids = [[0x1a; 8], [0x2b; 8]];
         let open_steering = {
             let mut dataset = Dataset::default();
@@ -269,9 +269,9 @@ async fn concurrent_enable_joiner_calls_keep_every_joiner() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_dataset_change_during_a_prefix_fetch_leaves_the_cache_empty() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             exchange(
@@ -307,7 +307,7 @@ fn status_reports_a_session_task_that_stopped_without_ending_the_session() {
         .build()
         .unwrap();
     let mut started = None;
-    runtime.block_on(with_test_deadline(async {
+    runtime.block_on(with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([petition_exchange()]);
         let (commissioner, events) = scripted_commissioner(script, []).await;
         commissioner.petition().await.unwrap();
@@ -327,9 +327,9 @@ fn status_reports_a_session_task_that_stopped_without_ending_the_session() {
     assert_eq!(commissioner.session_id(), None);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn status_keeps_why_a_finished_session_ended() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             exchange(

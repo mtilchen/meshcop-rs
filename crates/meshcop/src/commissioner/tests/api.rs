@@ -1,8 +1,8 @@
 use super::*;
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn connect_only_establishes_dtls_and_resign_closes_the_session() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let pskc = [0x11; 16];
         let server = meshcop_dtls::DtlsServer::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr();
@@ -28,9 +28,9 @@ async fn connect_only_establishes_dtls_and_resign_closes_the_session() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn connect_rejects_invalid_keepalive_intervals_before_network_use() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         for interval in [Duration::from_secs(29), Duration::from_secs(46)] {
             let mut config = CommissionerConfig::pskc("test", [0x11; 16]);
             config.keepalive_interval = interval;
@@ -45,9 +45,9 @@ async fn connect_rejects_invalid_keepalive_intervals_before_network_use() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn scripted_harness_drives_petition_dataset_reads_events_and_resign() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let active_dataset = dataset_with_name("active-net");
         let pending_dataset = pending_dataset_with_name("pending-net");
         let commissioner_dataset = dataset_with_name("commissioner");
@@ -203,9 +203,9 @@ async fn scripted_harness_drives_petition_dataset_reads_events_and_resign() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn public_mutating_operations_include_session_tlvs_and_handle_success() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let active_dataset = active_dataset_with_name("active-set");
         let pending_dataset = pending_dataset_with_name("pending-set");
         let commissioner_dataset = dataset_with_name("commissioner-set");
@@ -404,9 +404,9 @@ async fn public_mutating_operations_include_session_tlvs_and_handle_success() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn public_api_maps_protocol_errors_without_touching_live_network() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let (pending_petition, _pending_petition_events) = scripted_commissioner(
             ScriptedMeshcopTransport::new([exchange(
                 CommissionerOperation::Petition,
@@ -545,9 +545,9 @@ async fn public_api_maps_protocol_errors_without_touching_live_network() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn petition_requires_connected_inactive_commissioner_state() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let (disconnected, _disconnected_events) =
             scripted_commissioner(ScriptedMeshcopTransport::new([]), []).await;
         disconnected.resign().await.unwrap();
@@ -592,9 +592,9 @@ async fn petition_requires_connected_inactive_commissioner_state() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn inactive_session_and_deferred_ccm_paths_are_reported() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let (commissioner, _commissioner_events) =
             scripted_commissioner(ScriptedMeshcopTransport::new([]), []).await;
 
@@ -636,9 +636,9 @@ async fn inactive_session_and_deferred_ccm_paths_are_reported() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn public_commissioner_methods_are_table_driven() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let cases = [
             PublicCommissionerMethod::Connect,
             PublicCommissionerMethod::Status,

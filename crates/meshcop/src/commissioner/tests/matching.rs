@@ -19,9 +19,9 @@ fn from_device(source: Ipv6Addr, message: &CoapMessage) -> CoapMessage {
     .unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_proxied_answer_cannot_complete_an_exchange_with_the_border_agent() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         // A mesh device echoes the keep-alive's token and message ID in a
         // rejection, which arrives through the proxy before the border agent's
         // own answer.
@@ -44,9 +44,9 @@ async fn a_proxied_answer_cannot_complete_an_exchange_with_the_border_agent() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_direct_answer_cannot_complete_a_proxied_exchange() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             exchange(CommissionerOperation::DiagnosticGetUnicast, []),
@@ -129,9 +129,9 @@ async fn only_an_empty_ack_stops_retransmission() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_reserved_code_class_does_not_answer_a_request() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         const RESERVED_CLASS_3: CoapCode = CoapCode(3 << 5);
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
@@ -167,9 +167,9 @@ async fn a_reserved_code_class_does_not_answer_a_request() {
     .await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn concurrent_exchanges_are_matched_by_unpredictable_tokens() {
-    with_test_deadline(async {
+    with_paused_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),
             exchange(CommissionerOperation::KeepAlive, []),

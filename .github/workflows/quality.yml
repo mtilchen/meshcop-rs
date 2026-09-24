@@ -185,12 +185,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [meshcop, dtls]
+        shard: [meshcop, session, dtls]
     env:
       MUTANTS_SCOPE: ${{ github.event.inputs.mutants_scope || 'targeted' }}
       MUTANTS_SHARD: ${{ matrix.shard }}
       CARGO_MUTANTS_JOBS: 2
-      CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT: 20
+      # Scripted tests run on paused time, so a mutant that stalls the session
+      # fails them at once, but it still waits out the deadlines of the few
+      # tests that run a real DTLS session over loopback sockets (about 20 s
+      # locally with two test threads; CI runners are slower).
+      CARGO_MUTANTS_MINIMUM_TEST_TIMEOUT: 60
       # Used only when MUTANTS_SCOPE=custom. Space-separated globs are passed to
       # cargo-mutants as repeated --file filters.
       CARGO_MUTANTS_FILES: ${{ vars.CARGO_MUTANTS_FILES }}

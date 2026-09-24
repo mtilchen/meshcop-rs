@@ -746,27 +746,32 @@ async fn assert_no_event(events: &mut Events) {
     assert!(next.is_err(), "unexpected event {next:?}");
 }
 
-/// Bound on a real-time test's run time. A mutation that stalls the session
-/// then fails the test well inside the mutation-testing timeout instead of
-/// hanging it; baseline tests finish in a fraction of this.
-const TEST_DEADLINE: Duration = Duration::from_secs(3);
-/// Bound on a paused-time test's virtual run time: longer than any test waits,
-/// and elapsed instantly when a stalled session leaves nothing else to run.
+/// Bound on a test's virtual run time: longer than any test waits, and
+/// elapsed instantly when a stalled session leaves nothing else to run. Every
+/// scripted session test runs on paused time, so a mutation that stalls the
+/// session fails the test at once instead of after a real-time deadline.
 const PAUSED_TEST_DEADLINE: Duration = Duration::from_secs(3600);
 
-/// Runs a real-time test body, failing it if it exceeds [`TEST_DEADLINE`].
-async fn with_test_deadline(body: impl std::future::Future<Output = ()>) {
-    run_with_deadline(TEST_DEADLINE, body).await;
+/// Bound on a real-time test's run time. Only tests that run a real DTLS
+/// session over loopback sockets use real time: a paused clock jumps ahead
+/// whenever the runtime waits on a socket, which would fire their timers
+/// early.
+const SOCKET_TEST_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Runs a real-time socket test body, failing it if it exceeds
+/// [`SOCKET_TEST_DEADLINE`].
+async fn with_socket_test_deadline(body: impl std::future::Future<Output = ()>) {
+    run_with_deadline(SOCKET_TEST_DEADLINE, body).await;
 }
 
 /// Bound for the real-DTLS retransmission tests, which wait out CoAP timers
 /// (2-4 s) on real time to prove a retransmission does or does not happen.
-const SLOW_TEST_DEADLINE: Duration = Duration::from_secs(8);
+const SLOW_SOCKET_TEST_DEADLINE: Duration = Duration::from_secs(8);
 
-/// Runs a real-time test body that waits out CoAP timers, failing it if it
-/// exceeds [`SLOW_TEST_DEADLINE`].
-async fn with_slow_test_deadline(body: impl std::future::Future<Output = ()>) {
-    run_with_deadline(SLOW_TEST_DEADLINE, body).await;
+/// Runs a real-time socket test body that waits out CoAP timers, failing it
+/// if it exceeds [`SLOW_SOCKET_TEST_DEADLINE`].
+async fn with_slow_socket_test_deadline(body: impl std::future::Future<Output = ()>) {
+    run_with_deadline(SLOW_SOCKET_TEST_DEADLINE, body).await;
 }
 
 /// Runs a paused-time test body, failing it if it exceeds

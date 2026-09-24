@@ -23,15 +23,19 @@ fi
 # Matrix runs split the normal targeted scope. Full/custom invocations still
 # run exactly once on the primary shard so workflow_dispatch does not duplicate
 # an intentionally unsharded audit.
-if [[ "${scope}" != "targeted" && "${shard}" == "dtls" ]]; then
+if [[ "${scope}" != "targeted" && "${shard}" != "meshcop" ]]; then
   echo "Mutation scope ${scope} runs only on the primary meshcop shard."
   exit 0
 fi
 
-# Production surfaces of each targeted shard; `all` runs both.
-meshcop_files=(
+# Production surfaces of each targeted shard; `all` runs every shard. The
+# commissioner session (handle and driver) is its own shard so each job stays
+# well inside the workflow's time limit.
+session_files=(
   'crates/meshcop/src/commissioner/client/*.rs'
   'crates/meshcop/src/commissioner/client/driver/*.rs'
+)
+meshcop_files=(
   crates/meshcop/src/commissioner/events.rs
   crates/meshcop/src/commissioner/joiner.rs
   crates/meshcop/src/meshcop/coap.rs
@@ -56,8 +60,9 @@ filters=()
 case "${scope}" in
   targeted)
     case "${shard}" in
-      all) files=("${meshcop_files[@]}" "${dtls_files[@]}") ;;
+      all) files=("${meshcop_files[@]}" "${session_files[@]}" "${dtls_files[@]}") ;;
       meshcop) files=("${meshcop_files[@]}") ;;
+      session) files=("${session_files[@]}") ;;
       dtls) files=("${dtls_files[@]}") ;;
       *)
         echo "unknown MUTANTS_SHARD: ${shard}" >&2

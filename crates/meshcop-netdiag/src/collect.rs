@@ -574,13 +574,14 @@ mod tests {
 
     const MESH_LOCAL_PREFIX: [u8; 8] = [0xfd, 0x00, 0x0d, 0xb8, 0, 0, 0, 0];
 
-    /// Bound on a real-time test's run time. A mutation that stalls the session
-    /// then fails the test well inside the mutation-testing timeout instead of
-    /// hanging it; baseline tests finish in a fraction of this.
-    const TEST_DEADLINE: Duration = Duration::from_secs(3);
-    /// Runs a real-time test body, failing it if it exceeds [`TEST_DEADLINE`].
-    async fn with_test_deadline(body: impl std::future::Future<Output = ()>) {
-        run_with_deadline(TEST_DEADLINE, body).await;
+    /// Bound on a test's virtual run time: longer than any test waits, and
+    /// elapsed instantly when a stalled session leaves nothing else to run, so
+    /// a mutation that stalls the session fails the test at once.
+    const PAUSED_TEST_DEADLINE: Duration = Duration::from_secs(3600);
+    /// Runs a paused-time test body, failing it if it exceeds
+    /// [`PAUSED_TEST_DEADLINE`] of virtual time.
+    async fn with_paused_test_deadline(body: impl std::future::Future<Output = ()>) {
+        run_with_deadline(PAUSED_TEST_DEADLINE, body).await;
     }
 
     async fn active_session(
@@ -612,9 +613,9 @@ mod tests {
         session
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn start_reads_the_mesh_local_prefix_for_routing() {
-        with_test_deadline(async {
+        with_paused_test_deadline(async {
             let (commissioner, _events) = active_session([]).await;
             let collector = Collector::start(&commissioner, Duration::from_secs(1))
                 .await
@@ -629,9 +630,9 @@ mod tests {
         .await
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_lost_session_stops_the_walk_instead_of_reading_as_silence() {
-        with_test_deadline(async {
+        with_paused_test_deadline(async {
             let (commissioner, _events) = active_session([ScriptedExchange::new(
                 CommissionerOperation::KeepAlive,
                 [ScriptedResponse::reject()],
