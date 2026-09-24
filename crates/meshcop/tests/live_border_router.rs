@@ -7,12 +7,12 @@ use meshcop::{
 };
 
 #[tokio::test]
-#[ignore = "requires a Thread border agent at 192.168.4.48:49156 and ESP_MATTER_TEST_THREAD_DATASET_HEX"]
+#[ignore = "requires MESHCOP_BORDER_AGENT (resolve over mDNS; see AGENTS.md) and ESP_MATTER_TEST_THREAD_DATASET_HEX"]
 async fn live_border_router_read_only_smoke() -> meshcop::Result<()> {
     let dataset_hex = std::env::var("ESP_MATTER_TEST_THREAD_DATASET_HEX")
         .expect("ESP_MATTER_TEST_THREAD_DATASET_HEX must contain a dataset with PSKc");
     let border_agent: SocketAddr = std::env::var("MESHCOP_BORDER_AGENT")
-        .unwrap_or_else(|_| "192.168.4.48:49156".to_string())
+        .expect("MESHCOP_BORDER_AGENT must name the border agent (host:port, resolved over mDNS)")
         .parse()
         .expect("MESHCOP_BORDER_AGENT must be host:port");
 
@@ -40,12 +40,12 @@ async fn live_border_router_read_only_smoke() -> meshcop::Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a Thread border agent at 192.168.4.48:49156 and ESP_MATTER_TEST_THREAD_DATASET_HEX"]
+#[ignore = "requires MESHCOP_BORDER_AGENT (resolve over mDNS; see AGENTS.md) and ESP_MATTER_TEST_THREAD_DATASET_HEX"]
 async fn live_border_router_active_dataset_matches_env() -> meshcop::Result<()> {
     let dataset_hex = std::env::var("ESP_MATTER_TEST_THREAD_DATASET_HEX")
         .expect("ESP_MATTER_TEST_THREAD_DATASET_HEX must contain a dataset with PSKc");
     let border_agent: SocketAddr = std::env::var("MESHCOP_BORDER_AGENT")
-        .unwrap_or_else(|_| "192.168.4.48:49156".to_string())
+        .expect("MESHCOP_BORDER_AGENT must name the border agent (host:port, resolved over mDNS)")
         .parse()
         .expect("MESHCOP_BORDER_AGENT must be host:port");
 

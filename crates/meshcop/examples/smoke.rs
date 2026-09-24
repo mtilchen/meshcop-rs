@@ -15,7 +15,7 @@ async fn main() -> meshcop::Result<()> {
     let dataset_hex = std::env::var("ESP_MATTER_TEST_THREAD_DATASET_HEX")
         .expect("ESP_MATTER_TEST_THREAD_DATASET_HEX must contain an active dataset with PSKc");
     let border_agent: SocketAddr = std::env::var("MESHCOP_BORDER_AGENT")
-        .unwrap_or_else(|_| "192.168.4.48:49156".to_string())
+        .expect("MESHCOP_BORDER_AGENT must name the border agent (host:port, resolved over mDNS)")
         .parse()
         .expect("MESHCOP_BORDER_AGENT must be host:port");
 

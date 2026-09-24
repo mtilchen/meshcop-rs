@@ -78,7 +78,9 @@ fn require_mutation_gate(command: &str) -> meshcop::Result<()> {
 fn border_agent_arg(arg: Option<String>) -> meshcop::Result<SocketAddr> {
     let raw = arg
         .or_else(|| std::env::var("MESHCOP_BORDER_AGENT").ok())
-        .unwrap_or_else(|| "192.168.4.48:49156".to_string());
+        .ok_or(meshcop::Error::Configuration(
+            "border-agent host:port argument or MESHCOP_BORDER_AGENT required",
+        ))?;
     raw.parse().map_err(|err| {
         meshcop::Error::Dataset(format!("invalid border-agent address `{raw}`: {err}"))
     })
