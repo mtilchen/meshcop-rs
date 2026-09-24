@@ -68,6 +68,17 @@ impl Interpreter {
         self.should_exit
     }
 
+    /// Resigns a running session before the program exits, printing the
+    /// outcome. Does nothing without one.
+    pub async fn shutdown(&mut self) {
+        let running = self.commissioner.as_ref().is_some_and(|commissioner| {
+            !matches!(commissioner.status(), SessionStatus::Closed { .. })
+        });
+        if running {
+            self.cmd_stop().await.print();
+        }
+    }
+
     /// Waits for the current session's next event. Never completes while no
     /// session is running, so the REPL can wait on it alongside input.
     pub(super) async fn next_event(&mut self) -> Option<CommissionerEvent> {
@@ -82,13 +93,12 @@ impl Interpreter {
     }
 
     /// Records an event that arrived while the REPL was waiting for input,
-    /// and returns a message to show for a lost session.
+    /// and returns a message to show for a lost session or lost events.
     pub(super) fn handle_background_event(&mut self, event: CommissionerEvent) -> Option<String> {
         if let CommissionerEvent::SessionLost { reason } = &event {
             return Some(format!("commissioner session lost: {reason}"));
         }
-        self.record_event(event);
-        None
+        self.record_event(event)
     }
 
     /// Evaluates one input line and prints the result.

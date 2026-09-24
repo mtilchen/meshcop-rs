@@ -1204,3 +1204,75 @@ async fn protocol_errors_surface_as_failed_output() {
     })
     .await
 }
+
+#[tokio::test]
+async fn lost_events_are_reported_while_waiting_and_after_a_scan() {
+    with_test_deadline(async {
+        const WARNING: &str =
+            "missed 2 commissioner events; energy and PAN ID reports may be incomplete";
+        let lagged = CommissionerEvent::Lagged { missed: 2 };
+        let mut interpreter = scripted_interpreter([], [lagged.clone()]).await;
+
+        assert_eq!(
+            interpreter.handle_background_event(lagged),
+            Some(WARNING.to_string())
+        );
+        let scanned = interpreter.pump_events(Duration::from_millis(50)).await;
+        assert_eq!(scanned.rendered().as_str(), format!("{WARNING}\n[done]"));
+    })
+    .await
+}
+
+#[tokio::test]
+async fn shutdown_resigns_a_running_session() {
+    with_test_deadline(async {
+        let mut interpreter = active_interpreter(
+            [(
+                CommissionerOperation::KeepAlive,
+                vec![ScriptedResponse::accept()],
+            )],
+            [],
+        )
+        .await;
+        let transport = interpreter
+            .commissioner
+            .as_ref()
+            .unwrap()
+            .scripted_transport()
+            .unwrap()
+            .clone();
+
+        interpreter.shutdown().await;
+        let resignation = transport.observed_requests().pop().unwrap();
+        assert_eq!(resignation.operation, CommissionerOperation::KeepAlive);
+        assert!(interpreter.commissioner.is_none());
+        // Without a session there is nothing to resign.
+        interpreter.shutdown().await;
+        assert_eq!(transport.observed_requests().len(), 2);
+    })
+    .await
+}
+
+#[tokio::test]
+async fn shutdown_leaves_a_lost_session_alone() {
+    with_test_deadline(async {
+        let mut interpreter = active_interpreter(
+            [(
+                CommissionerOperation::KeepAlive,
+                vec![ScriptedResponse::reject()],
+            )],
+            [],
+        )
+        .await;
+        let commissioner = interpreter.commissioner.clone().unwrap();
+        assert!(commissioner.keep_alive().await.is_ok());
+        assert!(matches!(
+            commissioner.status(),
+            meshcop::commissioner::SessionStatus::Closed { .. }
+        ));
+
+        interpreter.shutdown().await;
+        assert!(interpreter.commissioner.is_some());
+    })
+    .await
+}

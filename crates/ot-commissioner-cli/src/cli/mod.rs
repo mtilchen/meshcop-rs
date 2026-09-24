@@ -162,9 +162,12 @@ pub async fn run(config_path: Option<&Path>) -> meshcop::Result<()> {
                 let line = Zeroizing::new(line);
                 interpreter.evaluate_and_print(&line).await;
             }
-            Ok(None) | Err(_) => return Ok(()),
+            Ok(None) | Err(_) => break,
         }
     }
+    // Resign here: once main returns, runtime shutdown would cancel the
+    // session task's own best-effort resignation.
+    interpreter.shutdown().await;
     Ok(())
 }
 

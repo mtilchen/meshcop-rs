@@ -95,8 +95,7 @@ impl Interpreter {
                         return CommandValue::failed(err.to_string());
                     }
                 }
-                self.pump_events(Duration::from_secs(3)).await;
-                CommandValue::done()
+                self.pump_events(Duration::from_secs(3)).await
             }
             "conflict" => {
                 if tokens.len() < 3 {
@@ -148,8 +147,7 @@ impl Interpreter {
                         return CommandValue::failed(err.to_string());
                     }
                 }
-                self.pump_events(Duration::from_secs(3)).await;
-                CommandValue::done()
+                self.pump_events(Duration::from_secs(3)).await
             }
             "report" => {
                 let filter = tokens
