@@ -135,6 +135,11 @@ where
     async fn recv_application_data_inner(&mut self) -> DriverResult<Vec<u8>, U::Error> {
         let mut duplicate_retransmissions = DuplicateRetransmitBudget::new();
         loop {
+            if let Some(result) = self.state.open_next_record() {
+                // Authenticated traffic proves the client has our Finished.
+                self.server_finished.clear();
+                return result.map_err(DriverError::from);
+            }
             let (records, _, _) =
                 recv_records_from_unbounded(&mut self.transport, self.peer).await?;
             if take_server_finished_retry(
@@ -149,11 +154,7 @@ where
                 )?;
                 send_records(&mut self.transport, self.local, self.peer, &flight).await?;
             }
-            if let Some(result) = self.state.open_session_datagram(&records) {
-                // Authenticated traffic proves the client has our Finished.
-                self.server_finished.clear();
-                return result.map_err(DriverError::from);
-            }
+            self.state.receive_datagram(records);
         }
     }
 

@@ -488,7 +488,10 @@ Where the implementation departs from, or makes concrete, the design above:
 - **Peer close.** `meshcop-dtls` now reports an authenticated `close_notify`
   as `Error::PeerClosed`. A connect-only session treats it as normal (status
   `Idle`, reopened on the next request); an active one ends with
-  `CloseReason::PeerClosed`.
+  `CloseReason::PeerClosed`. A datagram may carry several records, and the
+  session keeps the ones after the record it returns for the next receive,
+  so a `close_notify` sent in the same datagram as application data is
+  still seen.
 - **Response matching is bound to the route and to response codes.**
   - A message arriving directly from the border agent can only answer,
     acknowledge, or reset a direct exchange, and one arriving in UDP_RX only
@@ -516,10 +519,6 @@ Where the implementation departs from, or makes concrete, the design above:
     RFC 7252's exchange lifetime. With one application request in flight,
     reusing an ID within its lifetime would take tens of thousands of
     requests in a few minutes.
-  - `meshcop-dtls` returns only the first usable record of a datagram. A
-    `close_notify` sent in the same datagram as application data is lost. A
-    connect-only session would then not notice the close, and its requests
-    would time out instead of reopening the session.
   - The scripted harness delivers a proxied request's scripted answers in
     UDP_RX from the request's destination. Tests that need an answer at a
     chosen time, or one that depends on the assigned token, use
