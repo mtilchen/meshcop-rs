@@ -284,7 +284,7 @@ impl SessionState {
                 continue;
             };
             return Some(if is_alert {
-                Err(decode_alert_error(&record.header, &plaintext))
+                Err(decode_authenticated_alert(&record.header, &plaintext))
             } else {
                 Ok(plaintext)
             });
@@ -413,6 +413,18 @@ where
         }
     };
     with_timeout(receive, delay.clone(), duration).await
+}
+
+/// TLS `close_notify` alert description (RFC 5246 §7.2.1).
+const ALERT_CLOSE_NOTIFY: u8 = 0;
+
+/// Converts an authenticated alert from an established session into an
+/// error, reporting an orderly `close_notify` as [`Error::PeerClosed`].
+fn decode_authenticated_alert(header: &RecordHeader, payload: &[u8]) -> Error {
+    match payload {
+        [_, ALERT_CLOSE_NOTIFY, ..] => Error::PeerClosed,
+        _ => decode_alert_error(header, payload),
+    }
 }
 
 /// Converts a received alert's header and plaintext into an error.
@@ -909,6 +921,42 @@ mod tests {
             }
             other => panic!("expected a decoded alert error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recv_application_data_reports_a_protected_close_notify_as_peer_closed() {
+        const WARNING_LEVEL: u8 = 1;
+        let key_material = test_key_material();
+        let close_notify = protect_aes_128_ccm_8_record(
+            ContentType::Alert,
+            1,
+            1,
+            RecordProtectionKey::new(key_material.key_block.server_write_key),
+            &key_material.key_block.server_write_iv,
+            &[WARNING_LEVEL, ALERT_CLOSE_NOTIFY],
+        )
+        .expect("protected close_notify");
+        let mut transport = QueuedUdp {
+            queue: VecDeque::from([(
+                close_notify.encode().expect("close_notify encodes"),
+                LOCAL_ADDR,
+                PEER_ADDR,
+            )]),
+        };
+        let delay = PendingDelay;
+        let mut state = SessionState::new(key_material, SessionRole::Client);
+        let err = futures_lite_for_test::block_on(recv_application_data(
+            &mut state,
+            &mut transport,
+            &delay,
+            PEER_ADDR,
+            Duration::from_secs(1),
+        ))
+        .expect_err("close_notify must end the receive");
+        assert!(
+            matches!(err, DriverError::Protocol(Error::PeerClosed)),
+            "expected PeerClosed, got {err:?}"
+        );
     }
 
     #[test]
