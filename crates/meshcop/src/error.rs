@@ -51,6 +51,16 @@ pub enum Error {
         existing_commissioner_id: Option<String>,
     },
 
+    /// The commissioner session has ended, so the handle can no longer be
+    /// used.
+    #[error("commissioner session is closed")]
+    SessionClosed,
+
+    /// The session ended while this request was outstanding. The request may
+    /// or may not have taken effect.
+    #[error("commissioner session was lost: {0}")]
+    SessionLost(crate::commissioner::CloseReason),
+
     /// The requested operation is intentionally deferred.
     #[error("unsupported operation: {0}")]
     Unsupported(&'static str),

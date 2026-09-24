@@ -26,7 +26,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use meshcop::{
-    commissioner::{Commissioner, CommissionerConfig, CommissionerEvent},
+    commissioner::{Commissioner, CommissionerConfig, CommissionerEvent, Events},
     dataset::Dataset,
     meshcop::diag::diag_flags,
 };
@@ -42,7 +42,7 @@ const SCAN_DURATION_MS: u16 = 200;
 const ANNOUNCE_COUNT: u8 = 1;
 const ANNOUNCE_PERIOD_MS: u16 = 500;
 
-#[tokio::main]
+#[tokio::main(flavor = "local")]
 async fn main() -> meshcop::Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let show_secrets = support::show_secrets_requested(&mut args);
@@ -70,10 +70,11 @@ async fn main() -> meshcop::Result<()> {
     let channel_mask = page0_channel_mask(channel.channel);
 
     println!("== connecting to {border_agent} ==");
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    let (commissioner, mut events) = Commissioner::connect_only(config, border_agent).await?;
 
     let probe_result = probe(
-        &mut commissioner,
+        &commissioner,
+        &mut events,
         leader_aloc,
         channel_mask,
         channel.channel,
@@ -93,7 +94,8 @@ async fn main() -> meshcop::Result<()> {
 }
 
 async fn probe(
-    commissioner: &mut Commissioner,
+    commissioner: &Commissioner,
+    events: &mut Events,
     leader_aloc: Ipv6Addr,
     channel_mask: u32,
     channel: u16,
@@ -117,7 +119,7 @@ async fn probe(
         )
         .await?;
     println!("energy scan accepted; waiting for MGMT_ED_REPORT.ans");
-    match wait_for_event(commissioner, EVENT_TIMEOUT, |event| {
+    match wait_for_event(events, EVENT_TIMEOUT, |event| {
         matches!(event, CommissionerEvent::EnergyReport { .. })
     })
     .await?
@@ -146,7 +148,7 @@ async fn probe(
         .pan_id_query(channel_mask, pan_id, leader_aloc)
         .await?;
     println!("PAN ID query accepted; waiting for conflict reports");
-    match wait_for_event(commissioner, CONFLICT_TIMEOUT, |event| {
+    match wait_for_event(events, CONFLICT_TIMEOUT, |event| {
         matches!(event, CommissionerEvent::PanIdConflict { .. })
     })
     .await?
@@ -178,7 +180,7 @@ async fn probe(
         | diag_flags::CHANNEL_PAGES;
     commissioner.diagnostic_get(None, flags).await?;
     println!("diagnostic get accepted; waiting for DIAG_GET.ans");
-    match wait_for_event(commissioner, EVENT_TIMEOUT, |event| {
+    match wait_for_event(events, EVENT_TIMEOUT, |event| {
         matches!(event, CommissionerEvent::DiagnosticAnswer { .. })
     })
     .await?
@@ -216,7 +218,7 @@ async fn probe(
 
 /// Drains commissioner events until `matches` accepts one or `timeout` lapses.
 async fn wait_for_event(
-    commissioner: &mut Commissioner,
+    events: &mut Events,
     timeout: Duration,
     matches: impl Fn(&CommissionerEvent) -> bool,
 ) -> meshcop::Result<Option<CommissionerEvent>> {
@@ -226,12 +228,13 @@ async fn wait_for_event(
         if remaining.is_zero() {
             return Ok(None);
         }
-        match tokio::time::timeout(remaining, commissioner.next_event()).await {
-            Ok(Ok(Some(event))) if matches(&event) => return Ok(Some(event)),
-            Ok(Ok(Some(other))) => println!("  (other event: {})", event_label(&other)),
-            Ok(Ok(None)) => return Ok(None),
-            Ok(Err(err)) => return Err(err),
-            Err(_elapsed) => return Ok(None),
+        match tokio::time::timeout(remaining, events.next()).await {
+            Ok(Some(CommissionerEvent::SessionLost { reason })) => {
+                return Err(meshcop::Error::SessionLost(reason));
+            }
+            Ok(Some(event)) if matches(&event) => return Ok(Some(event)),
+            Ok(Some(other)) => println!("  (other event: {})", event_label(&other)),
+            Ok(None) | Err(_) => return Ok(None),
         }
     }
 }

@@ -2,54 +2,58 @@ use super::*;
 
 #[tokio::test]
 async fn steering_helpers_update_the_commissioner_dataset() {
-    let joiner_id = [0x1au8, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81];
-    let mut expected_steering = vec![0u8; 16];
-    crate::crypto::add_joiner_to_steering_data(&mut expected_steering, &joiner_id);
+    with_test_deadline(async {
+        let joiner_id = [0x1au8, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81];
+        let mut expected_steering = vec![0u8; 16];
+        crate::crypto::add_joiner_to_steering_data(&mut expected_steering, &joiner_id);
 
-    let existing = {
-        let mut dataset = Dataset::default();
-        dataset.set_raw(TLV_STEERING_DATA, vec![0x00]);
-        dataset.to_bytes().unwrap()
-    };
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0xcafe)],
-        ),
-        exchange(
-            CommissionerOperation::GetCommissionerDataset,
-            [ScriptedResponse::content(existing)],
-        ),
-        exchange(
-            CommissionerOperation::SetCommissionerDataset,
-            [ScriptedResponse::accept()],
-        ),
-        exchange(
-            CommissionerOperation::SetCommissionerDataset,
-            [ScriptedResponse::accept()],
-        ),
-        exchange(
-            CommissionerOperation::SetCommissionerDataset,
-            [ScriptedResponse::accept()],
-        ),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    commissioner.petition().await.unwrap();
+        let existing = {
+            let mut dataset = Dataset::default();
+            dataset.set_raw(TLV_STEERING_DATA, vec![0x00]);
+            dataset.to_bytes().unwrap()
+        };
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0xcafe)],
+            ),
+            exchange(
+                CommissionerOperation::GetCommissionerDataset,
+                [ScriptedResponse::content(existing)],
+            ),
+            exchange(
+                CommissionerOperation::SetCommissionerDataset,
+                [ScriptedResponse::accept()],
+            ),
+            exchange(
+                CommissionerOperation::SetCommissionerDataset,
+                [ScriptedResponse::accept()],
+            ),
+            exchange(
+                CommissionerOperation::SetCommissionerDataset,
+                [ScriptedResponse::accept()],
+            ),
+        ]);
+        let (commissioner, _commissioner_events) = scripted_commissioner(script, []).await;
+        commissioner.petition().await.unwrap();
 
-    commissioner.enable_joiner(&joiner_id).await.unwrap();
-    commissioner.enable_all_joiners(true).await.unwrap();
-    commissioner.enable_all_joiners(false).await.unwrap();
+        commissioner.enable_joiner(&joiner_id).await.unwrap();
+        commissioner.enable_all_joiners(true).await.unwrap();
+        commissioner.enable_all_joiners(false).await.unwrap();
 
-    let harness = commissioner.scripted_transport().unwrap();
-    let requests = harness.observed_requests();
-    let steering =
-        |idx: usize| tlv_value(&requests[idx].inner_message().unwrap(), TLV_STEERING_DATA).unwrap();
-    // enable_joiner: the 1-byte closed filter is replaced by a fresh 16-byte
-    // Bloom filter containing the joiner.
-    assert_eq!(steering(2), expected_steering);
-    // enable_all_joiners: wildcard open, then closed.
-    assert_eq!(steering(3), vec![0xff]);
-    assert_eq!(steering(4), vec![0x00]);
+        let harness = commissioner.scripted_transport().unwrap();
+        let requests = harness.observed_requests();
+        let steering = |idx: usize| {
+            tlv_value(&requests[idx].inner_message().unwrap(), TLV_STEERING_DATA).unwrap()
+        };
+        // enable_joiner: the 1-byte closed filter is replaced by a fresh 16-byte
+        // Bloom filter containing the joiner.
+        assert_eq!(steering(2), expected_steering);
+        // enable_all_joiners: wildcard open, then closed.
+        assert_eq!(steering(3), vec![0xff]);
+        assert_eq!(steering(4), vec![0x00]);
+    })
+    .await
 }
 
 #[test]
@@ -122,261 +126,285 @@ fn joiner_handler_default_callbacks_accept_and_ignore() {
 
 #[tokio::test]
 async fn dataset_set_operations_validate_mandatory_tlvs() {
-    let script = ScriptedMeshcopTransport::new([exchange(
-        CommissionerOperation::Petition,
-        [ScriptedResponse::petition_accept(0xcafe)],
-    )]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    commissioner.petition().await.unwrap();
+    with_test_deadline(async {
+        let script = ScriptedMeshcopTransport::new([exchange(
+            CommissionerOperation::Petition,
+            [ScriptedResponse::petition_accept(0xcafe)],
+        )]);
+        let (commissioner, _commissioner_events) = scripted_commissioner(script, []).await;
+        commissioner.petition().await.unwrap();
 
-    // Active set without an Active Timestamp.
-    assert!(matches!(
-        commissioner
-            .set_active_dataset(&dataset_with_name("incomplete"))
-            .await
-            .unwrap_err(),
-        Error::Dataset(message) if message.contains("Active Timestamp")
-    ));
-    // Pending set missing the Delay Timer.
-    let mut no_delay = active_dataset_with_name("incomplete");
-    no_delay.set_raw(DATASET_TLV_PENDING_TIMESTAMP, 1u64.to_be_bytes());
-    assert!(matches!(
-        commissioner.set_pending_dataset(&no_delay).await.unwrap_err(),
-        Error::Dataset(message) if message.contains("Delay Timer")
-    ));
-    // Secure pending set missing the Pending Timestamp.
-    let mut no_pending = active_dataset_with_name("incomplete");
-    no_pending.set_raw(crate::dataset::TLV_DELAY_TIMER, 30_000u32.to_be_bytes());
-    assert!(matches!(
-        commissioner
-            .set_secure_pending_dataset(120, &no_pending)
-            .await
-            .unwrap_err(),
-        Error::Dataset(message) if message.contains("Pending Timestamp")
-    ));
-    // Nothing was sent for any of the rejected datasets.
-    assert_eq!(
-        commissioner
-            .scripted_transport()
-            .unwrap()
-            .observed_requests()
-            .len(),
-        1
-    );
+        // Active set without an Active Timestamp.
+        assert!(matches!(
+            commissioner
+                .set_active_dataset(&dataset_with_name("incomplete"))
+                .await
+                .unwrap_err(),
+            Error::Dataset(message) if message.contains("Active Timestamp")
+        ));
+        // Pending set missing the Delay Timer.
+        let mut no_delay = active_dataset_with_name("incomplete");
+        no_delay.set_raw(DATASET_TLV_PENDING_TIMESTAMP, 1u64.to_be_bytes());
+        assert!(matches!(
+            commissioner.set_pending_dataset(&no_delay).await.unwrap_err(),
+            Error::Dataset(message) if message.contains("Delay Timer")
+        ));
+        // Secure pending set missing the Pending Timestamp.
+        let mut no_pending = active_dataset_with_name("incomplete");
+        no_pending.set_raw(crate::dataset::TLV_DELAY_TIMER, 30_000u32.to_be_bytes());
+        assert!(matches!(
+            commissioner
+                .set_secure_pending_dataset(120, &no_pending)
+                .await
+                .unwrap_err(),
+            Error::Dataset(message) if message.contains("Pending Timestamp")
+        ));
+        // Nothing was sent for any of the rejected datasets.
+        assert_eq!(
+            commissioner
+                .scripted_transport()
+                .unwrap()
+                .observed_requests()
+                .len(),
+            1
+        );
+    })
+    .await
 }
 
 #[tokio::test]
 async fn commissioner_runs_petition_over_a_real_dtls_session() {
-    use meshcop_dtls::{ContentType, DtlsRecord, test_support};
+    with_test_deadline(async {
+        use meshcop_dtls::{ContentType, DtlsRecord, test_support};
 
-    const LOOPBACK_PETITION_TIMEOUT: Duration = Duration::from_secs(5);
+        const LOOPBACK_PETITION_TIMEOUT: Duration = Duration::from_secs(5);
 
-    let pskc = [0x42u8; 16];
-    let border = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let border_addr = border.local_addr().unwrap();
+        let pskc = [0x42u8; 16];
+        let border = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let border_addr = border.local_addr().unwrap();
 
-    // Border-agent side: complete the DTLS handshake, then answer the
-    // petition request with an accepting COMM_PET.rsp over the session.
-    let agent = tokio::spawn(async move {
-        // Learn the commissioner's ephemeral address, then connect so the
-        // loopback server can use send()/recv() like the dtls tests.
-        let mut peek = [0u8; 1];
-        let (_, peer) = border.peek_from(&mut peek).await.unwrap();
-        border.connect(peer).await.unwrap();
-        let keys =
-            test_support::loopback_dtls_server(&border, &pskc, test_support::LoopbackEnd::Complete)
-                .await
-                .unwrap()
-                .unwrap();
-        let mut buf = [0u8; 4096];
-        loop {
-            let len =
-                tokio::time::timeout(std::time::Duration::from_secs(2), border.recv(&mut buf))
-                    .await
-                    .unwrap()
-                    .unwrap();
-            for record in DtlsRecord::parse_datagram(&buf[..len]).unwrap() {
-                if record.header.epoch != 1
-                    || record.header.content_type != ContentType::ApplicationData
-                {
-                    continue;
-                }
-                let plaintext = meshcop_dtls::open_aes_128_ccm_8_record(
-                    &record,
-                    meshcop_dtls::RecordProtectionKey::new(keys.key_block.client_write_key),
-                    &keys.key_block.client_write_iv,
-                )
-                .unwrap();
-                let request = CoapMessage::decode(&plaintext).unwrap();
-                let mut payload = vec![TLV_STATE, 1, 0x01];
-                payload.extend_from_slice(&[TLV_COMMISSIONER_SESSION_ID, 2, 0x12, 0x34]);
-                let response = CoapMessage {
-                    ty: CoapType::Acknowledgement,
-                    code: CoapCode::CHANGED,
-                    message_id: request.message_id,
-                    token: request.token.clone(),
-                    options: Vec::new(),
-                    payload,
-                };
-                let protected = meshcop_dtls::protect_aes_128_ccm_8_record(
-                    ContentType::ApplicationData,
-                    1,
-                    1,
-                    meshcop_dtls::RecordProtectionKey::new(keys.key_block.server_write_key),
-                    &keys.key_block.server_write_iv,
-                    &response.encode().unwrap(),
-                )
-                .unwrap();
-                border.send(&protected.encode().unwrap()).await.unwrap();
-                return;
-            }
-        }
-    });
-
-    let mut commissioner =
-        Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr)
+        // Border-agent side: complete the DTLS handshake, then answer the
+        // petition request with an accepting COMM_PET.rsp over the session.
+        let agent = tokio::spawn(async move {
+            // Learn the commissioner's ephemeral address, then connect so the
+            // loopback server can use send()/recv() like the dtls tests.
+            let mut peek = [0u8; 1];
+            let (_, peer) = border.peek_from(&mut peek).await.unwrap();
+            border.connect(peer).await.unwrap();
+            let keys = test_support::loopback_dtls_server(
+                &border,
+                &pskc,
+                test_support::LoopbackEnd::Complete,
+            )
             .await
+            .unwrap()
             .unwrap();
-    let petition = tokio::time::timeout(LOOPBACK_PETITION_TIMEOUT, commissioner.petition())
+            let mut buf = [0u8; 4096];
+            loop {
+                let len =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), border.recv(&mut buf))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                for record in DtlsRecord::parse_datagram(&buf[..len]).unwrap() {
+                    if record.header.epoch != 1
+                        || record.header.content_type != ContentType::ApplicationData
+                    {
+                        continue;
+                    }
+                    let plaintext = meshcop_dtls::open_aes_128_ccm_8_record(
+                        &record,
+                        meshcop_dtls::RecordProtectionKey::new(keys.key_block.client_write_key),
+                        &keys.key_block.client_write_iv,
+                    )
+                    .unwrap();
+                    let request = CoapMessage::decode(&plaintext).unwrap();
+                    let mut payload = vec![TLV_STATE, 1, 0x01];
+                    payload.extend_from_slice(&[TLV_COMMISSIONER_SESSION_ID, 2, 0x12, 0x34]);
+                    let response = CoapMessage {
+                        ty: CoapType::Acknowledgement,
+                        code: CoapCode::CHANGED,
+                        message_id: request.message_id,
+                        token: request.token.clone(),
+                        options: Vec::new(),
+                        payload,
+                    };
+                    let protected = meshcop_dtls::protect_aes_128_ccm_8_record(
+                        ContentType::ApplicationData,
+                        1,
+                        1,
+                        meshcop_dtls::RecordProtectionKey::new(keys.key_block.server_write_key),
+                        &keys.key_block.server_write_iv,
+                        &response.encode().unwrap(),
+                    )
+                    .unwrap();
+                    border.send(&protected.encode().unwrap()).await.unwrap();
+                    return;
+                }
+            }
+        });
+
+        let (commissioner, _events) = tokio::time::timeout(
+            LOOPBACK_PETITION_TIMEOUT,
+            Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr),
+        )
         .await
-        .expect("loopback petition timed out")
+        .expect("loopback connect and petition timed out")
         .unwrap();
-    assert_eq!(petition.session_id, 0x1234);
-    assert_eq!(commissioner.state(), CommissionerState::Active);
-    agent.await.expect("agent task panicked");
+        assert_eq!(commissioner.session_id(), Some(0x1234));
+        assert!(commissioner.status().is_active());
+        agent.await.expect("agent task panicked");
+    })
+    .await
 }
 
 #[tokio::test]
 async fn confirmable_request_is_retransmitted_without_changing_its_coap_identity() {
-    use meshcop_dtls::DtlsServer;
+    with_slow_test_deadline(async {
+        use meshcop_dtls::DtlsServer;
 
-    let pskc = [0x42u8; 16];
-    let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
-    let border_addr = server.local_addr();
-    let server_task = async move {
-        let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
-        let first = session
-            .recv_application_data(Duration::from_secs(10))
-            .await
-            .unwrap();
-        let repeated = session
-            .recv_application_data(Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(repeated, first);
+        let pskc = [0x42u8; 16];
+        let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
+        let border_addr = server.local_addr();
+        let server_task = async move {
+            let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
+            let first = session
+                .recv_application_data(Duration::from_secs(10))
+                .await
+                .unwrap();
+            let repeated = session
+                .recv_application_data(Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(repeated, first);
 
-        let request = CoapMessage::decode(&repeated).unwrap();
-        let response =
-            petition_accept_response(CoapType::Acknowledgement, request.message_id, request.token);
-        session
-            .send_application_data(&response.encode().unwrap())
-            .await
-            .unwrap();
-    };
+            let request = CoapMessage::decode(&repeated).unwrap();
+            let response = petition_accept_response(
+                CoapType::Acknowledgement,
+                request.message_id,
+                request.token,
+            );
+            session
+                .send_application_data(&response.encode().unwrap())
+                .await
+                .unwrap();
+        };
 
-    let mut commissioner =
-        Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr)
-            .await
-            .unwrap();
-    let ((), petition) = tokio::join!(server_task, commissioner.petition());
-    assert_eq!(petition.unwrap().session_id, 0x1234);
+        let petition = petition_over_dtls(CommissionerConfig::pskc("meshcop", pskc), border_addr);
+        let ((), petition) = tokio::join!(server_task, petition);
+        assert_eq!(petition.unwrap().session_id, 0x1234);
+    })
+    .await
 }
 
 #[tokio::test]
 async fn empty_ack_stops_retransmission_while_a_separate_response_is_pending() {
-    use meshcop_dtls::{DtlsServer, driver::DriverError};
+    with_slow_test_deadline(async {
+        use meshcop_dtls::{DtlsServer, driver::DriverError};
 
-    let pskc = [0x42u8; 16];
-    let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
-    let border_addr = server.local_addr();
-    let server_task = async move {
-        let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
-        let request_wire = session
-            .recv_application_data(Duration::from_secs(10))
-            .await
-            .unwrap();
-        let request = CoapMessage::decode(&request_wire).unwrap();
-        let ack = CoapMessage::empty_ack(request.message_id);
-        session
-            .send_application_data(&ack.encode().unwrap())
-            .await
-            .unwrap();
+        let pskc = [0x42u8; 16];
+        let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
+        let border_addr = server.local_addr();
+        let server_task = async move {
+            let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
+            let request_wire = session
+                .recv_application_data(Duration::from_secs(10))
+                .await
+                .unwrap();
+            let request = CoapMessage::decode(&request_wire).unwrap();
+            let ack = CoapMessage::empty_ack(request.message_id);
+            session
+                .send_application_data(&ack.encode().unwrap())
+                .await
+                .unwrap();
 
-        let unexpected = session.recv_application_data(Duration::from_secs(4)).await;
-        assert!(
-            matches!(unexpected, Err(DriverError::Timeout)),
-            "an acknowledged CoAP request must not be retransmitted: {unexpected:?}"
-        );
+            let unexpected = session.recv_application_data(Duration::from_secs(4)).await;
+            assert!(
+                matches!(unexpected, Err(DriverError::Timeout)),
+                "an acknowledged CoAP request must not be retransmitted: {unexpected:?}"
+            );
 
-        let response = petition_accept_response(
-            CoapType::NonConfirmable,
-            request.message_id.wrapping_add(1),
-            request.token,
-        );
-        session
-            .send_application_data(&response.encode().unwrap())
-            .await
-            .unwrap();
-    };
+            let response = petition_accept_response(
+                CoapType::NonConfirmable,
+                request.message_id.wrapping_add(1),
+                request.token,
+            );
+            session
+                .send_application_data(&response.encode().unwrap())
+                .await
+                .unwrap();
+        };
 
-    let mut commissioner =
-        Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr)
-            .await
-            .unwrap();
-    let ((), petition) = tokio::join!(server_task, commissioner.petition());
-    assert_eq!(petition.unwrap().session_id, 0x1234);
+        let petition = petition_over_dtls(CommissionerConfig::pskc("meshcop", pskc), border_addr);
+        let ((), petition) = tokio::join!(server_task, petition);
+        assert_eq!(petition.unwrap().session_id, 0x1234);
+    })
+    .await
 }
 
 #[tokio::test]
 async fn reset_fails_the_exchange_without_retransmitting() {
-    use meshcop_dtls::{DtlsServer, driver::DriverError};
+    with_slow_test_deadline(async {
+        use meshcop_dtls::{DtlsServer, driver::DriverError};
 
-    let pskc = [0x42u8; 16];
-    let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
-    let border_addr = server.local_addr();
-    let server_task = async move {
-        let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
-        let request_wire = session
-            .recv_application_data(Duration::from_secs(10))
-            .await
-            .unwrap();
-        let request = CoapMessage::decode(&request_wire).unwrap();
-        let mut reset = CoapMessage::empty_ack(request.message_id);
-        reset.ty = CoapType::Reset;
-        session
-            .send_application_data(&reset.encode().unwrap())
-            .await
-            .unwrap();
-        // The first CoAP retransmission would arrive after at least two
-        // seconds; a reset request must never be retransmitted.
-        let unexpected = session.recv_application_data(Duration::from_secs(3)).await;
+        let pskc = [0x42u8; 16];
+        let server = DtlsServer::bind("127.0.0.1:0").await.unwrap();
+        let border_addr = server.local_addr();
+        let server_task = async move {
+            let mut session = server.accept(&pskc, Duration::from_secs(10)).await.unwrap();
+            let request_wire = session
+                .recv_application_data(Duration::from_secs(10))
+                .await
+                .unwrap();
+            let request = CoapMessage::decode(&request_wire).unwrap();
+            let mut reset = CoapMessage::empty_ack(request.message_id);
+            reset.ty = CoapType::Reset;
+            session
+                .send_application_data(&reset.encode().unwrap())
+                .await
+                .unwrap();
+            // The first CoAP retransmission would arrive after at least two
+            // seconds; a reset request must never be retransmitted.
+            let unexpected = session.recv_application_data(Duration::from_secs(3)).await;
+            assert!(
+                matches!(unexpected, Err(DriverError::Timeout)),
+                "a reset CoAP request must not be retransmitted: {unexpected:?}"
+            );
+        };
+
+        let petition = async {
+            let (commissioner, _events) =
+                Commissioner::connect_only(CommissionerConfig::pskc("meshcop", pskc), border_addr)
+                    .await
+                    .unwrap();
+            let started = tokio::time::Instant::now();
+            let result = commissioner.petition().await;
+            (result, started.elapsed())
+        };
+        let ((), (petition, elapsed)) = tokio::join!(server_task, petition);
         assert!(
-            matches!(unexpected, Err(DriverError::Timeout)),
-            "a reset CoAP request must not be retransmitted: {unexpected:?}"
+            matches!(
+                petition,
+                Err(Error::InvalidState("CoAP request was reset by the peer"))
+            ),
+            "unexpected petition result {petition:?}"
         );
-    };
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a Reset must end the exchange immediately, took {elapsed:?}"
+        );
+    })
+    .await
+}
 
-    let mut commissioner =
-        Commissioner::connect(CommissionerConfig::pskc("meshcop", pskc), border_addr)
-            .await
-            .unwrap();
-    let petition = async {
-        let started = tokio::time::Instant::now();
-        let result = commissioner.petition().await;
-        (result, started.elapsed())
-    };
-    let ((), (petition, elapsed)) = tokio::join!(server_task, petition);
-    assert!(
-        matches!(
-            petition,
-            Err(Error::InvalidState("CoAP request was reset by the peer"))
-        ),
-        "unexpected petition result {petition:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "a Reset must end the exchange immediately, took {elapsed:?}"
-    );
+/// Opens a connect-only session and petitions over it, for tests whose
+/// border agent is driven alongside.
+async fn petition_over_dtls(
+    config: CommissionerConfig,
+    border_agent: SocketAddr,
+) -> crate::Result<PetitionResponse> {
+    let (commissioner, _events) = Commissioner::connect_only(config, border_agent).await?;
+    commissioner.petition().await
 }
 
 fn petition_accept_response(ty: CoapType, message_id: u16, token: Vec<u8>) -> CoapMessage {
@@ -394,215 +422,227 @@ fn petition_accept_response(ty: CoapType, message_id: u16, token: Vec<u8>) -> Co
 
 #[tokio::test]
 async fn multicast_commands_skip_the_response_wait() {
-    // A multicast announce-begin is non-confirmable: the client must not wait
-    // for a response, so a script with no response still succeeds.
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0xcafe)],
-        ),
-        exchange(CommissionerOperation::AnnounceBegin, []),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    commissioner.petition().await.unwrap();
-    commissioner
-        .announce_begin(0x07fff800, 1, 100, multicast_destination())
-        .await
-        .unwrap();
+    with_test_deadline(async {
+        // A multicast announce-begin is non-confirmable: the client must not wait
+        // for a response, so a script with no response still succeeds.
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0xcafe)],
+            ),
+            exchange(CommissionerOperation::AnnounceBegin, []),
+        ]);
+        let (commissioner, _commissioner_events) = scripted_commissioner(script, []).await;
+        commissioner.petition().await.unwrap();
+        commissioner
+            .announce_begin(0x07fff800, 1, 100, multicast_destination())
+            .await
+            .unwrap();
 
-    let request = &commissioner
-        .scripted_transport()
-        .unwrap()
-        .observed_requests()[1];
-    assert_eq!(request.message.ty, CoapType::NonConfirmable);
-    assert_eq!(logical_message(request).ty, CoapType::NonConfirmable);
+        let request = &commissioner
+            .scripted_transport()
+            .unwrap()
+            .observed_requests()[1];
+        assert_eq!(request.message.ty, CoapType::NonConfirmable);
+        assert_eq!(logical_message(request).ty, CoapType::NonConfirmable);
+    })
+    .await
 }
 
 #[tokio::test]
 async fn clear_joiner_handler_drops_sessions_and_restores_raw_events() {
-    let mut rng = rand_core::OsRng;
-    let joiner = meshcop_dtls::ThreadDtlsHandshake::new(b"J01NME", &mut rng);
-    let client_hello = joiner
-        .client_hello_state()
-        .unwrap()
-        .next_client_hello_record()
-        .unwrap()
-        .encode()
-        .unwrap();
-    let joiner_iid = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
-
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0x1234)],
-        ),
-        exchange(
-            CommissionerOperation::GetActiveDataset,
-            [
-                ScriptedResponse::Raw(joiner_sessions::relay_rx_message(
-                    &joiner_iid,
-                    &client_hello,
-                )),
-                ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
-            ],
-        ),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    let mut handler = StaticJoinerHandler::new();
-    handler.enable_all("J01NME");
-    commissioner.set_joiner_handler(handler);
-    // Clearing the handler before the relay arrives means the raw payload is
-    // surfaced as a JoinerMessage event instead of being consumed.
-    commissioner.clear_joiner_handler();
-    commissioner.petition().await.unwrap();
-    commissioner
-        .get_active_dataset(DatasetFlags::NETWORK_NAME)
-        .await
-        .unwrap();
-    assert_eq!(
-        commissioner.next_event().await.unwrap(),
-        Some(CommissionerEvent::JoinerMessage {
-            joiner_id: joiner_iid.to_vec(),
-            port: 1000,
-            payload: client_hello,
-        })
-    );
-    assert!(
-        commissioner
-            .scripted_transport()
+    with_test_deadline(async {
+        let mut rng = rand_core::OsRng;
+        let joiner = meshcop_dtls::ThreadDtlsHandshake::new(b"J01NME", &mut rng);
+        let client_hello = joiner
+            .client_hello_state()
             .unwrap()
-            .sent_messages()
-            .is_empty()
-    );
+            .next_client_hello_record()
+            .unwrap()
+            .encode()
+            .unwrap();
+        let joiner_iid = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0x1234)],
+            ),
+            exchange(
+                CommissionerOperation::GetActiveDataset,
+                [
+                    ScriptedResponse::Raw(joiner_sessions::relay_rx_message(
+                        &joiner_iid,
+                        &client_hello,
+                    )),
+                    ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
+                ],
+            ),
+        ]);
+        let (commissioner, mut commissioner_events) = scripted_commissioner(script, []).await;
+        let mut handler = StaticJoinerHandler::new();
+        handler.enable_all("J01NME");
+        commissioner.set_joiner_handler(handler).unwrap();
+        // Clearing the handler before the relay arrives means the raw payload is
+        // surfaced as a JoinerMessage event instead of being consumed.
+        commissioner.clear_joiner_handler().unwrap();
+        commissioner.petition().await.unwrap();
+        commissioner
+            .get_active_dataset(DatasetFlags::NETWORK_NAME)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut commissioner_events).await,
+            Some(CommissionerEvent::JoinerMessage {
+                joiner_id: joiner_iid.to_vec(),
+                port: 1000,
+                payload: client_hello,
+            })
+        );
+        assert!(
+            commissioner
+                .scripted_transport()
+                .unwrap()
+                .sent_messages()
+                .is_empty()
+        );
+    })
+    .await
 }
 
 #[tokio::test]
 async fn proxied_commands_pick_confirmability_from_the_destination() {
-    // Unicast destinations are confirmable (the client waits for a response);
-    // multicast destinations are non-confirmable (fire-and-forget).
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0xcafe)],
-        ),
-        exchange(
-            CommissionerOperation::Reenroll,
-            [ScriptedResponse::accept()],
-        ),
-        exchange(CommissionerOperation::Reenroll, []),
-        exchange(
-            CommissionerOperation::DomainReset,
-            [ScriptedResponse::accept()],
-        ),
-        exchange(CommissionerOperation::DomainReset, []),
-        exchange(CommissionerOperation::Migrate, [ScriptedResponse::accept()]),
-        exchange(CommissionerOperation::Migrate, []),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    commissioner.petition().await.unwrap();
+    with_test_deadline(async {
+        // Unicast destinations are confirmable (the client waits for a response);
+        // multicast destinations are non-confirmable (fire-and-forget).
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0xcafe)],
+            ),
+            exchange(
+                CommissionerOperation::Reenroll,
+                [ScriptedResponse::accept()],
+            ),
+            exchange(CommissionerOperation::Reenroll, []),
+            exchange(
+                CommissionerOperation::DomainReset,
+                [ScriptedResponse::accept()],
+            ),
+            exchange(CommissionerOperation::DomainReset, []),
+            exchange(CommissionerOperation::Migrate, [ScriptedResponse::accept()]),
+            exchange(CommissionerOperation::Migrate, []),
+        ]);
+        let (commissioner, _commissioner_events) = scripted_commissioner(script, []).await;
+        commissioner.petition().await.unwrap();
 
-    commissioner
-        .command_reenroll(unicast_destination())
-        .await
-        .unwrap();
-    commissioner
-        .command_reenroll(multicast_destination())
-        .await
-        .unwrap();
-    commissioner
-        .command_domain_reset(unicast_destination())
-        .await
-        .unwrap();
-    commissioner
-        .command_domain_reset(multicast_destination())
-        .await
-        .unwrap();
-    commissioner
-        .command_migrate(unicast_destination(), "net")
-        .await
-        .unwrap();
-    commissioner
-        .command_migrate(multicast_destination(), "net")
-        .await
-        .unwrap();
+        commissioner
+            .command_reenroll(unicast_destination())
+            .await
+            .unwrap();
+        commissioner
+            .command_reenroll(multicast_destination())
+            .await
+            .unwrap();
+        commissioner
+            .command_domain_reset(unicast_destination())
+            .await
+            .unwrap();
+        commissioner
+            .command_domain_reset(multicast_destination())
+            .await
+            .unwrap();
+        commissioner
+            .command_migrate(unicast_destination(), "net")
+            .await
+            .unwrap();
+        commissioner
+            .command_migrate(multicast_destination(), "net")
+            .await
+            .unwrap();
 
-    let requests = commissioner
-        .scripted_transport()
-        .unwrap()
-        .observed_requests();
-    // Requests 1..7 alternate unicast (confirmable) / multicast (non-confirmable).
-    for (idx, expected) in [
-        CoapType::Confirmable,
-        CoapType::NonConfirmable,
-        CoapType::Confirmable,
-        CoapType::NonConfirmable,
-        CoapType::Confirmable,
-        CoapType::NonConfirmable,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        assert_eq!(
-            logical_message(&requests[idx + 1]).ty,
-            expected,
-            "request {idx}"
-        );
-    }
+        let requests = commissioner
+            .scripted_transport()
+            .unwrap()
+            .observed_requests();
+        // Requests 1..7 alternate unicast (confirmable) / multicast (non-confirmable).
+        for (idx, expected) in [
+            CoapType::Confirmable,
+            CoapType::NonConfirmable,
+            CoapType::Confirmable,
+            CoapType::NonConfirmable,
+            CoapType::Confirmable,
+            CoapType::NonConfirmable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                logical_message(&requests[idx + 1]).ty,
+                expected,
+                "request {idx}"
+            );
+        }
+    })
+    .await
 }
 
 #[tokio::test]
 async fn non_confirmable_proxied_responses_are_not_acknowledged() {
-    let leader: Ipv6Addr = "fd00:db8::ff:fe00:fc00".parse().unwrap();
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0x1234)],
-        ),
-        // A confirmable matched proxied response must be acknowledged through
-        // the proxy; a non-confirmable one must not.
-        exchange(
-            CommissionerOperation::GetCommissionerDataset,
-            [ScriptedResponse::proxied(
-                leader,
-                ScriptedResponse::Content {
-                    payload: dataset_with_name("confirmable").to_bytes().unwrap(),
-                    confirmable: true,
-                },
-            )],
-        ),
-        exchange(
-            CommissionerOperation::GetCommissionerDataset,
-            [ScriptedResponse::proxied(
-                leader,
-                ScriptedResponse::content(dataset_with_name("plain").to_bytes().unwrap()),
-            )],
-        ),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    commissioner.petition().await.unwrap();
+    with_test_deadline(async {
+        let leader: Ipv6Addr = "fd00:db8::ff:fe00:fc00".parse().unwrap();
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0x1234)],
+            ),
+            // A confirmable matched proxied response must be acknowledged through
+            // the proxy; a non-confirmable one must not.
+            exchange(
+                CommissionerOperation::GetCommissionerDataset,
+                [ScriptedResponse::proxied(
+                    leader,
+                    ScriptedResponse::Content {
+                        payload: dataset_with_name("confirmable").to_bytes().unwrap(),
+                        confirmable: true,
+                    },
+                )],
+            ),
+            exchange(
+                CommissionerOperation::GetCommissionerDataset,
+                [ScriptedResponse::proxied(
+                    leader,
+                    ScriptedResponse::content(dataset_with_name("plain").to_bytes().unwrap()),
+                )],
+            ),
+        ]);
+        let (commissioner, _commissioner_events) = scripted_commissioner(script, []).await;
+        commissioner.petition().await.unwrap();
 
-    commissioner
-        .get_commissioner_dataset(CommissionerDatasetFlags::STEERING_DATA)
-        .await
-        .unwrap();
-    let acks_after_confirmable = commissioner
-        .scripted_transport()
-        .unwrap()
-        .sent_messages()
-        .len();
-    assert_eq!(acks_after_confirmable, 1, "confirmable response is acked");
+        commissioner
+            .get_commissioner_dataset(CommissionerDatasetFlags::STEERING_DATA)
+            .await
+            .unwrap();
+        let acks_after_confirmable = commissioner
+            .scripted_transport()
+            .unwrap()
+            .sent_messages()
+            .len();
+        assert_eq!(acks_after_confirmable, 1, "confirmable response is acked");
 
-    commissioner
-        .get_commissioner_dataset(CommissionerDatasetFlags::STEERING_DATA)
-        .await
-        .unwrap();
-    let acks_after_plain = commissioner
-        .scripted_transport()
-        .unwrap()
-        .sent_messages()
-        .len();
-    assert_eq!(
-        acks_after_plain, acks_after_confirmable,
-        "non-confirmable response must not be acked"
-    );
+        commissioner
+            .get_commissioner_dataset(CommissionerDatasetFlags::STEERING_DATA)
+            .await
+            .unwrap();
+        let acks_after_plain = commissioner
+            .scripted_transport()
+            .unwrap()
+            .sent_messages()
+            .len();
+        assert_eq!(
+            acks_after_plain, acks_after_confirmable,
+            "non-confirmable response must not be acked"
+        );
+    })
+    .await
 }

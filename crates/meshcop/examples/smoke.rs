@@ -8,7 +8,7 @@ use meshcop::{
 #[path = "support/mod.rs"]
 mod support;
 
-#[tokio::main]
+#[tokio::main(flavor = "local")]
 async fn main() -> meshcop::Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let show_secrets = support::show_secrets_requested(&mut args);
@@ -21,9 +21,8 @@ async fn main() -> meshcop::Result<()> {
 
     let dataset = Dataset::from_hex(dataset_hex)?;
     let config = CommissionerConfig::from_dataset("meshcop-smoke", &dataset)?;
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    let (commissioner, _events) = Commissioner::connect(config, border_agent).await?;
 
-    commissioner.petition().await?;
     let smoke_result = async {
         commissioner.keep_alive().await?;
         let active = commissioner.get_active_dataset(DatasetFlags::EMPTY).await?;

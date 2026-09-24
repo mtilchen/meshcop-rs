@@ -1,6 +1,9 @@
 # Design: commissioner session driver
 
-Status: draft for discussion. Nothing here is implemented.
+Status: phase 1 is implemented (see "Phasing" and "Phase 1 as built").
+Phases 2–4 are not.
+
+The "Problem" section describes the library as it was before phase 1.
 
 ## Problem
 
@@ -250,8 +253,8 @@ Surface changes:
   - `next_event()`, replaced by `Events`.
   - `socket()`, since the driver owns the socket.
   - `disconnect()`, replaced by `resign()` or dropping the handle.
-  - `set_joiner_handler` and `clear_joiner_handler`, which move to the
-    builder. A runtime setter can come back if a use case appears.
+- **Kept as runtime setters:** `set_joiner_handler` and
+  `clear_joiner_handler` (see "Phase 1 as built").
 - **`CommissionerEvent` becomes `#[non_exhaustive]`,** so lifecycle events
   can be added without a breaking change.
 
@@ -439,6 +442,46 @@ driver task.
   - `README.md` and `CLAUDE.md`: update the "keep-alives are
     application-driven" notes.
   - `CommissionerConfig::keepalive_interval`: update its doc comment.
+
+## Phase 1 as built
+
+Where the implementation departs from, or makes concrete, the design above:
+
+- **The joiner handler is still set at runtime.** `set_joiner_handler` and
+  `clear_joiner_handler` stay on the handle rather than moving to the builder,
+  because the CLI replaces the handler whenever `joiner enable` changes the
+  enabled set. They return `Result`, failing with `SessionClosed` once the
+  session has ended.
+- **Commands travel on an unbounded channel.** Every command carries a reply
+  channel its caller awaits, so the queue is bounded by the number of waiting
+  callers, and `set_joiner_handler` can stay synchronous.
+- **`resign()` also closes an unpetitioned session.** On a connect-only
+  session there is nothing to resign, so it just ends the session.
+- **`resign()` always ends the session**, even when the border agent does not
+  confirm it; the error then reports the missing confirmation.
+- **Recovery is not implemented.** Every session loss closes the session with
+  a `CloseReason` and publishes `SessionLost`, which matches
+  `Recovery::Never`. There is no `recovery` setting yet.
+- **`max_in_flight` is fixed at 1** and not configurable yet.
+- **Peer close.** `meshcop-dtls` now reports an authenticated `close_notify`
+  as `Error::PeerClosed`. A connect-only session treats it as normal (status
+  `Idle`, reopened on the next request); an active one ends with
+  `CloseReason::PeerClosed`.
+- **Response matching only accepts responses.** A message is matched to a
+  request by token only when its code is a response code, so a notification
+  whose token happens to equal a request's cannot complete it.
+- **Closing does not send `close_notify`.** Ending a session drops the DTLS
+  state without telling the border agent, which then keeps its side until
+  its own timeout. This predates phase 1; sending `close_notify` on close is
+  a follow-up.
+- **Runtimes.** The driver is `Send` and started with `tokio::spawn`, which
+  also works on a `LocalRuntime` (stable since Tokio 1.51). The examples run
+  on `#[tokio::main(flavor = "local")]`.
+
+Verified against the live OpenThread border agent: an active session sent
+keep-alives at 30 s and 60 s with no application activity and served a proxied
+request afterwards, and a connect-only session went `Idle` at 50 s and reopened
+for the next request.
 
 ## Phasing
 

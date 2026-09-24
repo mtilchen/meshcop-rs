@@ -4,23 +4,21 @@ impl Interpreter {
     // --- session lifecycle ---
 
     pub(super) fn cmd_state(&self) -> CommandValue {
-        let state = match &self.commissioner {
-            None => CommissionerState::Disabled,
-            Some(c) => c.state(),
-        };
-        CommandValue::ok(match state {
-            CommissionerState::Disabled => "disabled",
-            CommissionerState::Connected => "connected",
-            CommissionerState::Petitioning => "petitioning",
-            CommissionerState::Active => "active",
+        let status = self.commissioner.as_ref().map(Commissioner::status);
+        CommandValue::ok(match status {
+            Some(SessionStatus::Connected | SessionStatus::Idle) => "connected",
+            Some(SessionStatus::Petitioning) => "petitioning",
+            Some(SessionStatus::Active { .. }) => "active",
+            // A closed session and any future status read as disabled.
+            None | Some(_) => "disabled",
         })
     }
 
     pub(super) fn cmd_active(&self) -> CommandValue {
-        let active = matches!(
-            self.commissioner.as_ref().map(|c| c.state()),
-            Some(CommissionerState::Active)
-        );
+        let active = self
+            .commissioner
+            .as_ref()
+            .is_some_and(|c| c.status().is_active());
         CommandValue::ok(if active { "true" } else { "false" })
     }
 
@@ -49,11 +47,13 @@ impl Interpreter {
             Ok(config) => config,
             Err(err) => return CommandValue::failed(err.to_string()),
         };
-        let mut commissioner = match Commissioner::connect(config, address).await {
-            Ok(c) => c,
+        let (commissioner, events) = match Commissioner::connect_only(config, address).await {
+            Ok(session) => session,
             Err(err) => return CommandValue::failed(err.to_string()),
         };
-        self.install_joiner_handler(&mut commissioner);
+        if let Err(err) = self.install_joiner_handler(&commissioner) {
+            return CommandValue::failed(err.to_string());
+        }
         // Petition unless `--connect-only`. A border agent that accepts the
         // petition echoes our own Commissioner ID back in the response; that is
         // not a conflict, so an accepted petition (`Ok`) is success. Only
@@ -66,20 +66,16 @@ impl Interpreter {
         };
         // Keep the connected session regardless of the petition outcome so the
         // user can inspect `state` and `stop` to disconnect, as the C++ CLI does.
-        self.keepalive_deadline = None;
+        // Keep-alives run in the session itself once the petition is accepted.
         self.commissioner = Some(commissioner);
-        self.schedule_keepalive();
+        self.events = Some(events);
         petition_result.into()
     }
 
     pub(super) async fn cmd_stop(&mut self) -> CommandValue {
-        self.keepalive_deadline = None;
-        match self.commissioner.as_mut() {
-            Some(commissioner) => {
-                let result = commissioner.resign().await;
-                self.commissioner = None;
-                result.into()
-            }
+        self.events = None;
+        match self.commissioner.take() {
+            Some(commissioner) => commissioner.resign().await.into(),
             None => CommandValue::done(),
         }
     }

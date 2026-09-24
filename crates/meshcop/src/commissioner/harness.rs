@@ -7,10 +7,10 @@
 //! DTLS has delivered application data.
 //!
 //! This harness scripts that post-DTLS MeshCoP layer. Each public API call still
-//! builds a real [`crate::meshcop::CoapMessage`], advances commissioner state,
-//! and runs the production incoming-message loop (token correlation, empty-ACK
-//! skipping, UDP_RX decapsulation, and notification routing) over the scripted
-//! message stream. Crypto and wire-level DTLS behavior remain covered by the
+//! builds a real [`crate::meshcop::CoapMessage`] and runs through the
+//! production session driver (identity assignment, token correlation,
+//! empty-ACK handling, retransmission, UDP_RX decapsulation, and notification
+//! routing) over the scripted message stream. Crypto and wire-level DTLS behavior remain covered by the
 //! dedicated `dtls` and `crypto` tests.
 //!
 //! This module is gated behind the `test-support` feature (and always built
@@ -19,6 +19,7 @@
 
 use std::collections::VecDeque;
 use std::net::Ipv6Addr;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::{
     Result,
@@ -114,6 +115,12 @@ pub enum ScriptedResponse {
     Raw(CoapMessage),
     /// An empty Reset rejecting the request's message ID.
     Reset,
+    /// The border agent closes the DTLS session with `close_notify` instead
+    /// of answering.
+    PeerClosed,
+    /// Receiving fails as if the socket reported an error, for example an
+    /// ICMP port-unreachable after the border agent went away.
+    TransportFailure,
     /// A response wrapped in a UDP_RX.ntf encapsulation.
     ///
     /// The inner template is rendered against the request encapsulated in the
@@ -241,6 +248,11 @@ impl ScriptedResponse {
                 reset.ty = CoapType::Reset;
                 reset
             }
+            Self::PeerClosed | Self::TransportFailure => {
+                return Err(Error::InvalidState(
+                    "a scripted connection event is not a message",
+                ));
+            }
             Self::UdpRx {
                 source_address,
                 source_port,
@@ -300,38 +312,66 @@ pub fn udp_rx_message(
 }
 
 /// Scripted post-DTLS MeshCoP transport.
-#[derive(Debug, Default)]
+///
+/// Clones share one script, so a test can keep a clone to inspect what the
+/// session sent while the session's driver consumes the script.
+#[derive(Debug, Clone, Default)]
 pub struct ScriptedMeshcopTransport {
+    state: Arc<Mutex<ScriptState>>,
+}
+
+#[derive(Debug, Default)]
+struct ScriptState {
     exchanges: VecDeque<ScriptedExchange>,
     observed_requests: Vec<ObservedRequest>,
     sent_messages: Vec<CoapMessage>,
+    incoming: VecDeque<ScriptedIncoming>,
+    sends_fail: bool,
+}
+
+/// What the client receives next from the scripted border agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScriptedIncoming {
+    /// A MeshCoP message.
+    Message(CoapMessage),
+    /// The border agent closed the DTLS session.
+    PeerClosed,
+    /// The socket reported an error.
+    TransportFailure,
 }
 
 impl ScriptedMeshcopTransport {
     /// Creates a transport from the ordered exchange script.
     pub fn new(exchanges: impl IntoIterator<Item = ScriptedExchange>) -> Self {
         Self {
-            exchanges: exchanges.into_iter().collect(),
-            observed_requests: Vec::new(),
-            sent_messages: Vec::new(),
+            state: Arc::new(Mutex::new(ScriptState {
+                exchanges: exchanges.into_iter().collect(),
+                ..ScriptState::default()
+            })),
         }
     }
 
+    fn state(&self) -> MutexGuard<'_, ScriptState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Returns requests observed so far.
-    pub fn observed_requests(&self) -> &[ObservedRequest] {
-        &self.observed_requests
+    pub fn observed_requests(&self) -> Vec<ObservedRequest> {
+        self.state().observed_requests.clone()
     }
 
     /// Returns every message the client sent outside of exchanges, such as
-    /// ACKs for confirmable responses and proxied acknowledgements.
-    pub fn sent_messages(&self) -> &[CoapMessage] {
-        &self.sent_messages
+    /// ACKs for confirmable responses, proxied acknowledgements, relayed
+    /// joiner records, and retransmissions.
+    pub fn sent_messages(&self) -> Vec<CoapMessage> {
+        self.state().sent_messages.clone()
     }
 
     /// Returns confirmable response message IDs for which the client generated
     /// an empty ACK.
     pub fn acked_confirmable_responses(&self) -> Vec<u16> {
-        self.sent_messages
+        self.state()
+            .sent_messages
             .iter()
             .filter(|message| {
                 message.ty == CoapType::Acknowledgement && message.code == CoapCode::EMPTY
@@ -342,44 +382,77 @@ impl ScriptedMeshcopTransport {
 
     /// Returns the number of exchanges not yet consumed.
     pub fn remaining_exchange_count(&self) -> usize {
-        self.exchanges.len()
+        self.state().exchanges.len()
+    }
+
+    /// Makes every later send fail with an I/O error, as a socket does once
+    /// the network path is gone.
+    pub fn fail_sends(&self) {
+        self.state().sends_fail = true;
+    }
+
+    fn check_send(&self) -> Result<()> {
+        if self.state().sends_fail {
+            return Err(Error::Io(std::io::Error::other("scripted send failure")));
+        }
+        Ok(())
     }
 
     /// Records a non-exchange message sent by the client.
-    pub(crate) fn record_sent(&mut self, message: CoapMessage) {
-        self.sent_messages.push(message);
+    pub(crate) fn record_sent(&self, message: CoapMessage) -> Result<()> {
+        self.check_send()?;
+        self.state().sent_messages.push(message);
+        Ok(())
     }
 
-    /// Consumes the next scripted exchange and returns its incoming stream.
-    pub(crate) fn exchange(
-        &mut self,
-        operation: CommissionerOperation,
-        request: CoapMessage,
-    ) -> Result<VecDeque<CoapMessage>> {
-        let exchange = self
+    /// Takes the next scripted message for the client to receive.
+    pub(crate) fn next_incoming(&self) -> Option<ScriptedIncoming> {
+        self.state().incoming.pop_front()
+    }
+
+    /// Consumes the next scripted exchange for a new request and queues its
+    /// responses for the client to receive.
+    ///
+    /// The request's URI (after UDP_TX decapsulation) must match the scripted
+    /// operation's URI.
+    pub(crate) fn exchange(&self, request: &CoapMessage) -> Result<()> {
+        self.check_send()?;
+        let encoded = request.encode()?;
+        let request = CoapMessage::decode(&encoded)?;
+        let logical_request = decapsulated_request(&request)?;
+        let mut state = self.state();
+        let exchange = state
             .exchanges
             .pop_front()
             .ok_or(Error::InvalidState("scripted MeshCoP exchange missing"))?;
-        if exchange.operation != operation {
+        if logical_request.uri_path()?.as_deref() != Some(exchange.operation.uri_path()) {
             return Err(Error::InvalidState("scripted MeshCoP operation mismatch"));
         }
-
-        let encoded = request.encode()?;
-        let request = CoapMessage::decode(&encoded)?;
-        self.observed_requests.push(ObservedRequest {
-            operation,
-            message: request.clone(),
+        state.observed_requests.push(ObservedRequest {
+            operation: exchange.operation,
+            message: request,
         });
-
-        let logical_request = decapsulated_request(&request)?;
-        let mut incoming = VecDeque::new();
         for template in exchange.responses {
+            match template {
+                ScriptedResponse::PeerClosed => {
+                    state.incoming.push_back(ScriptedIncoming::PeerClosed);
+                    continue;
+                }
+                ScriptedResponse::TransportFailure => {
+                    state.incoming.push_back(ScriptedIncoming::TransportFailure);
+                    continue;
+                }
+                _ => {}
+            }
             let message = template.into_message(&logical_request)?;
             // Round-trip through the wire form so the client sees exactly what
             // a live border agent would deliver.
-            incoming.push_back(CoapMessage::decode(&message.encode()?)?);
+            let delivered = CoapMessage::decode(&message.encode()?)?;
+            state
+                .incoming
+                .push_back(ScriptedIncoming::Message(delivered));
         }
-        Ok(incoming)
+        Ok(())
     }
 }
 
@@ -407,4 +480,41 @@ fn state_payload(state: MeshcopState) -> Vec<u8> {
     let mut payload = Vec::new();
     append_tlv(&mut payload, TLV_STATE, &[state.to_wire()]);
     payload
+}
+
+/// Wall-clock bound on any test run through [`run_with_deadline`], enforced
+/// from outside the async runtime.
+const WATCHDOG_LIMIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Runs a test body under an async `deadline` and a wall-clock watchdog.
+///
+/// The deadline fails a test whose session stalls. The watchdog covers what
+/// the deadline cannot: a session task that spins without yielding blocks the
+/// runtime's timers, and one that never goes idle stops paused time from
+/// advancing. If the body runs longer than 15 seconds of wall-clock time, the
+/// watchdog aborts the test process, which the mutation gate reports as a
+/// failure rather than a timeout. Unstable test scaffolding for this
+/// workspace's suites; not a supported public API.
+pub async fn run_with_deadline(
+    deadline: std::time::Duration,
+    body: impl std::future::Future<Output = ()>,
+) {
+    let (finished, watched) = std::sync::mpsc::channel::<()>();
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("unnamed test")
+        .to_owned();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            watched.recv_timeout(WATCHDOG_LIMIT)
+        {
+            eprintln!("{test} ran for more than {WATCHDOG_LIMIT:?}; aborting the test process");
+            std::process::abort();
+        }
+    });
+    // Boxed: wrapping large handshake futures would otherwise overflow the
+    // test thread's stack.
+    let outcome = tokio::time::timeout(deadline, Box::pin(body)).await;
+    drop(finished);
+    assert!(outcome.is_ok(), "test exceeded its deadline");
 }

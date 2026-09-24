@@ -31,6 +31,8 @@ fi
 # Production surfaces of each targeted shard; `all` runs both.
 meshcop_files=(
   'crates/meshcop/src/commissioner/client/*.rs'
+  'crates/meshcop/src/commissioner/client/driver/*.rs'
+  crates/meshcop/src/commissioner/events.rs
   crates/meshcop/src/commissioner/joiner.rs
   crates/meshcop/src/meshcop/coap.rs
   'crates/meshcop/src/meshcop/diag/*.rs'

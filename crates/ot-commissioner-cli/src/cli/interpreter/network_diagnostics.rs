@@ -5,7 +5,7 @@ impl Interpreter {
         if tokens.len() < 3 {
             return CommandValue::failed(SYNTAX_FEW_ARGS);
         }
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         match tokens[1].as_str() {

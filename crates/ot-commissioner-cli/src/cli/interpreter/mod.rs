@@ -16,8 +16,8 @@ use zeroize::Zeroizing;
 
 use meshcop::{
     commissioner::{
-        Commissioner, CommissionerDatasetFlags, CommissionerEvent, CommissionerState, DatasetFlags,
-        ResultCode, StaticJoinerHandler,
+        Commissioner, CommissionerDatasetFlags, CommissionerEvent, DatasetFlags, Events,
+        SessionStatus, StaticJoinerHandler,
     },
     crypto::compute_joiner_id,
     dataset::Dataset,
@@ -31,19 +31,6 @@ use super::value::CommandValue;
 const SYNTAX_FEW_ARGS: &str = "too few arguments";
 const NOT_CONNECTED: &str = "commissioner is not started; run 'start' first";
 
-// A commissioner operation owns the transport until its response arrives, so
-// a keep-alive cannot safely be interleaved with an in-flight command. The
-// longest current command paths perform two serial MeshCoP exchanges (a
-// mesh-local-prefix read followed by a proxied request). Reserving both
-// exchange budgets plus a processing margin before dispatch keeps those
-// network waits inside the minimum 30-second keep-alive interval.
-const LONGEST_COMMAND_EXCHANGES: u64 = 2;
-const COMMAND_PROCESSING_MARGIN: Duration = Duration::from_secs(4);
-const COMMAND_KEEPALIVE_HEADROOM: Duration = Duration::from_secs(
-    LONGEST_COMMAND_EXCHANGES * Commissioner::EXCHANGE_TIMEOUT.as_secs()
-        + COMMAND_PROCESSING_MARGIN.as_secs(),
-);
-
 /// One parsed REPL command line.
 type Tokens = Vec<String>;
 
@@ -51,10 +38,11 @@ type Tokens = Vec<String>;
 pub struct Interpreter {
     config: CliConfig,
     commissioner: Option<Commissioner>,
+    /// Events of the current session; `None` once the stream has ended.
+    events: Option<Events>,
     /// Joiner PSKds keyed by joiner ID, applied via a [`StaticJoinerHandler`].
     joiner_pskds: HashMap<[u8; 8], Zeroizing<String>>,
     joiner_all_pskd: Option<Zeroizing<String>>,
-    keepalive_deadline: Option<tokio::time::Instant>,
     energy_reports: Vec<(String, u32, Vec<u8>)>,
     panid_conflicts: Vec<(String, u32, u16)>,
     should_exit: bool,
@@ -66,9 +54,9 @@ impl Interpreter {
         Self {
             config,
             commissioner: None,
+            events: None,
             joiner_pskds: HashMap::new(),
             joiner_all_pskd: None,
-            keepalive_deadline: None,
             energy_reports: Vec::new(),
             panid_conflicts: Vec::new(),
             should_exit: false,
@@ -80,125 +68,27 @@ impl Interpreter {
         self.should_exit
     }
 
-    /// Returns the absolute deadline for the next application-driven
-    /// commissioner keep-alive.
-    pub(super) fn keepalive_deadline(&self) -> Option<tokio::time::Instant> {
-        self.keepalive_deadline
-    }
-
-    /// Sends a scheduled or proactive keep-alive for the REPL loop.
-    ///
-    /// An accepted response re-arms the absolute deadline. Pending, rejected,
-    /// and failed exchanges disconnect the unusable session so the application
-    /// cannot continue without keep-alives.
-    pub(super) async fn handle_scheduled_keepalive(&mut self) -> meshcop::Result<()> {
-        self.keepalive_deadline = None;
-        let (result, deferred_events, callback_result) = {
-            let commissioner = self
-                .commissioner
-                .as_mut()
-                .ok_or(meshcop::Error::InvalidState("commissioner is not started"))?;
-            if commissioner.state() != CommissionerState::Active {
-                return Err(meshcop::Error::InvalidState(
-                    "commissioner session is not active",
-                ));
-            }
-
-            let result = match commissioner.keep_alive().await {
-                Ok(result) => result,
-                Err(err) => {
-                    commissioner.disconnect();
-                    return Err(err);
-                }
-            };
-            let mut deferred_events = Vec::new();
-            let callback_result = loop {
-                let event = match commissioner.next_event().await {
-                    Ok(Some(event)) => event,
-                    Ok(None) => {
-                        commissioner.disconnect();
-                        return Err(meshcop::Error::InvalidState(
-                            "keep-alive response event was not queued",
-                        ));
-                    }
-                    Err(err) => {
-                        commissioner.disconnect();
-                        return Err(err);
-                    }
-                };
-                match event {
-                    CommissionerEvent::KeepAliveResponse(callback_result) => {
-                        break callback_result;
-                    }
-                    other => deferred_events.push(other),
-                }
-            };
-            (result, deferred_events, callback_result)
+    /// Waits for the current session's next event. Never completes while no
+    /// session is running, so the REPL can wait on it alongside input.
+    pub(super) async fn next_event(&mut self) -> Option<CommissionerEvent> {
+        let Some(events) = self.events.as_mut() else {
+            return std::future::pending().await;
         };
-
-        for event in deferred_events {
-            self.record_event(event);
+        let event = events.next().await;
+        if event.is_none() {
+            self.events = None;
         }
-        if callback_result != result {
-            if let Some(commissioner) = self.commissioner.as_mut() {
-                commissioner.disconnect();
-            }
-            return Err(meshcop::Error::InvalidState(
-                "keep-alive result and callback did not match",
-            ));
-        }
-        match result {
-            ResultCode::Accept => {
-                self.schedule_keepalive();
-                Ok(())
-            }
-            ResultCode::Pending => {
-                if let Some(commissioner) = self.commissioner.as_mut() {
-                    commissioner.disconnect();
-                }
-                Err(meshcop::Error::InvalidState(
-                    "scheduled keep-alive response is pending",
-                ))
-            }
-            ResultCode::Reject => {
-                if let Some(commissioner) = self.commissioner.as_mut() {
-                    commissioner.disconnect();
-                }
-                Err(meshcop::Error::InvalidState(
-                    "scheduled keep-alive was rejected",
-                ))
-            }
-        }
+        event
     }
 
-    fn schedule_keepalive(&mut self) {
-        self.keepalive_deadline = self
-            .commissioner
-            .as_ref()
-            .filter(|commissioner| commissioner.state() == CommissionerState::Active)
-            .and_then(|commissioner| {
-                tokio::time::Instant::now().checked_add(commissioner.config().keepalive_interval)
-            });
-    }
-
-    async fn refresh_keepalive_before_command(&mut self, tokens: &Tokens) -> meshcop::Result<()> {
-        if !command_may_wait_for_commissioner(tokens) {
-            return Ok(());
+    /// Records an event that arrived while the REPL was waiting for input,
+    /// and returns a message to show for a lost session.
+    pub(super) fn handle_background_event(&mut self, event: CommissionerEvent) -> Option<String> {
+        if let CommissionerEvent::SessionLost { reason } = &event {
+            return Some(format!("commissioner session lost: {reason}"));
         }
-        let Some(deadline) = self.keepalive_deadline else {
-            return Ok(());
-        };
-        // A replacement start can spend several receive windows establishing
-        // the new DTLS session, while the current commissioner remains active
-        // until that attempt succeeds. Refresh it regardless of headroom.
-        let starts_replacement = tokens.first().is_some_and(|token| token == "start");
-        if !starts_replacement
-            && deadline.saturating_duration_since(tokio::time::Instant::now())
-                > COMMAND_KEEPALIVE_HEADROOM
-        {
-            return Ok(());
-        }
-        self.handle_scheduled_keepalive().await
+        self.record_event(event);
+        None
     }
 
     /// Evaluates one input line and prints the result.
@@ -220,10 +110,6 @@ impl Interpreter {
                  which is not implemented in this build",
             )
             .print();
-            return;
-        }
-        if let Err(err) = self.refresh_keepalive_before_command(&tokens).await {
-            CommandValue::failed(format!("keep-alive failed: {err}")).print();
             return;
         }
         let value = self.dispatch(&tokens).await;

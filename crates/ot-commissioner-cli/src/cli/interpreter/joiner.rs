@@ -15,7 +15,7 @@ impl Interpreter {
                 if tokens.len() < 3 || tokens[2] != "locator" {
                     return CommandValue::failed("only 'borderagent get locator' is supported");
                 }
-                let Some(commissioner) = self.commissioner.as_mut() else {
+                let Some(commissioner) = self.commissioner.as_ref() else {
                     return CommandValue::failed(NOT_CONNECTED);
                 };
                 match commissioner
@@ -49,7 +49,7 @@ impl Interpreter {
         if joiner_type != "meshcop" {
             return CommandValue::failed(format!("{joiner_type} is not a valid joiner type"));
         }
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         match subcommand {
@@ -66,8 +66,7 @@ impl Interpreter {
                     return CommandValue::failed(err.to_string());
                 }
                 self.joiner_pskds.insert(joiner_id, Zeroizing::new(pskd));
-                self.reinstall_joiner_handler();
-                CommandValue::done()
+                self.reinstall_joiner_handler().into()
             }
             "enableall" => {
                 if tokens.len() < 4 {
@@ -77,8 +76,7 @@ impl Interpreter {
                     return CommandValue::failed(err.to_string());
                 }
                 self.joiner_all_pskd = Some(Zeroizing::new(tokens[3].clone()));
-                self.reinstall_joiner_handler();
-                CommandValue::done()
+                self.reinstall_joiner_handler().into()
             }
             "disable" => {
                 if tokens.len() < 4 {
@@ -88,16 +86,14 @@ impl Interpreter {
                     return CommandValue::failed(format!("invalid EUI-64 '{}'", tokens[3]));
                 };
                 self.joiner_pskds.remove(&compute_joiner_id(eui64));
-                self.reinstall_joiner_handler();
                 // Steering is rewritten from the remaining enabled joiners.
-                CommandValue::done()
+                self.reinstall_joiner_handler().into()
             }
             "disableall" => {
                 let result = commissioner.enable_all_joiners(false).await;
                 self.joiner_pskds.clear();
                 self.joiner_all_pskd = None;
-                self.reinstall_joiner_handler();
-                result.into()
+                result.and(self.reinstall_joiner_handler()).into()
             }
             "getport" => match commissioner
                 .get_commissioner_dataset(CommissionerDatasetFlags::JOINER_UDP_PORT)
@@ -127,15 +123,17 @@ impl Interpreter {
         }
     }
 
-    pub(super) fn install_joiner_handler(&mut self, commissioner: &mut Commissioner) {
-        let handler = self.build_joiner_handler();
-        commissioner.set_joiner_handler(handler);
+    pub(super) fn install_joiner_handler(
+        &self,
+        commissioner: &Commissioner,
+    ) -> meshcop::Result<()> {
+        commissioner.set_joiner_handler(self.build_joiner_handler())
     }
 
-    fn reinstall_joiner_handler(&mut self) {
-        let handler = self.build_joiner_handler();
-        if let Some(commissioner) = self.commissioner.as_mut() {
-            commissioner.set_joiner_handler(handler);
+    fn reinstall_joiner_handler(&self) -> meshcop::Result<()> {
+        match self.commissioner.as_ref() {
+            Some(commissioner) => self.install_joiner_handler(commissioner),
+            None => Ok(()),
         }
     }
 

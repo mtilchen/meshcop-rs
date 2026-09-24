@@ -18,10 +18,10 @@ async fn live_border_router_read_only_smoke() -> meshcop::Result<()> {
 
     let dataset = Dataset::from_hex(dataset_hex)?;
     let config = CommissionerConfig::from_dataset("meshcop-live", &dataset)?;
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    let (commissioner, _events) = Commissioner::connect(config, border_agent).await?;
 
-    let petition = commissioner.petition().await?;
-    assert!(petition.session_id != 0);
+    let session_id = commissioner.session_id();
+    assert!(session_id.is_some_and(|id| id != 0), "{session_id:?}");
     let read_result = async {
         assert_eq!(
             commissioner.keep_alive().await?,
@@ -51,10 +51,10 @@ async fn live_border_router_active_dataset_matches_env() -> meshcop::Result<()> 
 
     let expected = Dataset::from_hex(dataset_hex)?;
     let config = CommissionerConfig::from_dataset("meshcop-compare", &expected)?;
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    let (commissioner, _events) = Commissioner::connect(config, border_agent).await?;
 
-    let petition = commissioner.petition().await?;
-    assert!(petition.session_id != 0);
+    let session_id = commissioner.session_id();
+    assert!(session_id.is_some_and(|id| id != 0), "{session_id:?}");
     let live_bytes = commissioner
         .get_raw_active_dataset(DatasetFlags::EMPTY)
         .await;
