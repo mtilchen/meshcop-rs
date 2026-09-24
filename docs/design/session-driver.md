@@ -452,9 +452,31 @@ Where the implementation departs from, or makes concrete, the design above:
   because the CLI replaces the handler whenever `joiner enable` changes the
   enabled set. They return `Result`, failing with `SessionClosed` once the
   session has ended.
-- **Commands travel on an unbounded channel.** Every command carries a reply
-  channel its caller awaits, so the queue is bounded by the number of waiting
-  callers, and `set_joiner_handler` can stay synchronous.
+- **Commands travel on an unbounded channel, and the driver handles them
+  last.** Request commands carry a reply channel their caller awaits, so each
+  caller has at most one queued. `set_joiner_handler` and
+  `clear_joiner_handler` stay synchronous and carry no reply, so a caller
+  looping on them can grow the queue. The driver's loop takes due timers
+  first, then received datagrams, then commands, so no volume of commands
+  can delay a keep-alive, a retransmission, or a response. Timers before
+  datagrams also means a response that arrives with its deadline already
+  due is not accepted.
+- **A dropped request is withdrawn.** Dropping the future of a request, for
+  example under `tokio::time::timeout`, tells the driver. A queued request
+  is then never sent, and a sent one stops being retransmitted and frees its
+  slot; a late answer to it is dropped as unmatched.
+- **One keep-alive at a time, and nothing new while resigning.** A second
+  `keep_alive()` while one is outstanding fails with `InvalidState`, and once
+  a resignation is outstanding, new requests, keep-alives, and resignations
+  fail with `InvalidState("commissioner is resigning")`.
+- **Read-modify-write steering updates are serialized.** `enable_joiner`
+  holds a lock across its read and write of the commissioner dataset, and
+  the other commissioner dataset writes take the same lock, so concurrent
+  calls from cloned handles cannot drop a joiner.
+- **A stopped task is reported.** If the driver task stops without ending the
+  session (a panicking `JoinerHandler`, or runtime shutdown), `status()`
+  reports `Closed` with `CloseReason::TaskStopped`. No `SessionLost` event
+  is published in that case; the event stream just ends.
 - **`resign()` also closes an unpetitioned session.** On a connect-only
   session there is nothing to resign, so it just ends the session.
 - **`resign()` always ends the session**, even when the border agent does not
@@ -467,13 +489,41 @@ Where the implementation departs from, or makes concrete, the design above:
   as `Error::PeerClosed`. A connect-only session treats it as normal (status
   `Idle`, reopened on the next request); an active one ends with
   `CloseReason::PeerClosed`.
-- **Response matching only accepts responses.** A message is matched to a
-  request by token only when its code is a response code, so a notification
-  whose token happens to equal a request's cannot complete it.
+- **Response matching is bound to the route and to response codes.**
+  - A message arriving directly from the border agent can only answer,
+    acknowledge, or reset a direct exchange, and one arriving in UDP_RX only
+    a proxied exchange. A mesh device therefore cannot complete a keep-alive
+    or other border-agent exchange.
+  - The UDP_RX source address is not compared with the request's
+    destination. Answers to anycast (ALOC) and multicast requests come from
+    another address, and a device holding the network key can forge mesh
+    source addresses anyway.
+  - Tokens are 4 random bytes, unique among in-flight exchanges, rather than
+    the message ID, so they cannot be predicted from earlier traffic.
+  - Only 2.xx, 4.xx, and 5.xx codes can answer a request, so a notification
+    or a reserved code class cannot complete one even if its token matches.
+  - Only a strictly empty ACK (no token, options, or payload) stops
+    retransmission.
 - **Closing does not send `close_notify`.** Ending a session drops the DTLS
   state without telling the border agent, which then keeps its side until
   its own timeout. This predates phase 1; sending `close_notify` on close is
   a follow-up.
+- **Known limitations.**
+  - A retransmitted confirmable response is not acknowledged again once its
+    exchange has completed, and duplicate confirmable notifications are not
+    filtered, because there is no record of recently seen message IDs.
+  - Message IDs count up from 1 for each driver and wrap without tracking
+    RFC 7252's exchange lifetime. With one application request in flight,
+    reusing an ID within its lifetime would take tens of thousands of
+    requests in a few minutes.
+  - `meshcop-dtls` returns only the first usable record of a datagram. A
+    `close_notify` sent in the same datagram as application data is lost. A
+    connect-only session would then not notice the close, and its requests
+    would time out instead of reopening the session.
+  - The scripted harness delivers a proxied request's scripted answers in
+    UDP_RX from the request's destination. Tests that need an answer at a
+    chosen time, or one that depends on the assigned token, use
+    `ScriptedMeshcopTransport::deliver`.
 - **Runtimes.** The driver is `Send` and started with `tokio::spawn`, which
   also works on a `LocalRuntime` (stable since Tokio 1.51). The examples run
   on `#[tokio::main(flavor = "local")]`.

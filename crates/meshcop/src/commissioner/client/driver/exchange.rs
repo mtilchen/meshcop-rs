@@ -28,6 +28,8 @@ const COAP_MAX_RETRANSMIT: u8 = 2;
 /// keep-alive, resign) are not counted, so a slow request never delays a
 /// keep-alive.
 const MAX_APPLICATION_IN_FLIGHT: usize = 1;
+/// Length of the random token that correlates a response with its request.
+const TOKEN_LENGTH: usize = 4;
 
 /// A Reset answering the outstanding request ends the exchange at once
 /// instead of being retransmitted until the exchange deadline.
@@ -82,8 +84,11 @@ pub(in super::super) struct Outbound {
 /// Who is waiting for an exchange, and what its outcome means.
 #[derive(Debug)]
 pub(super) enum Completion {
-    /// A handle request.
-    Caller(oneshot::Sender<Result<Option<CoapMessage>>>),
+    /// A handle request, identified so its caller can withdraw it.
+    Caller {
+        id: u64,
+        reply: oneshot::Sender<Result<Option<CoapMessage>>>,
+    },
     /// A petition.
     Petition(oneshot::Sender<Result<PetitionResponse>>),
     /// A keep-alive; `None` when the driver scheduled it.
@@ -95,7 +100,12 @@ pub(super) enum Completion {
 impl Completion {
     /// Whether this exchange counts against the application in-flight limit.
     const fn is_application(&self) -> bool {
-        matches!(self, Self::Caller(_))
+        matches!(self, Self::Caller { .. })
+    }
+
+    /// Whether this is the handle request `id`.
+    const fn is_caller(&self, id: u64) -> bool {
+        matches!(self, Self::Caller { id: caller, .. } if *caller == id)
     }
 }
 
@@ -113,6 +123,14 @@ pub(super) struct Pending {
     pub(super) completion: Completion,
 }
 
+impl Pending {
+    /// Whether answers to this exchange arrive through the UDP proxy rather
+    /// than directly from the border agent.
+    const fn is_proxied(&self) -> bool {
+        matches!(self.destination, Destination::Mesh { .. })
+    }
+}
+
 /// Exchanges in flight and application requests waiting for a slot.
 #[derive(Debug, Default)]
 pub(super) struct Exchanges {
@@ -126,6 +144,42 @@ impl Exchanges {
             .iter()
             .filter(|pending| pending.completion.is_application())
             .count()
+    }
+
+    /// Whether a resignation is outstanding.
+    pub(super) fn resigning(&self) -> bool {
+        self.in_flight
+            .iter()
+            .any(|pending| matches!(pending.completion, Completion::Resign(_)))
+    }
+
+    /// Whether a keep-alive is outstanding.
+    pub(super) fn keep_alive_outstanding(&self) -> bool {
+        self.in_flight
+            .iter()
+            .any(|pending| matches!(pending.completion, Completion::KeepAlive(_)))
+    }
+
+    /// Removes the handle request `id`, queued or in flight, and reports
+    /// whether it was found.
+    fn withdraw(&mut self, id: u64) -> bool {
+        if let Some(index) = self
+            .queued
+            .iter()
+            .position(|(_, completion)| completion.is_caller(id))
+        {
+            self.queued.remove(index);
+            return true;
+        }
+        if let Some(index) = self
+            .in_flight
+            .iter()
+            .position(|pending| pending.completion.is_caller(id))
+        {
+            self.in_flight.remove(index);
+            return true;
+        }
+        false
     }
 
     /// Returns the earliest retransmission or deadline among in-flight
@@ -155,6 +209,16 @@ impl Driver {
     pub(super) async fn submit(&mut self, request: Outbound, completion: Completion) {
         self.exchanges.queued.push_back((request, completion));
         self.send_queued().await;
+    }
+
+    /// Forgets the handle request `id`, whose caller stopped waiting: a queued
+    /// request is never sent, and a sent one is no longer retransmitted and
+    /// frees its slot. A late response to it is dropped as unmatched.
+    pub(super) async fn withdraw(&mut self, id: u64) {
+        if self.exchanges.withdraw(id) {
+            commissioner_trace(format_args!("request {id} withdrawn by its caller"));
+            self.send_queued().await;
+        }
     }
 
     /// Sends queued application requests while the in-flight limit allows.
@@ -214,14 +278,13 @@ impl Driver {
     }
 
     /// Fails an exchange whose request could not be sent. A transport
-    /// failure also ends the session.
+    /// failure also ends the session, first, so queued requests fail with the
+    /// session instead of being tried on the broken link.
     async fn fail_send(&mut self, completion: Completion, err: Error) {
-        let transport_failed = is_transport_error(&err);
-        let description = err.to_string();
-        self.complete(completion, Err(err)).await;
-        if transport_failed {
-            self.transport_failed(description).await;
+        if is_transport_error(&err) {
+            self.transport_failed(err.to_string()).await;
         }
+        self.complete(completion, Err(err)).await;
     }
 
     /// Retransmits and expires in-flight exchanges whose timers are due.
@@ -272,15 +335,13 @@ impl Driver {
         self.send_queued().await;
     }
 
-    /// Stops retransmitting the exchange whose request `message_id` was
-    /// acknowledged with an empty ACK; its separate response is still awaited.
-    pub(super) fn acknowledge(&mut self, message_id: u16) -> bool {
-        match self
-            .exchanges
-            .in_flight
-            .iter_mut()
-            .find(|pending| pending.request.message_id == message_id)
-        {
+    /// Stops retransmitting the exchange that `ack` acknowledges, if it is an
+    /// empty ACK that arrived by the exchange's route (`proxied` or direct);
+    /// the separate response is still awaited.
+    pub(super) fn acknowledge(&mut self, ack: &CoapMessage, proxied: bool) -> bool {
+        match self.exchanges.in_flight.iter_mut().find(|pending| {
+            pending.is_proxied() == proxied && ack.is_empty_ack_for(pending.request.message_id)
+        }) {
             Some(pending) => {
                 pending.retry_at = None;
                 true
@@ -290,11 +351,19 @@ impl Driver {
     }
 
     /// Removes and returns the exchange answered by `response`: a Reset of
-    /// its message ID, or a response carrying its token.
-    pub(super) fn take_answered(&mut self, response: &CoapMessage) -> Option<Pending> {
+    /// its message ID, or a response carrying its token. Only exchanges on
+    /// the route `response` arrived by (`proxied` or direct) can match, so a
+    /// mesh device answering through the proxy cannot complete an exchange
+    /// with the border agent itself.
+    pub(super) fn take_answered(
+        &mut self,
+        response: &CoapMessage,
+        proxied: bool,
+    ) -> Option<Pending> {
         let index = self.exchanges.in_flight.iter().position(|pending| {
-            response.is_reset_for(pending.request.message_id)
-                || (is_response(response) && response.token == pending.request.token)
+            pending.is_proxied() == proxied
+                && (response.is_reset_for(pending.request.message_id)
+                    || (is_response(response) && response.token == pending.request.token))
         })?;
         Some(self.exchanges.in_flight.remove(index))
     }
@@ -302,7 +371,24 @@ impl Driver {
     pub(super) fn assign_identity(&mut self, message: &mut CoapMessage) {
         self.next_message_id = self.next_message_id.wrapping_add(1);
         message.message_id = self.next_message_id;
-        message.token = self.next_message_id.to_be_bytes().to_vec();
+        message.token = self.unused_token();
+    }
+
+    /// Returns a random token that no in-flight exchange uses, so responses
+    /// cannot be predicted from message IDs.
+    fn unused_token(&self) -> Vec<u8> {
+        loop {
+            let mut token = vec![0; TOKEN_LENGTH];
+            rand_core::OsRng.fill_bytes(&mut token);
+            let in_use = self
+                .exchanges
+                .in_flight
+                .iter()
+                .any(|pending| pending.request.token == token);
+            if !in_use {
+                return token;
+            }
+        }
     }
 
     /// Returns the message to put on the wire for `request`: the request
@@ -325,9 +411,9 @@ impl Driver {
 }
 
 /// Whether `message` is a response (2.xx, 4.xx, or 5.xx) rather than a
-/// request or an empty message.
-fn is_response(message: &CoapMessage) -> bool {
-    message.code.0 >> 5 != 0
+/// request, an empty message, or a reserved code class.
+const fn is_response(message: &CoapMessage) -> bool {
+    matches!(message.code.0 >> 5, 2 | 4 | 5)
 }
 
 /// Whether `err` means the DTLS session or socket is unusable.

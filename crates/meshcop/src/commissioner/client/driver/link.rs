@@ -132,15 +132,21 @@ impl Link {
                 if !*open {
                     return core::future::pending().await;
                 }
-                match transport.next_incoming() {
-                    Some(ScriptedIncoming::Message(message)) => message.encode(),
-                    Some(ScriptedIncoming::PeerClosed) => {
-                        Err(Error::Dtls(meshcop_dtls::Error::PeerClosed))
+                loop {
+                    match transport.next_incoming() {
+                        Some(ScriptedIncoming::Message(message)) => return message.encode(),
+                        Some(ScriptedIncoming::PeerClosed) => {
+                            return Err(Error::Dtls(meshcop_dtls::Error::PeerClosed));
+                        }
+                        Some(ScriptedIncoming::TransportFailure) => {
+                            return Err(Error::Io(std::io::Error::other(
+                                "scripted transport failure",
+                            )));
+                        }
+                        // Cancel-safe: a delivery while this is not waiting
+                        // leaves a permit, so the next wait returns at once.
+                        None => transport.arrival().await,
                     }
-                    Some(ScriptedIncoming::TransportFailure) => Err(Error::Io(
-                        std::io::Error::other("scripted transport failure"),
-                    )),
-                    None => core::future::pending().await,
                 }
             }
         }

@@ -13,7 +13,10 @@
 
 use std::{
     net::{Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -31,7 +34,7 @@ use super::{
     config::{CommissionerConfig, MIN_KEEPALIVE_INTERVAL},
     events::Events,
     joiner::JoinerHandler,
-    types::{CommissionerEvent, PetitionResponse, ResultCode, SessionStatus},
+    types::{CloseReason, CommissionerEvent, PetitionResponse, ResultCode, SessionStatus},
 };
 
 mod commands;
@@ -50,8 +53,10 @@ use driver::{Command, Driver, Link};
 /// matches responses to requests, retransmits lost messages, commissions
 /// relayed joiners, and publishes [`CommissionerEvent`]s. Handles are cheap to
 /// clone, and every clone drives the same session, so independent tasks can
-/// issue requests concurrently. The task needs a Tokio runtime; any flavor,
-/// including `LocalRuntime`, works.
+/// issue requests concurrently. Dropping a request's future, for example on a
+/// timeout, withdraws the request: it is not sent if it was still queued, and
+/// is no longer retransmitted if it was. The task needs a Tokio runtime; any
+/// flavor, including `LocalRuntime`, works.
 ///
 /// The session ends when [`Commissioner::resign`] is called, when the session
 /// is lost, or when every handle has been dropped. In the last case the task
@@ -69,7 +74,12 @@ pub struct Commissioner {
 struct Shared {
     config: CommissionerConfig,
     border_agent: SocketAddr,
-    mesh_local_prefix: Mutex<Option<[u8; 8]>>,
+    mesh_local_prefix: Mutex<PrefixCache>,
+    /// Serializes commissioner dataset writes, so the read-modify-write in
+    /// [`Commissioner::enable_joiner`] cannot interleave with another write.
+    commissioner_dataset_writes: tokio::sync::Mutex<()>,
+    /// Source of the IDs that let a dropped request be withdrawn.
+    next_exchange_id: AtomicU64,
     /// Never read; kept so new subscribers can be created from any handle
     /// without keeping the event channel open after the driver stops.
     event_template: broadcast::Receiver<CommissionerEvent>,
@@ -77,11 +87,32 @@ struct Shared {
     scripted_transport: Option<ScriptedMeshcopTransport>,
 }
 
+/// The cached mesh-local prefix.
+///
+/// `generation` advances on every invalidation, so a fetch that raced a
+/// dataset change cannot store the prefix it read before the change.
+#[derive(Debug, Default)]
+struct PrefixCache {
+    prefix: Option<[u8; 8]>,
+    generation: u64,
+}
+
 impl Shared {
-    fn mesh_local_prefix(&self) -> MutexGuard<'_, Option<[u8; 8]>> {
+    fn mesh_local_prefix(&self) -> MutexGuard<'_, PrefixCache> {
         self.mesh_local_prefix
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Drops the cached prefix, for example after a dataset change.
+    fn invalidate_mesh_local_prefix(&self) {
+        let mut cache = self.mesh_local_prefix();
+        cache.prefix = None;
+        cache.generation = cache.generation.wrapping_add(1);
+    }
+
+    fn next_exchange_id(&self) -> u64 {
+        self.next_exchange_id.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -145,7 +176,9 @@ impl Commissioner {
         let shared = Arc::new(Shared {
             config,
             border_agent,
-            mesh_local_prefix: Mutex::new(None),
+            mesh_local_prefix: Mutex::default(),
+            commissioner_dataset_writes: tokio::sync::Mutex::new(()),
+            next_exchange_id: AtomicU64::new(0),
             event_template,
             #[cfg(any(test, feature = "test-support"))]
             scripted_transport,
@@ -180,14 +213,26 @@ impl Commissioner {
     }
 
     /// Returns where the session stands.
+    ///
+    /// If the session's task stopped without ending the session, the status
+    /// is [`SessionStatus::Closed`] with [`CloseReason::TaskStopped`].
     pub fn status(&self) -> SessionStatus {
-        self.status.borrow().clone()
+        let status = self.status.borrow().clone();
+        // The driver drops its status sender when its task ends, whether or
+        // not it got to report why.
+        let task_stopped = self.status.has_changed().is_err();
+        if task_stopped && !matches!(status, SessionStatus::Closed { .. }) {
+            return SessionStatus::Closed {
+                reason: CloseReason::TaskStopped,
+            };
+        }
+        status
     }
 
     /// Returns the active commissioner session ID, when the session is
     /// active.
     pub fn session_id(&self) -> Option<u16> {
-        self.status.borrow().session_id()
+        self.status().session_id()
     }
 
     /// Returns the configured border-agent address.
@@ -228,7 +273,9 @@ impl Commissioner {
     ///
     /// Any answer other than Accept, or a failed exchange, ends the session.
     /// With [`super::KeepAlive::Automatic`] this is never required, but it may
-    /// be called; the next automatic keep-alive is rescheduled from it.
+    /// be called; the next automatic keep-alive is rescheduled from it. Fails
+    /// with [`Error::InvalidState`] while another keep-alive or a resignation
+    /// is outstanding.
     pub async fn keep_alive(&self) -> Result<ResultCode> {
         self.call(|reply| Command::KeepAlive { reply }).await?
     }
@@ -237,7 +284,9 @@ impl Commissioner {
     /// petition was accepted.
     ///
     /// The session ends even if the border agent does not confirm the
-    /// resignation; the error then reports that it was not confirmed.
+    /// resignation; the error then reports that it was not confirmed. While
+    /// the resignation is outstanding, new requests fail with
+    /// [`Error::InvalidState`].
     pub async fn resign(&self) -> Result<()> {
         self.call(|reply| Command::Resign { reply }).await?
     }
@@ -310,14 +359,14 @@ impl Commissioner {
     /// populate it. Unstable test scaffolding for this workspace's suites;
     /// not a supported public API.
     pub fn set_cached_mesh_local_prefix(&self, prefix: Option<[u8; 8]>) {
-        *self.shared.mesh_local_prefix() = prefix;
+        self.shared.mesh_local_prefix().prefix = prefix;
     }
 
     /// Test support: returns the currently cached mesh-local prefix. Unstable
     /// test scaffolding for this workspace's suites; not a supported public
     /// API.
     pub fn cached_mesh_local_prefix(&self) -> Option<[u8; 8]> {
-        *self.shared.mesh_local_prefix()
+        self.shared.mesh_local_prefix().prefix
     }
 }
 

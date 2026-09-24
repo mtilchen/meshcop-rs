@@ -169,6 +169,12 @@ impl Commissioner {
     /// The Commissioner Session ID and Border Agent Locator TLVs are managed
     /// by the protocol and are removed from `dataset` before sending.
     pub async fn set_commissioner_dataset(&self, dataset: &Dataset) -> Result<()> {
+        let _writing = self.shared.commissioner_dataset_writes.lock().await;
+        self.write_commissioner_dataset(dataset).await
+    }
+
+    /// Sets the commissioner dataset; the caller holds the write lock.
+    async fn write_commissioner_dataset(&self, dataset: &Dataset) -> Result<()> {
         let session_id = self.session_id_required()?;
         let dataset = strip_managed_commissioner_tlvs(dataset);
         if dataset.entries().is_empty() {
@@ -200,8 +206,10 @@ impl Commissioner {
     /// The current steering data is fetched from the leader, the joiner ID is
     /// added to its Bloom filter, and the result is written back through
     /// MGMT_COMMISSIONER_SET. PSKd provisioning stays with the configured
-    /// [`JoinerHandler`](super::super::JoinerHandler).
+    /// [`JoinerHandler`](super::super::JoinerHandler). Concurrent calls from
+    /// cloned handles are serialized, so none of their joiners is lost.
     pub async fn enable_joiner(&self, joiner_id: &[u8; 8]) -> Result<()> {
+        let _writing = self.shared.commissioner_dataset_writes.lock().await;
         let current = self
             .get_commissioner_dataset(CommissionerDatasetFlags::STEERING_DATA)
             .await?;
@@ -212,7 +220,7 @@ impl Commissioner {
         crate::crypto::add_joiner_to_steering_data(&mut steering_data, joiner_id);
         let mut dataset = Dataset::default();
         dataset.set_raw(meshcop::TLV_STEERING_DATA, steering_data);
-        self.set_commissioner_dataset(&dataset).await
+        self.write_commissioner_dataset(&dataset).await
     }
 
     /// Opens steering to every joiner, or closes it for all joiners.

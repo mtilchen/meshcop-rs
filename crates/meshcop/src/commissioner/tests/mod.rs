@@ -26,6 +26,8 @@ use crate::{
 mod api;
 mod driver;
 mod joiner_sessions;
+mod lifecycle;
+mod matching;
 mod more;
 mod routing;
 
@@ -550,6 +552,52 @@ fn prefixed_dataset() -> Dataset {
         TEST_MESH_LOCAL_PREFIX,
     );
     dataset
+}
+
+const SESSION_ID: u16 = 0xcafe;
+
+fn petition_exchange() -> ScriptedExchange {
+    exchange(
+        CommissionerOperation::Petition,
+        [ScriptedResponse::petition_accept(SESSION_ID)],
+    )
+}
+
+fn active_get(name: &str) -> ScriptedExchange {
+    exchange(
+        CommissionerOperation::GetActiveDataset,
+        [ScriptedResponse::content(
+            dataset_with_name(name).to_bytes().unwrap(),
+        )],
+    )
+}
+
+/// The operations the session has sent, in order.
+fn operations(commissioner: &Commissioner) -> Vec<CommissionerOperation> {
+    commissioner
+        .scripted_transport()
+        .unwrap()
+        .observed_requests()
+        .iter()
+        .map(|request| request.operation)
+        .collect()
+}
+
+/// The `index`th request the session sent, as its recipient sees it.
+fn sent_request(transport: &ScriptedMeshcopTransport, index: usize) -> CoapMessage {
+    logical_message(&transport.observed_requests()[index])
+}
+
+/// A piggybacked answer to `request`.
+fn answer(request: &CoapMessage, code: CoapCode, payload: Vec<u8>) -> CoapMessage {
+    CoapMessage {
+        ty: CoapType::Acknowledgement,
+        code,
+        message_id: request.message_id,
+        token: request.token.clone(),
+        options: Vec::new(),
+        payload,
+    }
 }
 
 fn exchange(

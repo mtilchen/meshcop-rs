@@ -3,6 +3,8 @@
 
 use std::net::Ipv6Addr;
 
+use tokio::sync::{mpsc, oneshot};
+
 use crate::{
     Result,
     dataset::Dataset,
@@ -47,17 +49,32 @@ impl Commissioner {
         .ok_or(Error::InvalidState("MeshCoP exchange produced no response"))
     }
 
+    /// Submits a request to the driver and waits for its outcome.
+    ///
+    /// Dropping the returned future withdraws the request: a queued request
+    /// is never sent, and a sent one stops being retransmitted and frees its
+    /// place for the next request.
     async fn submit(&self, request: Outbound) -> Result<Option<CoapMessage>> {
-        self.call(|reply| Command::Exchange { request, reply })
-            .await?
+        let id = self.shared.next_exchange_id();
+        let (reply, response) = oneshot::channel();
+        self.send_command(Command::Exchange { id, request, reply })?;
+        let _withdraw = WithdrawOnDrop {
+            commands: &self.commands,
+            id,
+        };
+        response.await.map_err(|_| Error::SessionClosed)?
     }
 
     /// Returns the cached mesh-local prefix, fetching it from the active
     /// dataset when needed.
     async fn require_mesh_local_prefix(&self) -> Result<[u8; 8]> {
-        if let Some(prefix) = *self.shared.mesh_local_prefix() {
-            return Ok(prefix);
-        }
+        let generation = {
+            let cache = self.shared.mesh_local_prefix();
+            if let Some(prefix) = cache.prefix {
+                return Ok(prefix);
+            }
+            cache.generation
+        };
         let raw = self
             .get_raw_active_dataset(DatasetFlags::MESH_LOCAL_PREFIX)
             .await?;
@@ -70,7 +87,12 @@ impl Commissioner {
                 "mesh-local prefix must be within fd00::/8".to_string(),
             ));
         }
-        *self.shared.mesh_local_prefix() = Some(prefix);
+        let mut cache = self.shared.mesh_local_prefix();
+        // A dataset change during the fetch may have moved the prefix; use
+        // what was read, but only cache it if nothing invalidated it since.
+        if cache.generation == generation {
+            cache.prefix = Some(prefix);
+        }
         Ok(prefix)
     }
 
@@ -177,5 +199,22 @@ const fn mesh_management(address: Ipv6Addr) -> Destination {
     Destination::Mesh {
         address,
         port: meshcop::DEFAULT_MM_PORT,
+    }
+}
+
+/// Withdraws a submitted request when its caller stops waiting for it.
+///
+/// It also fires after the outcome has arrived; the driver has forgotten the
+/// request by then, so the withdrawal does nothing.
+struct WithdrawOnDrop<'a> {
+    commands: &'a mpsc::UnboundedSender<Command>,
+    id: u64,
+}
+
+impl Drop for WithdrawOnDrop<'_> {
+    fn drop(&mut self) {
+        // The driver may already have stopped; then there is nothing to
+        // withdraw.
+        let _ = self.commands.send(Command::Withdraw(self.id));
     }
 }

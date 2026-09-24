@@ -4,27 +4,10 @@
 
 use super::*;
 
-const SESSION_ID: u16 = 0xcafe;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 /// Event wait bound for paused-time tests: longer than any virtual wait they
 /// expect, and elapsed instantly when a broken session never answers.
 const PAUSED_EVENT_WAIT: Duration = Duration::from_secs(300);
-
-fn petition_exchange() -> ScriptedExchange {
-    exchange(
-        CommissionerOperation::Petition,
-        [ScriptedResponse::petition_accept(SESSION_ID)],
-    )
-}
-
-fn active_get(name: &str) -> ScriptedExchange {
-    exchange(
-        CommissionerOperation::GetActiveDataset,
-        [ScriptedResponse::content(
-            dataset_with_name(name).to_bytes().unwrap(),
-        )],
-    )
-}
 
 /// Starts a scripted session that sends keep-alives on its own every
 /// [`KEEPALIVE_INTERVAL`].
@@ -37,16 +20,6 @@ async fn automatic_commissioner(script: ScriptedMeshcopTransport) -> (Commission
     Commissioner::connect_scripted(config, border_agent(), script, [])
         .await
         .unwrap()
-}
-
-fn operations(commissioner: &Commissioner) -> Vec<CommissionerOperation> {
-    commissioner
-        .scripted_transport()
-        .unwrap()
-        .observed_requests()
-        .iter()
-        .map(|request| request.operation)
-        .collect()
 }
 
 #[tokio::test(start_paused = true)]
@@ -186,7 +159,7 @@ async fn an_outstanding_keep_alive_does_not_hold_back_application_requests() {
 }
 
 #[tokio::test]
-async fn concurrent_requests_from_clones_are_queued_and_matched() {
+async fn requests_from_clones_take_turns_and_each_gets_its_own_answer() {
     with_test_deadline(async {
         let script = ScriptedMeshcopTransport::new([
             petition_exchange(),

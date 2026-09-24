@@ -64,6 +64,11 @@ pub enum CloseReason {
         /// Description of the failure.
         error: String,
     },
+    /// The session's background task stopped without ending the session,
+    /// because it panicked (for example in a [`super::JoinerHandler`]) or its
+    /// runtime shut down. No [`CommissionerEvent::SessionLost`] is published
+    /// for this reason; [`super::Commissioner::status`] reports it.
+    TaskStopped,
 }
 
 impl core::fmt::Display for CloseReason {
@@ -75,6 +80,7 @@ impl core::fmt::Display for CloseReason {
             Self::KeepAliveFailed { error } => write!(f, "a keep-alive failed: {error}"),
             Self::PeerClosed => f.write_str("the border agent closed the DTLS session"),
             Self::TransportFailed { error } => write!(f, "the transport failed: {error}"),
+            Self::TaskStopped => f.write_str("the session task stopped unexpectedly"),
         }
     }
 }

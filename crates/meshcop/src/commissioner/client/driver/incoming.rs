@@ -48,13 +48,10 @@ impl Driver {
                 return Ok(());
             }
         };
-        if inner.ty == meshcop::CoapType::Acknowledgement
-            && inner.code == meshcop::CoapCode::EMPTY
-            && self.acknowledge(inner.message_id)
-        {
+        if self.acknowledge(&inner, true) {
             return Ok(());
         }
-        if let Some(pending) = self.take_answered(&inner) {
+        if let Some(pending) = self.take_answered(&inner, true) {
             if inner.ty == meshcop::CoapType::Reset {
                 self.complete(
                     pending.completion,
@@ -82,13 +79,10 @@ impl Driver {
     }
 
     async fn route_direct(&mut self, incoming: CoapMessage) -> Result<()> {
-        if incoming.ty == meshcop::CoapType::Acknowledgement
-            && incoming.code == meshcop::CoapCode::EMPTY
-            && self.acknowledge(incoming.message_id)
-        {
+        if self.acknowledge(&incoming, false) {
             return Ok(());
         }
-        if let Some(pending) = self.take_answered(&incoming) {
+        if let Some(pending) = self.take_answered(&incoming, false) {
             if incoming.ty == meshcop::CoapType::Reset {
                 self.complete(
                     pending.completion,
@@ -160,7 +154,7 @@ impl Driver {
             // A dataset change may move the mesh-local prefix; drop the cache so
             // the next ALOC/RLOC route is recomputed. Mirrors the proxied path
             // in `route_unsolicited_proxied`.
-            *self.shared.mesh_local_prefix() = None;
+            self.shared.invalidate_mesh_local_prefix();
         }
         let peer_addr = self.shared.border_agent.ip().to_string();
         self.publish(notification_to_event(notification, peer_addr));
@@ -179,7 +173,7 @@ impl Driver {
         if notification == meshcop::MeshcopNotification::DatasetChanged {
             // The dataset change may carry a new mesh-local prefix; refresh it
             // before the next proxied request.
-            *self.shared.mesh_local_prefix() = None;
+            self.shared.invalidate_mesh_local_prefix();
         }
         self.publish(notification_to_event(
             notification,

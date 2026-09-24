@@ -72,7 +72,11 @@ impl ScriptedExchange {
     /// Expects `operation` and delivers `responses` as the incoming stream.
     ///
     /// Empty ACK responses are consumed by the same loop the live path uses and
-    /// therefore do not complete the public API call.
+    /// therefore do not complete the public API call. When the request is
+    /// proxied (UDP_TX), response templates are delivered in UDP_RX from the
+    /// request's mesh destination, as a Thread device's answer would be;
+    /// [`ScriptedResponse::Raw`] and [`ScriptedResponse::UdpRx`] are delivered
+    /// as given.
     pub fn new(
         operation: CommissionerOperation,
         responses: impl IntoIterator<Item = ScriptedResponse>,
@@ -228,6 +232,19 @@ impl ScriptedResponse {
         }
     }
 
+    /// Whether a Thread device would send this template, so that it travels
+    /// back through the proxy when answering a proxied request.
+    const fn is_device_answer(&self) -> bool {
+        matches!(
+            self,
+            Self::EmptyAck
+                | Self::Changed { .. }
+                | Self::Content { .. }
+                | Self::Coded { .. }
+                | Self::Reset
+        )
+    }
+
     /// Renders this template against the logical (decapsulated) request so
     /// response tokens and message IDs mirror what a Thread device would echo.
     fn into_message(self, logical_request: &CoapMessage) -> Result<CoapMessage> {
@@ -283,6 +300,18 @@ fn decapsulated_request(request: &CoapMessage) -> Result<CoapMessage> {
     }
 }
 
+/// Returns the mesh destination address and port of a UDP_TX.ntf request.
+fn proxy_destination(request: &CoapMessage) -> Option<(Ipv6Addr, u16)> {
+    let tlvs = crate::tlv::TlvSet::parse(&request.payload).ok()?;
+    let address: [u8; 16] = tlvs
+        .last_value(meshcop::TLV_IPV6_ADDRESS)?
+        .try_into()
+        .ok()?;
+    let encapsulation = tlvs.last_value(meshcop::TLV_UDP_ENCAPSULATION)?;
+    let port = u16::from_be_bytes(encapsulation.get(2..4)?.try_into().ok()?);
+    Some((Ipv6Addr::from(address), port))
+}
+
 /// Builds a UDP_RX.ntf message carrying `inner` bytes.
 pub fn udp_rx_message(
     source_address: Ipv6Addr,
@@ -318,6 +347,8 @@ pub fn udp_rx_message(
 #[derive(Debug, Clone, Default)]
 pub struct ScriptedMeshcopTransport {
     state: Arc<Mutex<ScriptState>>,
+    /// Wakes a session waiting for incoming messages.
+    arrived: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Default)]
@@ -348,6 +379,7 @@ impl ScriptedMeshcopTransport {
                 exchanges: exchanges.into_iter().collect(),
                 ..ScriptState::default()
             })),
+            arrived: Arc::default(),
         }
     }
 
@@ -385,6 +417,21 @@ impl ScriptedMeshcopTransport {
         self.state().exchanges.len()
     }
 
+    /// Delivers `message` to the session now, as if the border agent had just
+    /// sent it; for answers that depend on a request's assigned identity or
+    /// must arrive at a chosen time.
+    pub fn deliver(&self, message: CoapMessage) {
+        self.state()
+            .incoming
+            .push_back(ScriptedIncoming::Message(message));
+        self.arrived.notify_one();
+    }
+
+    /// Waits until a message may have been delivered.
+    pub(crate) async fn arrival(&self) {
+        self.arrived.notified().await;
+    }
+
     /// Makes every later send fail with an I/O error, as a socket does once
     /// the network path is gone.
     pub fn fail_sends(&self) {
@@ -420,6 +467,7 @@ impl ScriptedMeshcopTransport {
         let encoded = request.encode()?;
         let request = CoapMessage::decode(&encoded)?;
         let logical_request = decapsulated_request(&request)?;
+        let proxy = proxy_destination(&request);
         let mut state = self.state();
         let exchange = state
             .exchanges
@@ -444,6 +492,15 @@ impl ScriptedMeshcopTransport {
                 }
                 _ => {}
             }
+            let template = match proxy {
+                Some((address, port)) if template.is_device_answer() => ScriptedResponse::UdpRx {
+                    source_address: address,
+                    source_port: port,
+                    destination_port: meshcop::DEFAULT_MM_PORT,
+                    inner: Box::new(template),
+                },
+                _ => template,
+            };
             let message = template.into_message(&logical_request)?;
             // Round-trip through the wire form so the client sees exactly what
             // a live border agent would deliver.
@@ -452,6 +509,7 @@ impl ScriptedMeshcopTransport {
                 .incoming
                 .push_back(ScriptedIncoming::Message(delivered));
         }
+        self.arrived.notify_one();
         Ok(())
     }
 }

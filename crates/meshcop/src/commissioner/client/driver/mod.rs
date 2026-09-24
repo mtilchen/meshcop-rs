@@ -38,9 +38,13 @@ pub(super) use link::Link;
 /// A request from a handle to the driver.
 pub(super) enum Command {
     Exchange {
+        /// Identifies the request to [`Command::Withdraw`].
+        id: u64,
         request: Outbound,
         reply: oneshot::Sender<Result<Option<CoapMessage>>>,
     },
+    /// The caller of the identified request stopped waiting for it.
+    Withdraw(u64),
     Petition {
         reply: oneshot::Sender<Result<PetitionResponse>>,
     },
@@ -115,14 +119,17 @@ impl Driver {
         }
     }
 
+    /// Waits for the next thing to do. Due timers come first, so a deadline
+    /// is enforced before a late response is read, and handle commands come
+    /// last, so no volume of them can hold up keep-alives or responses.
     async fn next_wake(&mut self) -> Wake {
         let deadline = self.next_deadline();
         let accepting_commands = !self.handles_dropped;
         tokio::select! {
             biased;
-            command = self.commands.recv(), if accepting_commands => Wake::Command(command),
-            received = self.link.recv() => Wake::Received(received),
             () = sleep_until(deadline) => Wake::Timer,
+            received = self.link.recv() => Wake::Received(received),
+            command = self.commands.recv(), if accepting_commands => Wake::Command(command),
         }
     }
 
@@ -153,25 +160,43 @@ impl Driver {
 
     async fn handle_command(&mut self, command: Command) {
         match command {
-            Command::Exchange { request, reply } => {
+            Command::Exchange { id, request, reply } => {
+                if self.exchanges.resigning() {
+                    let _ = reply.send(Err(Error::InvalidState(RESIGNING)));
+                    return;
+                }
                 if let Err(err) = self.ensure_open().await {
                     let _ = reply.send(Err(err));
                     return;
                 }
-                self.submit(request, Completion::Caller(reply)).await;
+                self.submit(request, Completion::Caller { id, reply }).await;
             }
+            Command::Withdraw(id) => self.withdraw(id).await,
             Command::Petition { reply } => self.petition(reply).await,
             Command::KeepAlive { reply } => {
-                if self.session_id().is_none() {
-                    let _ = reply.send(Err(Error::InvalidState(
-                        "commissioner session is not active",
-                    )));
+                let refusal = if self.session_id().is_none() {
+                    Some("commissioner session is not active")
+                } else if self.exchanges.resigning() {
+                    Some(RESIGNING)
+                } else if self.exchanges.keep_alive_outstanding() {
+                    Some("a keep-alive is already outstanding")
+                } else {
+                    None
+                };
+                if let Some(refusal) = refusal {
+                    let _ = reply.send(Err(Error::InvalidState(refusal)));
                     return;
                 }
                 self.send_keep_alive(Completion::KeepAlive(Some(reply)))
                     .await;
             }
-            Command::Resign { reply } => self.resign(Some(reply)).await,
+            Command::Resign { reply } => {
+                if self.exchanges.resigning() {
+                    let _ = reply.send(Err(Error::InvalidState(RESIGNING)));
+                    return;
+                }
+                self.resign(Some(reply)).await;
+            }
             Command::SetJoinerHandler(handler) => {
                 if handler.is_none() {
                     self.joiner_sessions.clear();
@@ -270,6 +295,9 @@ impl Driver {
 
     async fn handles_dropped(&mut self) {
         self.handles_dropped = true;
+        if self.exchanges.resigning() {
+            return;
+        }
         commissioner_trace(format_args!("every handle was dropped; resigning"));
         self.resign(None).await;
     }
@@ -335,7 +363,7 @@ impl Driver {
     /// session-control outcomes to the session first.
     async fn complete(&mut self, completion: Completion, outcome: Result<Option<CoapMessage>>) {
         match completion {
-            Completion::Caller(reply) => {
+            Completion::Caller { reply, .. } => {
                 let _ = reply.send(outcome);
                 self.send_queued().await;
             }
@@ -479,6 +507,9 @@ impl Driver {
         }
     }
 }
+
+/// Why new work is refused once the session has started resigning.
+const RESIGNING: &str = "commissioner is resigning";
 
 /// Wraps a session-control request for the driver's own exchange.
 fn control_request(message: CoapMessage, operation: CommissionerOperation) -> Outbound {
