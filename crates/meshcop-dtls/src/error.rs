@@ -20,6 +20,13 @@ pub enum Error {
     /// A protocol operation timed out.
     #[error("timeout: {0}")]
     Timeout(&'static str),
+    /// The peer ended the session with an authenticated `close_notify` alert.
+    ///
+    /// Unlike other alerts this is an orderly shutdown, not a failure: a
+    /// border agent sends it, for example, when an unpetitioned session
+    /// reaches its lifetime.
+    #[error("peer closed the DTLS session")]
+    PeerClosed,
     /// An I/O operation failed.
     #[cfg(feature = "std")]
     #[error("I/O error: {0}")]

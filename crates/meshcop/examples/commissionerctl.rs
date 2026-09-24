@@ -8,7 +8,7 @@ use meshcop::{
 #[path = "support/mod.rs"]
 mod support;
 
-#[tokio::main]
+#[tokio::main(flavor = "local")]
 async fn main() -> meshcop::Result<()> {
     let mut raw_args = std::env::args().skip(1).collect::<Vec<_>>();
     let show_secrets = support::show_secrets_requested(&mut raw_args);
@@ -32,24 +32,27 @@ async fn main() -> meshcop::Result<()> {
         "connect" => {
             let addr = border_agent_arg(args.next())?;
             let config = config_from_env()?;
-            let commissioner = Commissioner::connect(config, addr).await?;
+            let (commissioner, _events) = Commissioner::connect_only(config, addr).await?;
             println!("connected to {}", commissioner.border_agent());
+            commissioner.resign().await?;
         }
         "petition" => {
             require_mutation_gate("petition")?;
             let addr = border_agent_arg(args.next())?;
             let config = config_from_env()?;
-            let mut commissioner = Commissioner::connect(config, addr).await?;
-            let petition = commissioner.petition().await?;
+            let (commissioner, _events) = Commissioner::connect(config, addr).await?;
+            let session_id = commissioner.session_id();
             let resign_result = commissioner.resign().await;
-            println!("petition accepted session_id=0x{:04x}", petition.session_id);
+            if let Some(session_id) = session_id {
+                println!("petition accepted session_id=0x{session_id:04x}");
+            }
             resign_result?;
         }
         "get-active-dataset" => {
             let addr = border_agent_arg(args.next())?;
             let config = config_from_env()?;
-            let mut commissioner = Commissioner::connect(config, addr).await?;
-            commissioner.petition().await?;
+            // Reading the active dataset does not need the commissioner role.
+            let (commissioner, _events) = Commissioner::connect_only(config, addr).await?;
             let dataset_result = commissioner.get_active_dataset(DatasetFlags::EMPTY).await;
             let resign_result = commissioner.resign().await;
             let dataset = dataset_result?;
@@ -78,7 +81,9 @@ fn require_mutation_gate(command: &str) -> meshcop::Result<()> {
 fn border_agent_arg(arg: Option<String>) -> meshcop::Result<SocketAddr> {
     let raw = arg
         .or_else(|| std::env::var("MESHCOP_BORDER_AGENT").ok())
-        .unwrap_or_else(|| "192.168.4.48:49156".to_string());
+        .ok_or(meshcop::Error::Configuration(
+            "border-agent host:port argument or MESHCOP_BORDER_AGENT required",
+        ))?;
     raw.parse().map_err(|err| {
         meshcop::Error::Dataset(format!("invalid border-agent address `{raw}`: {err}"))
     })

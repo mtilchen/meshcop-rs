@@ -60,9 +60,7 @@ struct Args {
     #[argh(option, default = "DEFAULT_COMMISSIONER_ID.to_string()")]
     commissioner_id: String,
 
-    /// per-node diagnostic answer timeout, in seconds (default 4; together
-    /// with one 12-second keep-alive exchange it must fit within the
-    /// commissioner keep-alive interval)
+    /// per-node diagnostic answer timeout, in seconds (default 4)
     #[argh(option, default = "DEFAULT_NODE_TIMEOUT_SECS")]
     node_timeout: u64,
 
@@ -159,10 +157,13 @@ async fn run(args: Args) -> meshcop::Result<()> {
 
     let config = CommissionerConfig::pskc(args.commissioner_id, pskc);
     eprintln!("connecting to {border_agent}");
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    let (commissioner, _events) = Commissioner::connect(config, border_agent).await?;
+    if let Some(session_id) = commissioner.session_id() {
+        eprintln!("petition accepted: session_id=0x{session_id:04x}");
+    }
 
     let result = dispatch(
-        &mut commissioner,
+        &commissioner,
         &args.command,
         node_timeout,
         &args.border_agent,
@@ -177,7 +178,7 @@ async fn run(args: Args) -> meshcop::Result<()> {
 }
 
 async fn dispatch(
-    commissioner: &mut Commissioner,
+    commissioner: &Commissioner,
     command: &Command,
     node_timeout: Duration,
     border_agent: &str,

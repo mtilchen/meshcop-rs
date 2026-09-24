@@ -60,7 +60,23 @@ Document surviving mutants in the review notes when they are intentionally defer
   commissioner implementation.
 - The preferred production path is pure Rust with minimal external dependencies.
 - OpenSSL, mbedTLS, OpenThread `ot-commissioner`, and CXX may be used as references or parity harnesses, but should not become required runtime dependencies without explicit review.
-- The local live test border agent is `192.168.4.48:49156`.
+- The local live test border agent advertises itself over mDNS as
+  `OpenThread BorderRouter #45DB` (`_meshcop._udp`). Its address and port are
+  dynamic, so look it up before running live tests or examples rather than
+  reusing a remembered address, then export it as `MESHCOP_BORDER_AGENT`:
+
+  ```sh
+  # macOS: resolve the instance to host:port, then the host to an address.
+  dns-sd -L "OpenThread BorderRouter #45DB" _meshcop._udp local.
+  dns-sd -G v4 <host>.local
+  # Linux (Avahi): resolves both in one step.
+  avahi-browse -rt _meshcop._udp
+  ```
+
+  `dns-sd` runs until interrupted; stop it once it has printed an answer.
+  Many other vendors' border agents share the network, so match the instance
+  name. A successful DTLS handshake with the dataset's PSKc confirms that the
+  agent belongs to the test network.
 - Live tests that compare the active dataset must use `ESP_MATTER_TEST_THREAD_DATASET_HEX` without printing or otherwise leaking secret dataset fields.
 - Example apps and live tests should resign commissioner sessions before exit when they are only inspecting data.
 - Mutating live operations must remain explicitly gated with `MESHCOP_MUTATE_OK=1`.

@@ -9,13 +9,15 @@ use crate::{
 
 use super::super::types::{CommissionerDatasetFlags, DatasetFlags};
 use super::{
-    Commissioner, check_state_response, require_dataset_tlvs, strip_managed_commissioner_tlvs,
+    Commissioner, check_state_response,
+    requests::{UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN},
+    require_dataset_tlvs, strip_managed_commissioner_tlvs,
 };
 
 impl Commissioner {
     /// Gets the active operational dataset.
     pub async fn get_active_dataset(
-        &mut self,
+        &self,
         flags: DatasetFlags,
     ) -> Result<ActiveOperationalDataset> {
         Dataset::from_bytes(&self.get_raw_active_dataset(flags).await?)
@@ -23,10 +25,10 @@ impl Commissioner {
 
     /// Gets the pending operational dataset.
     pub async fn get_pending_dataset(
-        &mut self,
+        &self,
         flags: DatasetFlags,
     ) -> Result<PendingOperationalDataset> {
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::dataset_get_request(
             CommissionerOperation::GetPendingDataset,
             message_id,
@@ -40,8 +42,8 @@ impl Commissioner {
     }
 
     /// Gets raw active operational dataset TLVs.
-    pub async fn get_raw_active_dataset(&mut self, flags: DatasetFlags) -> Result<Vec<u8>> {
-        let (message_id, token) = self.next_request_identity();
+    pub async fn get_raw_active_dataset(&self, flags: DatasetFlags) -> Result<Vec<u8>> {
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::dataset_get_request(
             CommissionerOperation::GetActiveDataset,
             message_id,
@@ -57,13 +59,13 @@ impl Commissioner {
     /// Sets the active operational dataset.
     ///
     /// The Active Timestamp TLV is mandatory.
-    pub async fn set_active_dataset(&mut self, dataset: &ActiveOperationalDataset) -> Result<()> {
+    pub async fn set_active_dataset(&self, dataset: &ActiveOperationalDataset) -> Result<()> {
         require_dataset_tlvs(
             dataset,
             &[(crate::dataset::TLV_ACTIVE_TIMESTAMP, "Active Timestamp")],
         )?;
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::dataset_set_request(
             CommissionerOperation::SetActiveDataset,
             message_id,
@@ -79,7 +81,7 @@ impl Commissioner {
     ///
     /// The Active Timestamp, Pending Timestamp, and Delay Timer TLVs are
     /// mandatory.
-    pub async fn set_pending_dataset(&mut self, dataset: &PendingOperationalDataset) -> Result<()> {
+    pub async fn set_pending_dataset(&self, dataset: &PendingOperationalDataset) -> Result<()> {
         require_dataset_tlvs(
             dataset,
             &[
@@ -89,7 +91,7 @@ impl Commissioner {
             ],
         )?;
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::dataset_set_request(
             CommissionerOperation::SetPendingDataset,
             message_id,
@@ -106,7 +108,7 @@ impl Commissioner {
     /// The Pending Timestamp (carried in the Secure Dissemination TLV) and
     /// Delay Timer TLVs are mandatory.
     pub async fn set_secure_pending_dataset(
-        &mut self,
+        &self,
         max_retrieval_timer: u32,
         dataset: &PendingOperationalDataset,
     ) -> Result<()> {
@@ -120,7 +122,7 @@ impl Commissioner {
         let session_id = self.session_id_required()?;
         let pbbr = self.primary_bbr_aloc().await?;
         let retrieval_uri = format!("coaps://[{pbbr}]{}", meshcop::uri::MGMT_PENDING_GET);
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::secure_pending_set_request(
             message_id,
             token,
@@ -141,11 +143,11 @@ impl Commissioner {
 
     /// Gets the commissioner dataset from the leader.
     pub async fn get_commissioner_dataset(
-        &mut self,
+        &self,
         flags: CommissionerDatasetFlags,
     ) -> Result<Dataset> {
         let leader = self.leader_aloc().await?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::dataset_get_request(
             CommissionerOperation::GetCommissionerDataset,
             message_id,
@@ -166,7 +168,13 @@ impl Commissioner {
     ///
     /// The Commissioner Session ID and Border Agent Locator TLVs are managed
     /// by the protocol and are removed from `dataset` before sending.
-    pub async fn set_commissioner_dataset(&mut self, dataset: &Dataset) -> Result<()> {
+    pub async fn set_commissioner_dataset(&self, dataset: &Dataset) -> Result<()> {
+        let _writing = self.shared.commissioner_dataset_writes.lock().await;
+        self.write_commissioner_dataset(dataset).await
+    }
+
+    /// Sets the commissioner dataset; the caller holds the write lock.
+    async fn write_commissioner_dataset(&self, dataset: &Dataset) -> Result<()> {
         let session_id = self.session_id_required()?;
         let dataset = strip_managed_commissioner_tlvs(dataset);
         if dataset.entries().is_empty() {
@@ -175,7 +183,7 @@ impl Commissioner {
             ));
         }
         let leader = self.leader_aloc().await?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::dataset_set_request(
             CommissionerOperation::SetCommissionerDataset,
             message_id,
@@ -198,8 +206,10 @@ impl Commissioner {
     /// The current steering data is fetched from the leader, the joiner ID is
     /// added to its Bloom filter, and the result is written back through
     /// MGMT_COMMISSIONER_SET. PSKd provisioning stays with the configured
-    /// [`JoinerHandler`](super::super::JoinerHandler).
-    pub async fn enable_joiner(&mut self, joiner_id: &[u8; 8]) -> Result<()> {
+    /// [`JoinerHandler`](super::super::JoinerHandler). Concurrent calls from
+    /// cloned handles are serialized, so none of their joiners is lost.
+    pub async fn enable_joiner(&self, joiner_id: &[u8; 8]) -> Result<()> {
+        let _writing = self.shared.commissioner_dataset_writes.lock().await;
         let current = self
             .get_commissioner_dataset(CommissionerDatasetFlags::STEERING_DATA)
             .await?;
@@ -210,11 +220,11 @@ impl Commissioner {
         crate::crypto::add_joiner_to_steering_data(&mut steering_data, joiner_id);
         let mut dataset = Dataset::default();
         dataset.set_raw(meshcop::TLV_STEERING_DATA, steering_data);
-        self.set_commissioner_dataset(&dataset).await
+        self.write_commissioner_dataset(&dataset).await
     }
 
     /// Opens steering to every joiner, or closes it for all joiners.
-    pub async fn enable_all_joiners(&mut self, enable: bool) -> Result<()> {
+    pub async fn enable_all_joiners(&self, enable: bool) -> Result<()> {
         let steering_data = if enable { vec![0xff] } else { vec![0x00] };
         let mut dataset = Dataset::default();
         dataset.set_raw(meshcop::TLV_STEERING_DATA, steering_data);
@@ -222,8 +232,8 @@ impl Commissioner {
     }
 
     /// Gets the Backbone Router dataset.
-    pub async fn get_bbr_dataset(&mut self, flags: CommissionerDatasetFlags) -> Result<Dataset> {
-        let (message_id, token) = self.next_request_identity();
+    pub async fn get_bbr_dataset(&self, flags: CommissionerDatasetFlags) -> Result<Dataset> {
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::dataset_get_request(
             CommissionerOperation::GetBbrDataset,
             message_id,
@@ -237,9 +247,9 @@ impl Commissioner {
     }
 
     /// Sets the Backbone Router dataset.
-    pub async fn set_bbr_dataset(&mut self, dataset: &Dataset) -> Result<()> {
+    pub async fn set_bbr_dataset(&self, dataset: &Dataset) -> Result<()> {
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::dataset_set_request(
             CommissionerOperation::SetBbrDataset,
             message_id,

@@ -8,7 +8,10 @@ use crate::{
     meshcop::{self, CommissionerOperation, diag::NetDiagData},
 };
 
-use super::{Commissioner, check_state_response};
+use super::{
+    Commissioner, check_state_response,
+    requests::{UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN},
+};
 
 impl Commissioner {
     /// Queries diagnostic TLVs from `destination`, or the leader when `None`.
@@ -16,17 +19,13 @@ impl Commissioner {
     /// This uses the DIAG_GET.qry resource, whose answers arrive asynchronously
     /// as [`CommissionerEvent::DiagnosticAnswer`](super::super::CommissionerEvent::DiagnosticAnswer).
     /// For a single node, prefer [`Commissioner::get_diagnostics`].
-    pub async fn diagnostic_get(
-        &mut self,
-        destination: Option<Ipv6Addr>,
-        flags: u64,
-    ) -> Result<()> {
+    pub async fn diagnostic_get(&self, destination: Option<Ipv6Addr>, flags: u64) -> Result<()> {
         self.session_id_required()?;
         let destination = match destination {
             Some(destination) => destination,
             None => self.leader_aloc().await?,
         };
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::diagnostic_request(
             CommissionerOperation::DiagnosticGet,
             message_id,
@@ -53,18 +52,14 @@ impl Commissioner {
     /// Requires an active commissioner session. `destination` must be a unicast
     /// mesh address; the DIAG_GET.req resource is unicast-only (use
     /// [`Commissioner::diagnostic_get`] for a multicast query).
-    pub async fn get_diagnostics(
-        &mut self,
-        destination: Ipv6Addr,
-        flags: u64,
-    ) -> Result<NetDiagData> {
+    pub async fn get_diagnostics(&self, destination: Ipv6Addr, flags: u64) -> Result<NetDiagData> {
         self.session_id_required()?;
         if destination.is_multicast() {
             return Err(Error::InvalidState(
                 "get_diagnostics requires a unicast destination; use diagnostic_get for a query",
             ));
         }
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::diagnostic_request(
             CommissionerOperation::DiagnosticGetUnicast,
             message_id,
@@ -86,17 +81,13 @@ impl Commissioner {
     }
 
     /// Resets diagnostic TLVs on `destination`, or the leader when `None`.
-    pub async fn diagnostic_reset(
-        &mut self,
-        destination: Option<Ipv6Addr>,
-        flags: u64,
-    ) -> Result<()> {
+    pub async fn diagnostic_reset(&self, destination: Option<Ipv6Addr>, flags: u64) -> Result<()> {
         self.session_id_required()?;
         let destination = match destination {
             Some(destination) => destination,
             None => self.leader_aloc().await?,
         };
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::diagnostic_request(
             CommissionerOperation::DiagnosticReset,
             message_id,

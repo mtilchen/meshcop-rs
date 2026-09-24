@@ -38,7 +38,7 @@ use std::time::Duration;
 use meshcop::{
     commissioner::{
         Commissioner, CommissionerConfig, CommissionerDatasetFlags, CommissionerEvent,
-        CommissionerState, DatasetFlags, PetitionResponse, ResultCode, StaticJoinerHandler,
+        DatasetFlags, Events, PetitionResponse, ResultCode, StaticJoinerHandler,
     },
     dataset::Dataset,
     error::Error,
@@ -57,16 +57,18 @@ async fn interop_commissioner_session_against_openthread() -> meshcop::Result<()
     let (border_agent, expected) = interop_inputs()?;
     let config = CommissionerConfig::from_dataset("meshcop-session", &expected)?;
 
-    // DTLS 1.2 + EC J-PAKE handshake authenticated with the network PSKc.
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
-
-    // COMM_PET.req: become the active commissioner.
-    let petition = commissioner.petition().await?;
-    assert_ne!(petition.session_id, 0, "petition returned session id 0");
+    // DTLS 1.2 + EC J-PAKE handshake authenticated with the network PSKc,
+    // then COMM_PET.req to become the active commissioner.
+    let (commissioner, _events) = Commissioner::connect(config, border_agent).await?;
+    assert_ne!(
+        commissioner.session_id(),
+        Some(0),
+        "petition returned session id 0"
+    );
 
     // Run the session body without `?` so the commissioner always resigns,
     // leaving the agent free for the next run even when an assertion fails.
-    let session = exercise_session(&mut commissioner, &expected).await;
+    let session = exercise_session(&commissioner, &expected).await;
     let resign = commissioner.resign().await;
     session?;
     resign
@@ -151,9 +153,10 @@ async fn run_packet_loss_case(
     });
 
     let config = CommissionerConfig::from_dataset("meshcop-loss", dataset)?;
-    let mut commissioner = Commissioner::connect(config, proxy_addr).await?;
-    let petition = commissioner.petition().await;
-    let resign = resign_if_active(&mut commissioner).await;
+    let (petition, resign) = match Commissioner::connect(config, proxy_addr).await {
+        Ok((commissioner, _events)) => (Ok(()), commissioner.resign().await),
+        Err(error) => (Err(error), Ok(())),
+    };
     proxy_task.abort();
     match proxy_task.await {
         Err(error) if error.is_cancelled() => {}
@@ -378,12 +381,9 @@ fn interop_inputs() -> meshcop::Result<(SocketAddr, Dataset)> {
 async fn interop_wrong_pskc_is_rejected_and_border_agent_recovers() -> meshcop::Result<()> {
     let (border_agent, expected) = interop_inputs()?;
     let wrong_config = CommissionerConfig::pskc("meshcop-wrong-pskc", WRONG_PSKC);
-    let mut rejected = Commissioner::connect(wrong_config, border_agent).await?;
-
-    let error = rejected
-        .petition()
+    let error = Commissioner::connect(wrong_config, border_agent)
         .await
-        .expect_err("a commissioner with the wrong PSKc must not petition successfully");
+        .expect_err("a commissioner with the wrong PSKc must not connect");
     let is_authentication_failure = matches!(
         &error,
         Error::Dtls(meshcop_dtls::Error::Crypto(message))
@@ -393,15 +393,17 @@ async fn interop_wrong_pskc_is_rejected_and_border_agent_recovers() -> meshcop::
         is_authentication_failure,
         "wrong PSKc did not produce a fatal DTLS authentication alert: {error}"
     );
-    rejected.disconnect();
 
     // A failed authentication attempt must not wedge the border agent. Prove
     // that a fresh commissioner with the real PSKc can immediately establish
     // DTLS, petition, and resign.
     let config = CommissionerConfig::from_dataset("meshcop-auth-recovery", &expected)?;
-    let mut recovered = Commissioner::connect(config, border_agent).await?;
-    let petition = recovered.petition().await?;
-    assert_ne!(petition.session_id, 0, "petition returned session id 0");
+    let (recovered, _events) = Commissioner::connect(config, border_agent).await?;
+    assert_ne!(
+        recovered.session_id(),
+        Some(0),
+        "petition returned session id 0"
+    );
     recovered.resign().await
 }
 
@@ -411,14 +413,14 @@ async fn interop_competing_commissioner_is_rejected_then_can_take_over() -> mesh
     let (border_agent, expected) = interop_inputs()?;
     let primary_config = CommissionerConfig::from_dataset(PRIMARY_COMMISSIONER_ID, &expected)?;
     let contender_config = CommissionerConfig::from_dataset(CONTENDING_COMMISSIONER_ID, &expected)?;
-    let mut primary = Commissioner::connect(primary_config, border_agent).await?;
-    let mut contender = Commissioner::connect(contender_config, border_agent).await?;
+    let (primary, _primary_events) = Commissioner::connect(primary_config, border_agent).await?;
+    let (contender, _contender_events) =
+        Commissioner::connect_only(contender_config, border_agent).await?;
 
-    primary.petition().await?;
     let rejection = verify_contention_rejection(contender.petition().await);
     if let Err(error) = rejection {
-        let _ = resign_if_active(&mut contender).await;
-        let _ = resign_if_active(&mut primary).await;
+        let _ = contender.resign().await;
+        let _ = primary.resign().await;
         return Err(error);
     }
 
@@ -431,8 +433,8 @@ async fn interop_competing_commissioner_is_rejected_then_can_take_over() -> mesh
         Ok(())
     }
     .await;
-    let contender_resign = resign_if_active(&mut contender).await;
-    let primary_resign = resign_if_active(&mut primary).await;
+    let contender_resign = resign_if_open(&contender).await;
+    let primary_resign = resign_if_open(&primary).await;
     takeover?;
     contender_resign?;
     primary_resign
@@ -443,10 +445,9 @@ async fn interop_competing_commissioner_is_rejected_then_can_take_over() -> mesh
 async fn interop_network_diagnostics_against_openthread() -> meshcop::Result<()> {
     let (border_agent, expected) = interop_inputs()?;
     let config = CommissionerConfig::from_dataset("meshcop-diagnostics", &expected)?;
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
-    commissioner.petition().await?;
+    let (commissioner, mut events) = Commissioner::connect(config, border_agent).await?;
 
-    let session = exercise_diagnostics(&mut commissioner, &expected).await;
+    let session = exercise_diagnostics(&commissioner, &mut events, &expected).await;
     let resign = commissioner.resign().await;
     session?;
     resign
@@ -471,16 +472,18 @@ fn verify_contention_rejection(result: meshcop::Result<PetitionResponse>) -> mes
     }
 }
 
-async fn resign_if_active(commissioner: &mut Commissioner) -> meshcop::Result<()> {
-    if commissioner.state() == CommissionerState::Active {
-        commissioner.resign().await
-    } else {
-        Ok(())
+/// Resigns a session that has not already ended (the primary resigns during
+/// the takeover).
+async fn resign_if_open(commissioner: &Commissioner) -> meshcop::Result<()> {
+    match commissioner.resign().await {
+        Err(Error::SessionClosed) => Ok(()),
+        result => result,
     }
 }
 
 async fn exercise_diagnostics(
-    commissioner: &mut Commissioner,
+    commissioner: &Commissioner,
+    events: &mut Events,
     expected: &Dataset,
 ) -> meshcop::Result<()> {
     let leader_aloc = leader_aloc_from_dataset(expected)?;
@@ -495,23 +498,23 @@ async fn exercise_diagnostics(
     // DIAG_GET.qry is a separate asynchronous resource: the command is
     // acknowledged first and the leader later emits DIAG_GET.ans.
     commissioner.diagnostic_get(None, DIAGNOSTIC_FLAGS).await?;
-    let asynchronous = wait_for_diagnostic_answer(commissioner).await?;
+    let asynchronous = wait_for_diagnostic_answer(events).await?;
     require_diagnostic_fields("asynchronous", &asynchronous)
 }
 
-async fn wait_for_diagnostic_answer(
-    commissioner: &mut Commissioner,
-) -> meshcop::Result<Box<NetDiagData>> {
+async fn wait_for_diagnostic_answer(events: &mut Events) -> meshcop::Result<Box<NetDiagData>> {
     let deadline = tokio::time::Instant::now() + DIAGNOSTIC_DEADLINE;
     loop {
-        match tokio::time::timeout_at(deadline, commissioner.next_event()).await {
+        match tokio::time::timeout_at(deadline, events.next()).await {
             Err(_elapsed) => {
                 return Err(Error::Timeout("OpenThread diagnostic answer timed out"));
             }
-            Ok(Ok(Some(CommissionerEvent::DiagnosticAnswer { data, .. }))) => return Ok(data),
-            Ok(Ok(_)) => {}
-            Ok(Err(Error::Dtls(meshcop_dtls::Error::Timeout(_)))) => {}
-            Ok(Err(error)) => return Err(error),
+            Ok(Some(CommissionerEvent::DiagnosticAnswer { data, .. })) => return Ok(data),
+            Ok(Some(CommissionerEvent::SessionLost { reason })) => {
+                return Err(Error::SessionLost(reason));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(Error::SessionClosed),
         }
     }
 }
@@ -546,10 +549,7 @@ fn leader_aloc_from_dataset(dataset: &Dataset) -> meshcop::Result<Ipv6Addr> {
     Ok(Ipv6Addr::from(octets))
 }
 
-async fn exercise_session(
-    commissioner: &mut Commissioner,
-    expected: &Dataset,
-) -> meshcop::Result<()> {
+async fn exercise_session(commissioner: &Commissioner, expected: &Dataset) -> meshcop::Result<()> {
     // COMM_KA.req on the established session.
     assert_eq!(
         commissioner.keep_alive().await?,
@@ -612,9 +612,12 @@ async fn interop_joiner_commissioning_against_openthread() -> meshcop::Result<()
         .channel;
     let config = CommissionerConfig::from_dataset("meshcop-interop", &expected)?;
 
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
-    let petition = commissioner.petition().await?;
-    assert_ne!(petition.session_id, 0, "petition returned session id 0");
+    let (commissioner, mut events) = Commissioner::connect(config, border_agent).await?;
+    assert_ne!(
+        commissioner.session_id(),
+        Some(0),
+        "petition returned session id 0"
+    );
 
     // The handler authenticates the joiner's DTLS session with its PSKd and
     // approves its JOIN_FIN; enabling by EUI-64 exercises the SHA-256 joiner
@@ -622,9 +625,9 @@ async fn interop_joiner_commissioning_against_openthread() -> meshcop::Result<()
     // own computation of both.
     let mut handler = StaticJoinerHandler::new();
     handler.enable_eui64(JOINER_EUI64, JOINER_PSKD);
-    commissioner.set_joiner_handler(handler);
+    commissioner.set_joiner_handler(handler)?;
 
-    let session = commission_joiner(&mut commissioner, &joiner_cli, channel).await;
+    let session = commission_joiner(&commissioner, &mut events, &joiner_cli, channel).await;
     let resign = commissioner.resign().await;
     session?;
     resign
@@ -641,7 +644,8 @@ fn require_mutation_gate() -> meshcop::Result<()> {
 }
 
 async fn commission_joiner(
-    commissioner: &mut Commissioner,
+    commissioner: &Commissioner,
+    events: &mut Events,
     joiner_cli: &std::path::Path,
     channel: u16,
 ) -> meshcop::Result<()> {
@@ -657,10 +661,10 @@ async fn commission_joiner(
         .command(&format!("joiner start {JOINER_PSKD}"))
         .await?;
 
-    // Drive the joiner to completion in the background while this task keeps
-    // pumping commissioner events: every RLY_RX hop of the joiner's DTLS
-    // handshake, the JOIN_FIN exchange, and the KEK hand-off to the joiner
-    // router are serviced inside `next_event`.
+    // Drive the joiner to completion in the background while this task
+    // watches commissioner events. The session services every RLY_RX hop of
+    // the joiner's DTLS handshake, the JOIN_FIN exchange, the KEK hand-off to
+    // the joiner router, and its own keep-alives.
     let mut driver = tokio::spawn(async move {
         joiner.wait_for_line("Join success", "Join failed").await?;
         joiner.command("thread start").await?;
@@ -669,8 +673,6 @@ async fn commission_joiner(
     });
 
     let deadline = tokio::time::Instant::now() + JOIN_DEADLINE;
-    let keepalive_interval = commissioner.config().keepalive_interval;
-    let mut keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
     let mut connected = false;
     let mut finalized = false;
     let mut joined = false;
@@ -684,14 +686,6 @@ async fn commission_joiner(
                 "joiner was entrusted but never attached to the network"
             }));
         }
-        if tokio::time::Instant::now() >= keepalive_deadline {
-            if commissioner.keep_alive().await? != ResultCode::Accept {
-                return Err(Error::InvalidState(
-                    "commissioner keep-alive was rejected during joiner commissioning",
-                ));
-            }
-            keepalive_deadline = tokio::time::Instant::now() + keepalive_interval;
-        }
         tokio::select! {
             result = &mut driver, if !joined => {
                 result.map_err(|err| {
@@ -703,20 +697,24 @@ async fn commission_joiner(
                 })??;
                 joined = true;
             }
-            event = tokio::time::timeout(Duration::from_secs(2), commissioner.next_event()) => {
+            event = tokio::time::timeout(Duration::from_secs(2), events.next()) => {
                 match event {
                     // No traffic in this poll tick; check the deadline again.
                     Err(_elapsed) => {}
-                    Ok(event) => match event? {
-                        Some(CommissionerEvent::JoinerConnected { joiner_id: id }) => {
+                    Ok(None) => return Err(Error::SessionClosed),
+                    Ok(Some(event)) => match event {
+                        CommissionerEvent::SessionLost { reason } => {
+                            return Err(Error::SessionLost(reason));
+                        }
+                        CommissionerEvent::JoinerConnected { joiner_id: id } => {
                             assert_eq!(id, joiner_id, "an unexpected joiner connected");
                             connected = true;
                         }
-                        Some(CommissionerEvent::JoinerFinalized {
+                        CommissionerEvent::JoinerFinalized {
                             joiner_id: id,
                             accepted,
                             info,
-                        }) => {
+                        } => {
                             assert_eq!(id, joiner_id, "an unexpected joiner finalized");
                             assert!(accepted, "the joiner's JOIN_FIN was rejected");
                             assert!(

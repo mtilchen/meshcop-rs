@@ -10,11 +10,11 @@ public API), excluding CCM (Commercial Commissioning Mode) per project scope.
 | C++ `Commissioner` API | Rust equivalent | Status |
 | --- | --- | --- |
 | `Init` / `GetConfig` | `Commissioner::connect(config, addr)` / `config()` | ✅ |
-| `Connect` / `Disconnect` | `connect` (DTLS established lazily) / `disconnect` | ✅ |
-| `GetSessionId` / `GetState` / `IsActive` | `session_id()` / `state()` | ✅ |
+| `Connect` / `Disconnect` | `connect_only` (DTLS only) or `connect` (DTLS and petition) / `resign`, or dropping every handle | ✅ |
+| `GetSessionId` / `GetState` / `IsActive` | `session_id()` / `status()` / `status().is_active()` | ✅ |
 | `IsCcmMode` / `GetDomainName` | CCM excluded; `enable_ccm` is rejected | ✅ (by scope) |
 | `Petition` / `Resign` | `petition` / `resign` | ✅ |
-| keep-alive (internal timer) | `keep_alive()` (caller-driven) | ✅* see [Async model](#async-model) |
+| keep-alive (internal timer) | session-driven by default (`KeepAlive::Automatic`); `keep_alive()` with `KeepAlive::Manual` | ✅ see [Async model](#async-model) |
 | `GetActiveDataset` / `GetRawActiveDataset` / `SetActiveDataset` | `get_active_dataset` / `get_raw_active_dataset` / `set_active_dataset` (Active Timestamp mandatory, as in C++) | ✅ |
 | `GetPendingDataset` / `SetPendingDataset` | `get_pending_dataset` / `set_pending_dataset` (Active/Pending Timestamp and Delay Timer mandatory, as in C++) | ✅ |
 | `SetSecurePendingDataset` | `set_secure_pending_dataset` (proxied to the PBBR ALOC, retrieval URI built from the PBBR address; Pending Timestamp and Delay Timer mandatory) | ✅⁺ (CCM-gated in C++; offered here without the gate) |
@@ -29,7 +29,7 @@ public API), excluding CCM (Commercial Commissioning Mode) per project scope.
 | `ComputeJoinerId` | `crypto::compute_joiner_id` | ✅ |
 | `AddJoiner` (steering data) | `crypto::add_joiner_to_steering_data` | ✅ |
 | `GetVersion` | `meshcop::version()` | ✅ |
-| `CancelRequests` | not needed: requests are `async` and cancelled by dropping futures | ✅ (idiom) |
+| `CancelRequests` | not needed: dropping a request's future stops waiting for it; the exchange itself still completes or times out in the session | ✅ (idiom) |
 
 ## CommissionerHandler callbacks
 
@@ -79,15 +79,17 @@ OpenThread's wire behavior instead of the C++ code:
 ## Async model
 
 The C++ library is callback-driven over libevent and re-arms an internal
-keep-alive timer. This crate is `async`/await-driven and does not spawn a
-background commissioner task: the application awaits `keep_alive()` on the
-configured `CommissionerConfig::keepalive_interval`, while unsolicited traffic
-is consumed through `Commissioner::next_event()`. Intervals are validated
-against the reference's inclusive 30–45 second range. The bundled REPL services
-an absolute keep-alive deadline while waiting for input and disconnects after a
-failed or non-accepting response; the `netdiag` collector sends proactively
-before a diagnostic wait could cross the same deadline. Examples and live tests
-resign before exiting, per the working agreement.
+keep-alive timer. This crate is `async`/await-driven with the same division of
+labour: `Commissioner::connect` spawns a session task on the current Tokio
+runtime that owns the DTLS session, sends keep-alives on the configured
+`CommissionerConfig::keepalive_interval` (validated against the reference's
+inclusive 30–45 second range), matches responses to requests, and publishes
+unsolicited traffic as `CommissionerEvent`s on an `Events` stream in place of
+the `CommissionerHandler` callbacks. Handles are cheap clones of one session.
+A rejected, pending, or failed keep-alive ends the session and publishes
+`CommissionerEvent::SessionLost`; automatic reconnection is not implemented
+yet (see `docs/design/session-driver.md`). Examples and live tests resign
+before exiting, per the working agreement.
 
 ## App-layer features (`crates/ot-commissioner-cli`) — out of library scope
 

@@ -65,35 +65,108 @@ This Cargo workspace contains four crates:
 ## Example
 
 ```rust
+use std::{net::SocketAddr, time::Duration};
+
 use meshcop::{
-    commissioner::{Commissioner, CommissionerConfig, DatasetFlags},
+    commissioner::{
+        Commissioner, CommissionerConfig, CommissionerEvent, DatasetFlags, StaticJoinerHandler,
+    },
     dataset::Dataset,
 };
 
-#[tokio::main]
-async fn main() -> meshcop::Result<()> {
+#[tokio::main(flavor = "local")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The commissioner authenticates with a PSKc. Derive it from an operational
     // dataset (the usual case — dataset hex is what Thread tooling hands you):
-    let dataset_hex = std::env::var("THREAD_DATASET_HEX").expect("dataset hex");
-    let dataset = Dataset::from_hex(dataset_hex)?;
+    let dataset = Dataset::from_hex(std::env::var("THREAD_DATASET_HEX")?)?;
     let config = CommissionerConfig::from_dataset("my-commissioner", &dataset)?;
     // ...or pass a Pskc (or a raw 16-byte array) straight in:
     //   let config = CommissionerConfig::pskc("my-commissioner", pskc_bytes);
+    let border_agent: SocketAddr = std::env::var("MESHCOP_BORDER_AGENT")?.parse()?;
 
-    // Connect to the border agent (host:port) and run the DTLS EC J-PAKE
-    // petition to become the active commissioner.
-    let border_agent = "192.0.2.1:49191".parse().expect("border agent address");
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
-    let petition = commissioner.petition().await?;
-    println!("active commissioner, session 0x{:04x}", petition.session_id);
+    // One call: DTLS handshake (EC J-PAKE over the PSKc), petition, and a
+    // background task that keeps the session alive from here on.
+    let (commissioner, mut events) = Commissioner::connect(config, border_agent).await?;
 
-    // Read the live active dataset, then resign cleanly.
-    let active = commissioner.get_active_dataset(DatasetFlags::ALL).await?;
-    println!("network name: {:?}", active.network_name()?);
+    // Let joiners in: the handler answers their DTLS handshakes with this PSKd,
+    // and opening the steering data tells the network to accept them.
+    let mut joiners = StaticJoinerHandler::new();
+    joiners.enable_all("J01NME");
+    commissioner.set_joiner_handler(joiners)?;
+    commissioner.enable_all_joiners(true).await?;
+
+    // The handle is a cheap clone, usable from any task.
+    let monitor = commissioner.clone();
+    tokio::spawn(async move {
+        let mut every_minute = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            every_minute.tick().await;
+            match monitor.get_active_dataset(DatasetFlags::ALL).await {
+                Ok(active) => println!("network: {:?}", active.network_name()),
+                Err(error) => break eprintln!("monitor stopped: {error}"),
+            }
+        }
+    });
+
+    // No keep-alive bookkeeping: just react to what the network tells us.
+    while let Some(event) = events.next().await {
+        match event {
+            CommissionerEvent::JoinerFinalized {
+                joiner_id,
+                accepted: true,
+                info,
+                ..
+            } => {
+                println!(
+                    "joined: {joiner_id:02x?} ({} {})",
+                    info.vendor_name, info.vendor_model
+                );
+                break;
+            }
+            CommissionerEvent::SessionLost { reason } => {
+                return Err(format!("session lost: {reason}").into());
+            }
+            _ => {}
+        }
+    }
+
+    // Close the network to joiners again, then resign cleanly.
+    commissioner.enable_all_joiners(false).await?;
     commissioner.resign().await?;
     Ok(())
 }
 ```
+
+### Sessions
+
+`Commissioner::connect` returns a cheap, cloneable handle and an `Events`
+stream. A background task started on the current Tokio runtime (any flavor,
+including `LocalRuntime`) runs the session:
+
+- It **sends keep-alives** every `keepalive_interval` while the petition is
+  active. Set `KeepAlive::Manual` to send them yourself with `keep_alive()`.
+- It **matches responses to requests**, retransmits lost confirmable requests,
+  and lets handle clones in different tasks issue requests concurrently. They
+  are sent one at a time; keep-alives never wait behind them.
+- It **publishes events** (scan reports, diagnostics answers, joiner progress,
+  keep-alive results, and `SessionLost`) to every `Events` subscriber. A
+  subscriber that falls more than `event_capacity` events behind receives
+  `Lagged` instead of slowing the session down.
+- It **commissions joiners** through a `JoinerHandler` installed with
+  `set_joiner_handler`.
+
+`Commissioner::connect_only` opens the DTLS session without petitioning, which
+is enough to read datasets; call `petition()` later to take the commissioner
+role. An OpenThread border agent closes an unpetitioned session about 50
+seconds after the handshake; the session then reopens on the next request.
+The same agent silently drops proxied (UDP_TX) traffic, such as network
+diagnostics, until the petition is accepted.
+
+A session ends when you call `resign()`, when the border agent rejects a
+keep-alive or closes the session, or when every handle is dropped. Requests
+still outstanding then fail with `Error::SessionLost`. Call `resign()` before
+your program exits: a runtime that is shutting down cancels the background
+task before it can resign on its own.
 
 The `meshcop-netdiag` crate provides a network-diagnostic topology mapper; run
 it with `cargo run -p meshcop-netdiag -- --help`. The

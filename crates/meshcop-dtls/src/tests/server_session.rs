@@ -736,6 +736,53 @@ async fn established_dtls_server_session_reports_client_alerts() -> crate::Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn established_dtls_server_session_reads_every_record_of_a_coalesced_datagram()
+-> crate::Result<()> {
+    let server = DtlsServer::bind("127.0.0.1:0").await?;
+    let server_addr = server.local_addr();
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+    client_socket.connect(server_addr).await?;
+    let pskc = [0x42; 16];
+    let deadline = core::time::Duration::from_secs(2);
+
+    let server_task = async move {
+        let mut session = server.accept(&pskc, deadline).await?;
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            received.push(
+                session
+                    .recv_application_data(deadline)
+                    .await
+                    .map_err(crate::Error::from)?,
+            );
+        }
+        crate::Result::Ok(received)
+    };
+    let client_task = async {
+        let session = DtlsSession::connect(&client_socket, &pskc, deadline).await?;
+        let key_block = &session.key_material().key_block;
+        let mut datagram = Vec::new();
+        for (sequence, plaintext) in [(1, b"first"), (2, b"later")] {
+            let record = protect_aes_128_ccm_8_record(
+                ContentType::ApplicationData,
+                1,
+                sequence,
+                RecordProtectionKey::new(key_block.client_write_key),
+                &key_block.client_write_iv,
+                plaintext,
+            )?;
+            datagram.extend_from_slice(&record.encode()?);
+        }
+        client_socket.send(&datagram).await?;
+        crate::Result::Ok(())
+    };
+    let (server_result, client_result) = tokio::join!(server_task, client_task);
+    client_result?;
+    assert_eq!(server_result?, [b"first".to_vec(), b"later".to_vec()]);
+    Ok(())
+}
+
 #[test]
 fn cookie_generator_binds_cookies_to_the_client_random() {
     let mut rng = OsRng;

@@ -2,22 +2,117 @@
 
 use crate::meshcop::NetDiagData;
 
-/// Commissioner state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommissionerState {
-    /// Not connected.
-    Disabled,
-    /// UDP socket connected to a border agent; DTLS is not active.
+/// Where a commissioner session stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionStatus {
+    /// The DTLS session is up and the commissioner has not petitioned.
     Connected,
-    /// Petition request is in flight.
+    /// A connect-only session was closed by the border agent. It is opened
+    /// again, with a new DTLS handshake, when a request needs it.
+    Idle,
+    /// A petition is in flight.
     Petitioning,
-    /// Commissioner petition accepted.
-    Active,
+    /// The petition was accepted.
+    Active {
+        /// Commissioner session ID allocated by the Leader.
+        session_id: u16,
+    },
+    /// The session has ended; the handle can no longer be used.
+    Closed {
+        /// Why the session ended.
+        reason: CloseReason,
+    },
+}
+
+impl SessionStatus {
+    /// Returns the commissioner session ID while the session is active.
+    pub const fn session_id(&self) -> Option<u16> {
+        match self {
+            Self::Active { session_id } => Some(*session_id),
+            _ => None,
+        }
+    }
+
+    /// Returns whether the petition has been accepted and the session has not
+    /// ended.
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Active { .. })
+    }
+}
+
+/// Why a commissioner session ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CloseReason {
+    /// The application ended the session, by resigning or by dropping every
+    /// [`super::Commissioner`] handle.
+    Resigned,
+    /// The border agent answered a keep-alive with Reject.
+    KeepAliveRejected,
+    /// The border agent answered a keep-alive with Pending.
+    KeepAlivePending,
+    /// A keep-alive exchange failed, for example by timing out.
+    KeepAliveFailed {
+        /// Description of the failure.
+        error: String,
+    },
+    /// The border agent closed the DTLS session with `close_notify`.
+    PeerClosed,
+    /// Sending or receiving on the session failed.
+    TransportFailed {
+        /// Description of the failure.
+        error: String,
+    },
+    /// The session's background task stopped without ending the session,
+    /// because it panicked (for example in a [`super::JoinerHandler`]) or its
+    /// runtime shut down. No [`CommissionerEvent::SessionLost`] is published
+    /// for this reason; [`super::Commissioner::status`] reports it.
+    TaskStopped,
+}
+
+impl core::fmt::Display for CloseReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Resigned => f.write_str("the application ended the session"),
+            Self::KeepAliveRejected => f.write_str("a keep-alive was rejected"),
+            Self::KeepAlivePending => f.write_str("a keep-alive was answered with Pending"),
+            Self::KeepAliveFailed { error } => write!(f, "a keep-alive failed: {error}"),
+            Self::PeerClosed => f.write_str("the border agent closed the DTLS session"),
+            Self::TransportFailed { error } => write!(f, "the transport failed: {error}"),
+            Self::TaskStopped => f.write_str("the session task stopped unexpectedly"),
+        }
+    }
+}
+
+/// Where a raw MeshCoP request is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    /// The border agent, directly over the commissioner DTLS session.
+    BorderAgent,
+    /// A mesh address, through the border agent's UDP_TX/UDP_RX proxy.
+    Mesh {
+        /// Destination IPv6 address on the Thread mesh.
+        address: std::net::Ipv6Addr,
+        /// Destination UDP port.
+        port: u16,
+    },
 }
 
 /// Events emitted by a commissioner session.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommissionerEvent {
+    /// The session ended for a reason other than the application ending it.
+    SessionLost {
+        /// Why the session ended.
+        reason: CloseReason,
+    },
+    /// This subscriber fell behind and missed events.
+    Lagged {
+        /// Number of events that were dropped for this subscriber.
+        missed: u64,
+    },
     /// Keepalive response status.
     KeepAliveResponse(ResultCode),
     /// Dataset changed notification.

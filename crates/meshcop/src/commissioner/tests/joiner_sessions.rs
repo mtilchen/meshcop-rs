@@ -851,211 +851,223 @@ fn static_joiner_handler_matches_ids_and_wildcards() {
     assert_eq!(by_eui.joiner_pskd(&derived).as_deref(), Some("EUIPSK"));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn commissioner_routes_relay_rx_into_joiner_sessions() {
-    let mut rng = OsRng;
-    let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
-    let mut hello_state = joiner.client_hello_state().unwrap();
-    let client_hello = hello_state.next_client_hello_record().unwrap();
-    let relay_rx = relay_rx_message(&JOINER_IID, &client_hello.encode().unwrap());
+    with_paused_test_deadline(async {
+        let mut rng = OsRng;
+        let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
+        let mut hello_state = joiner.client_hello_state().unwrap();
+        let client_hello = hello_state.next_client_hello_record().unwrap();
+        let relay_rx = relay_rx_message(&JOINER_IID, &client_hello.encode().unwrap());
 
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0x1234)],
-        ),
-        exchange(
-            CommissionerOperation::GetActiveDataset,
-            [
-                ScriptedResponse::Raw(relay_rx),
-                ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
-            ],
-        ),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    let mut handler = StaticJoinerHandler::new();
-    handler.enable_all(PSKD);
-    commissioner.set_joiner_handler(handler);
-    commissioner.petition().await.unwrap();
-    commissioner
-        .get_active_dataset(DatasetFlags::NETWORK_NAME)
-        .await
-        .unwrap();
-
-    // The HelloVerifyRequest must have been relayed back via RLY_TX.
-    let harness = commissioner.scripted_transport().unwrap();
-    let relay_tx = harness
-        .sent_messages()
-        .iter()
-        .find(|message| {
-            message.uri_path().unwrap().as_deref() == Some(crate::meshcop::uri::RELAY_TX)
-        })
-        .expect("no RLY_TX was sent for the joiner");
-    assert_eq!(
-        tlv_value(relay_tx, TLV_JOINER_IID),
-        Some(JOINER_IID.to_vec())
-    );
-    assert_eq!(
-        tlv_value(relay_tx, TLV_JOINER_UDP_PORT),
-        Some(1000u16.to_be_bytes().to_vec())
-    );
-    assert_eq!(
-        tlv_value(relay_tx, crate::meshcop::TLV_JOINER_ROUTER_LOCATOR),
-        Some(0x6800u16.to_be_bytes().to_vec())
-    );
-    assert_eq!(
-        tlv_value(relay_tx, crate::meshcop::TLV_JOINER_ROUTER_KEK),
-        None
-    );
-    let encapsulated = tlv_value(relay_tx, TLV_JOINER_DTLS_ENCAPSULATION).unwrap();
-    let records = DtlsRecord::parse_datagram(&encapsulated).unwrap();
-    parse_unfragmented_handshake_record(&records[0], HandshakeType::HelloVerifyRequest).unwrap();
-
-    // No raw joiner event is surfaced while a handler drives sessions.
-    assert!(matches!(
-        commissioner.next_event().await.unwrap_err(),
-        Error::InvalidState("DTLS session is not established")
-    ));
-}
-
-#[tokio::test]
-async fn joiner_session_survives_the_expiry_sweep_between_relay_messages() {
-    let mut rng = OsRng;
-    let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
-    let mut hello_state = joiner.client_hello_state().unwrap();
-    let client_hello = hello_state
-        .next_client_hello_record()
-        .unwrap()
-        .encode()
-        .unwrap();
-
-    // The same cookie-less ClientHello arrives twice; the expiry sweep that
-    // runs on every relay message must keep the live session in between.
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0x1234)],
-        ),
-        exchange(
-            CommissionerOperation::GetActiveDataset,
-            [
-                ScriptedResponse::Raw(relay_rx_message(&JOINER_IID, &client_hello)),
-                ScriptedResponse::Raw(relay_rx_message(&JOINER_IID, &client_hello)),
-                ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
-            ],
-        ),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    let mut handler = StaticJoinerHandler::new();
-    handler.enable_all(PSKD);
-    commissioner.set_joiner_handler(handler);
-    commissioner.petition().await.unwrap();
-    commissioner
-        .get_active_dataset(DatasetFlags::NETWORK_NAME)
-        .await
-        .unwrap();
-
-    let harness = commissioner.scripted_transport().unwrap();
-    let hello_verifies: Vec<(u64, Vec<u8>)> = harness
-        .sent_messages()
-        .iter()
-        .filter(|message| {
-            message.uri_path().unwrap().as_deref() == Some(crate::meshcop::uri::RELAY_TX)
-        })
-        .map(|relay_tx| {
-            let encapsulated = tlv_value(relay_tx, TLV_JOINER_DTLS_ENCAPSULATION).unwrap();
-            let records = DtlsRecord::parse_datagram(&encapsulated).unwrap();
-            let message =
-                parse_unfragmented_handshake_record(&records[0], HandshakeType::HelloVerifyRequest)
-                    .unwrap();
-            // HelloVerifyRequest body: 2-byte server version, 1-byte cookie
-            // length, cookie.
-            let cookie = message.payload[3..3 + message.payload[2] as usize].to_vec();
-            (records[0].header.sequence_number, cookie)
-        })
-        .collect();
-
-    // RFC 6347 requires each HelloVerifyRequest record sequence to mirror the
-    // triggering ClientHello. A persistent session still keeps one cookie key.
-    let [(first_seq, first_cookie), (second_seq, second_cookie)] = hello_verifies.as_slice() else {
-        panic!(
-            "expected two relayed HelloVerifyRequests, got {}",
-            hello_verifies.len()
-        );
-    };
-    assert_eq!(*first_seq, 0);
-    assert_eq!(*second_seq, 0);
-    assert_eq!(first_cookie, second_cookie);
-}
-
-#[tokio::test]
-async fn commissioner_ignores_disabled_joiners_and_keeps_legacy_events() {
-    let mut rng = OsRng;
-    let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
-    let mut hello_state = joiner.client_hello_state().unwrap();
-    let client_hello = hello_state
-        .next_client_hello_record()
-        .unwrap()
-        .encode()
-        .unwrap();
-
-    // A handler that knows no PSKd ignores the joiner entirely.
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0x1234)],
-        ),
-        exchange(
-            CommissionerOperation::GetActiveDataset,
-            [
-                ScriptedResponse::Raw(relay_rx_message(&JOINER_IID, &client_hello)),
-                ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
-            ],
-        ),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    commissioner.set_joiner_handler(StaticJoinerHandler::new());
-    commissioner.petition().await.unwrap();
-    commissioner
-        .get_active_dataset(DatasetFlags::NETWORK_NAME)
-        .await
-        .unwrap();
-    assert!(
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0x1234)],
+            ),
+            exchange(
+                CommissionerOperation::GetActiveDataset,
+                [
+                    ScriptedResponse::Raw(relay_rx),
+                    ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
+                ],
+            ),
+        ]);
+        let (commissioner, mut commissioner_events) = scripted_commissioner(script, []).await;
+        let mut handler = StaticJoinerHandler::new();
+        handler.enable_all(PSKD);
+        commissioner.set_joiner_handler(handler).unwrap();
+        commissioner.petition().await.unwrap();
         commissioner
-            .scripted_transport()
-            .unwrap()
-            .sent_messages()
-            .is_empty()
-    );
+            .get_active_dataset(DatasetFlags::NETWORK_NAME)
+            .await
+            .unwrap();
 
-    // Without any handler, the raw relay payload surfaces as an event.
-    let script = ScriptedMeshcopTransport::new([
-        exchange(
-            CommissionerOperation::Petition,
-            [ScriptedResponse::petition_accept(0x1234)],
-        ),
-        exchange(
-            CommissionerOperation::GetActiveDataset,
-            [
-                ScriptedResponse::Raw(relay_rx_message(&JOINER_IID, &client_hello)),
-                ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
-            ],
-        ),
-    ]);
-    let mut commissioner = scripted_commissioner(script, []).await;
-    commissioner.petition().await.unwrap();
-    commissioner
-        .get_active_dataset(DatasetFlags::NETWORK_NAME)
-        .await
-        .unwrap();
-    assert_eq!(
-        commissioner.next_event().await.unwrap(),
-        Some(CommissionerEvent::JoinerMessage {
-            joiner_id: JOINER_IID.to_vec(),
-            port: 1000,
-            payload: client_hello.clone(),
-        })
-    );
+        // The HelloVerifyRequest must have been relayed back via RLY_TX.
+        let harness = commissioner.scripted_transport().unwrap();
+        let sent = harness.sent_messages();
+        let relay_tx = sent
+            .iter()
+            .find(|message| {
+                message.uri_path().unwrap().as_deref() == Some(crate::meshcop::uri::RELAY_TX)
+            })
+            .expect("no RLY_TX was sent for the joiner");
+        assert_eq!(
+            tlv_value(relay_tx, TLV_JOINER_IID),
+            Some(JOINER_IID.to_vec())
+        );
+        assert_eq!(
+            tlv_value(relay_tx, TLV_JOINER_UDP_PORT),
+            Some(1000u16.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            tlv_value(relay_tx, crate::meshcop::TLV_JOINER_ROUTER_LOCATOR),
+            Some(0x6800u16.to_be_bytes().to_vec())
+        );
+        assert_eq!(
+            tlv_value(relay_tx, crate::meshcop::TLV_JOINER_ROUTER_KEK),
+            None
+        );
+        let encapsulated = tlv_value(relay_tx, TLV_JOINER_DTLS_ENCAPSULATION).unwrap();
+        let records = DtlsRecord::parse_datagram(&encapsulated).unwrap();
+        parse_unfragmented_handshake_record(&records[0], HandshakeType::HelloVerifyRequest)
+            .unwrap();
+
+        // No raw joiner event is surfaced while a handler drives sessions.
+        assert_no_event(&mut commissioner_events).await;
+    })
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn joiner_session_survives_the_expiry_sweep_between_relay_messages() {
+    with_paused_test_deadline(async {
+        let mut rng = OsRng;
+        let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
+        let mut hello_state = joiner.client_hello_state().unwrap();
+        let client_hello = hello_state
+            .next_client_hello_record()
+            .unwrap()
+            .encode()
+            .unwrap();
+
+        // The same cookie-less ClientHello arrives twice; the expiry sweep that
+        // runs on every relay message must keep the live session in between.
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0x1234)],
+            ),
+            exchange(
+                CommissionerOperation::GetActiveDataset,
+                [
+                    ScriptedResponse::Raw(relay_rx_message(&JOINER_IID, &client_hello)),
+                    ScriptedResponse::Raw(relay_rx_message(&JOINER_IID, &client_hello)),
+                    ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
+                ],
+            ),
+        ]);
+        let (commissioner, _commissioner_events) = scripted_commissioner(script, []).await;
+        let mut handler = StaticJoinerHandler::new();
+        handler.enable_all(PSKD);
+        commissioner.set_joiner_handler(handler).unwrap();
+        commissioner.petition().await.unwrap();
+        commissioner
+            .get_active_dataset(DatasetFlags::NETWORK_NAME)
+            .await
+            .unwrap();
+
+        let harness = commissioner.scripted_transport().unwrap();
+        let hello_verifies: Vec<(u64, Vec<u8>)> = harness
+            .sent_messages()
+            .iter()
+            .filter(|message| {
+                message.uri_path().unwrap().as_deref() == Some(crate::meshcop::uri::RELAY_TX)
+            })
+            .map(|relay_tx| {
+                let encapsulated = tlv_value(relay_tx, TLV_JOINER_DTLS_ENCAPSULATION).unwrap();
+                let records = DtlsRecord::parse_datagram(&encapsulated).unwrap();
+                let message = parse_unfragmented_handshake_record(
+                    &records[0],
+                    HandshakeType::HelloVerifyRequest,
+                )
+                .unwrap();
+                // HelloVerifyRequest body: 2-byte server version, 1-byte cookie
+                // length, cookie.
+                let cookie = message.payload[3..3 + message.payload[2] as usize].to_vec();
+                (records[0].header.sequence_number, cookie)
+            })
+            .collect();
+
+        // RFC 6347 requires each HelloVerifyRequest record sequence to mirror the
+        // triggering ClientHello. A persistent session still keeps one cookie key.
+        let [(first_seq, first_cookie), (second_seq, second_cookie)] = hello_verifies.as_slice()
+        else {
+            panic!(
+                "expected two relayed HelloVerifyRequests, got {}",
+                hello_verifies.len()
+            );
+        };
+        assert_eq!(*first_seq, 0);
+        assert_eq!(*second_seq, 0);
+        assert_eq!(first_cookie, second_cookie);
+    })
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn commissioner_ignores_disabled_joiners_and_keeps_legacy_events() {
+    with_paused_test_deadline(async {
+        let mut rng = OsRng;
+        let joiner = ThreadDtlsHandshake::new(PSKD.as_bytes(), &mut rng);
+        let mut hello_state = joiner.client_hello_state().unwrap();
+        let client_hello = hello_state
+            .next_client_hello_record()
+            .unwrap()
+            .encode()
+            .unwrap();
+
+        // A handler that knows no PSKd ignores the joiner entirely.
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0x1234)],
+            ),
+            exchange(
+                CommissionerOperation::GetActiveDataset,
+                [
+                    ScriptedResponse::Raw(relay_rx_message(&JOINER_IID, &client_hello)),
+                    ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
+                ],
+            ),
+        ]);
+        let (commissioner, _commissioner_events) = scripted_commissioner(script, []).await;
+        commissioner
+            .set_joiner_handler(StaticJoinerHandler::new())
+            .unwrap();
+        commissioner.petition().await.unwrap();
+        commissioner
+            .get_active_dataset(DatasetFlags::NETWORK_NAME)
+            .await
+            .unwrap();
+        assert!(
+            commissioner
+                .scripted_transport()
+                .unwrap()
+                .sent_messages()
+                .is_empty()
+        );
+
+        // Without any handler, the raw relay payload surfaces as an event.
+        let script = ScriptedMeshcopTransport::new([
+            exchange(
+                CommissionerOperation::Petition,
+                [ScriptedResponse::petition_accept(0x1234)],
+            ),
+            exchange(
+                CommissionerOperation::GetActiveDataset,
+                [
+                    ScriptedResponse::Raw(relay_rx_message(&JOINER_IID, &client_hello)),
+                    ScriptedResponse::content(dataset_with_name("after").to_bytes().unwrap()),
+                ],
+            ),
+        ]);
+        let (commissioner, mut commissioner_events) = scripted_commissioner(script, []).await;
+        commissioner.petition().await.unwrap();
+        commissioner
+            .get_active_dataset(DatasetFlags::NETWORK_NAME)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_event(&mut commissioner_events).await,
+            Some(CommissionerEvent::JoinerMessage {
+                joiner_id: JOINER_IID.to_vec(),
+                port: 1000,
+                payload: client_hello.clone(),
+            })
+        );
+    })
+    .await
 }
 
 pub(super) fn relay_rx_message(joiner_iid: &[u8; 8], encapsulated: &[u8]) -> CoapMessage {

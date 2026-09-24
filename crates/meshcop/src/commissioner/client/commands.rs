@@ -9,7 +9,10 @@ use crate::{
     tlv::TlvSet,
 };
 
-use super::Commissioner;
+use super::{
+    Commissioner,
+    requests::{UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN},
+};
 
 impl Commissioner {
     /// Starts an announce-begin operation on `destination`.
@@ -17,14 +20,14 @@ impl Commissioner {
     /// Multicast destinations use non-confirmable signaling and return as soon
     /// as the request is forwarded.
     pub async fn announce_begin(
-        &mut self,
+        &self,
         channel_mask: u32,
         count: u8,
         period_ms: u16,
         destination: Ipv6Addr,
     ) -> Result<()> {
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::announce_begin_request(
             message_id,
             token,
@@ -43,13 +46,13 @@ impl Commissioner {
     /// Conflicts are reported through
     /// [`CommissionerEvent::PanIdConflict`](super::super::CommissionerEvent::PanIdConflict).
     pub async fn pan_id_query(
-        &mut self,
+        &self,
         channel_mask: u32,
         pan_id: u16,
         destination: Ipv6Addr,
     ) -> Result<()> {
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::pan_id_query_request(
             message_id,
             token,
@@ -67,7 +70,7 @@ impl Commissioner {
     /// Reports are delivered through
     /// [`CommissionerEvent::EnergyReport`](super::super::CommissionerEvent::EnergyReport).
     pub async fn energy_scan(
-        &mut self,
+        &self,
         channel_mask: u32,
         count: u8,
         period_ms: u16,
@@ -75,7 +78,7 @@ impl Commissioner {
         destination: Ipv6Addr,
     ) -> Result<()> {
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::energy_scan_request(
             message_id,
             token,
@@ -94,7 +97,7 @@ impl Commissioner {
 
     /// Registers multicast listeners through the Primary Backbone Router.
     pub async fn register_multicast_listener(
-        &mut self,
+        &self,
         addresses: &[String],
         timeout: u32,
     ) -> Result<u8> {
@@ -108,7 +111,7 @@ impl Commissioner {
             })
             .collect::<Result<Vec<_>>>()?;
         let pbbr = self.primary_bbr_aloc().await?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::multicast_listener_request(
             message_id, token, session_id, &addresses, timeout,
         )?;
@@ -134,9 +137,9 @@ impl Commissioner {
     /// The request is forwarded to `destination` through the UDP proxy.
     /// Multicast destinations use non-confirmable signaling and return as soon
     /// as the request is forwarded.
-    pub async fn command_reenroll(&mut self, destination: Ipv6Addr) -> Result<()> {
+    pub async fn command_reenroll(&self, destination: Ipv6Addr) -> Result<()> {
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::session_command_request(
             CommissionerOperation::Reenroll,
             message_id,
@@ -151,9 +154,9 @@ impl Commissioner {
     /// Commands a device to reset from the current domain.
     ///
     /// The request is forwarded to `destination` through the UDP proxy.
-    pub async fn command_domain_reset(&mut self, destination: Ipv6Addr) -> Result<()> {
+    pub async fn command_domain_reset(&self, destination: Ipv6Addr) -> Result<()> {
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::session_command_request(
             CommissionerOperation::DomainReset,
             message_id,
@@ -169,12 +172,12 @@ impl Commissioner {
     ///
     /// The request is forwarded to `destination` through the UDP proxy.
     pub async fn command_migrate(
-        &mut self,
+        &self,
         destination: Ipv6Addr,
         designated_network: &str,
     ) -> Result<()> {
         let session_id = self.session_id_required()?;
-        let (message_id, token) = self.next_request_identity();
+        let (message_id, token) = (UNASSIGNED_MESSAGE_ID, UNASSIGNED_TOKEN);
         let request = meshcop::migrate_request(
             message_id,
             token,

@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::{
-    harness::{ScriptedExchange, ScriptedMeshcopTransport, ScriptedResponse},
+    harness::{ScriptedExchange, ScriptedMeshcopTransport, ScriptedResponse, run_with_deadline},
     *,
 };
 use crate::{
@@ -22,21 +22,24 @@ use crate::{
     },
     tlv::TlvSet,
 };
-use tokio::net::UdpSocket;
 
 mod api;
+mod driver;
+mod duplicates;
 mod joiner_sessions;
+mod lifecycle;
+mod matching;
 mod more;
 mod routing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublicCommissionerMethod {
     Connect,
-    State,
+    Status,
     SessionId,
     BorderAgent,
     Config,
-    Socket,
+    Subscribe,
     Petition,
     KeepAlive,
     Resign,
@@ -60,10 +63,10 @@ enum PublicCommissionerMethod {
     DiagnosticGet,
     DiagnosticReset,
     SendToJoiner,
+    Request,
     RequestToken,
     SetToken,
-    NextEvent,
-    Disconnect,
+    Events,
 }
 
 impl PublicCommissionerMethod {
@@ -74,35 +77,35 @@ impl PublicCommissionerMethod {
         }
 
         let script = ScriptedMeshcopTransport::new(self.script());
-        let events = if self == Self::NextEvent {
+        let initial_events = if self == Self::Events {
             vec![CommissionerEvent::DatasetChanged]
         } else {
             Vec::new()
         };
-        let mut commissioner = scripted_commissioner(script, events).await;
+        let (commissioner, mut events) = scripted_commissioner(script, initial_events).await;
 
         if self.needs_active_session() {
             commissioner.petition().await.unwrap();
             assert_eq!(commissioner.session_id(), Some(0xcafe), "{self:?}");
         }
 
-        self.call(&mut commissioner).await;
+        self.call(&commissioner, &mut events).await;
         self.assert_observed(&commissioner);
     }
 
     async fn assert_connect_method_covered(self) {
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let commissioner =
-            Commissioner::connect(CommissionerConfig::pskc("test", [0x11; 16]), addr)
-                .await
-                .unwrap();
-
-        assert_eq!(
-            commissioner.state(),
-            CommissionerState::Connected,
-            "{self:?}"
+        let pskc = [0x11; 16];
+        let server = meshcop_dtls::DtlsServer::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr();
+        let accept = async move { server.accept(&pskc, Duration::from_secs(10)).await };
+        let (session, connected) = tokio::join!(
+            accept,
+            Commissioner::connect_only(CommissionerConfig::pskc("test", pskc), addr)
         );
+        session.unwrap();
+        let (commissioner, _events) = connected.unwrap();
+
+        assert_eq!(commissioner.status(), SessionStatus::Connected, "{self:?}");
         assert_eq!(commissioner.border_agent(), addr, "{self:?}");
     }
 
@@ -145,7 +148,6 @@ impl PublicCommissionerMethod {
                 | Self::DiagnosticGet
                 | Self::DiagnosticReset
                 | Self::SendToJoiner
-                | Self::Disconnect
         )
     }
 
@@ -177,16 +179,16 @@ impl PublicCommissionerMethod {
             Self::DiagnosticGet => Some(CommissionerOperation::DiagnosticGet),
             Self::DiagnosticReset => Some(CommissionerOperation::DiagnosticReset),
             Self::SendToJoiner => Some(CommissionerOperation::SendToJoiner),
+            Self::Request => Some(CommissionerOperation::GetActiveDataset),
             Self::Connect
-            | Self::State
+            | Self::Status
             | Self::SessionId
             | Self::BorderAgent
             | Self::Config
-            | Self::Socket
+            | Self::Subscribe
             | Self::RequestToken
             | Self::SetToken
-            | Self::NextEvent
-            | Self::Disconnect => None,
+            | Self::Events => None,
         }
     }
 
@@ -195,7 +197,7 @@ impl PublicCommissionerMethod {
             Self::Petition => ScriptedResponse::petition_accept(0xcafe),
             Self::KeepAlive => ScriptedResponse::accept(),
             Self::Resign => ScriptedResponse::reject(),
-            Self::GetActiveDataset | Self::GetRawActiveDataset => {
+            Self::GetActiveDataset | Self::GetRawActiveDataset | Self::Request => {
                 ScriptedResponse::content(dataset_with_name("active").to_bytes().unwrap())
             }
             Self::GetPendingDataset => {
@@ -225,23 +227,22 @@ impl PublicCommissionerMethod {
             | Self::DiagnosticReset
             | Self::SendToJoiner => ScriptedResponse::changed_without_state(),
             Self::Connect
-            | Self::State
+            | Self::Status
             | Self::SessionId
             | Self::BorderAgent
             | Self::Config
-            | Self::Socket
+            | Self::Subscribe
             | Self::RequestToken
             | Self::SetToken
-            | Self::NextEvent
-            | Self::Disconnect => ScriptedResponse::changed_without_state(),
+            | Self::Events => ScriptedResponse::changed_without_state(),
         }
     }
 
-    async fn call(self, commissioner: &mut Commissioner) {
+    async fn call(self, commissioner: &Commissioner, events: &mut Events) {
         match self {
             Self::Connect => unreachable!("connect is covered before a Commissioner exists"),
-            Self::State => {
-                assert_eq!(commissioner.state(), CommissionerState::Connected);
+            Self::Status => {
+                assert_eq!(commissioner.status(), SessionStatus::Connected);
             }
             Self::SessionId => {
                 assert_eq!(commissioner.session_id(), None);
@@ -252,8 +253,10 @@ impl PublicCommissionerMethod {
             Self::Config => {
                 assert_eq!(commissioner.config().commissioner_id, "meshcop");
             }
-            Self::Socket => {
-                assert!(commissioner.socket().local_addr().is_ok());
+            Self::Subscribe => {
+                let mut subscriber = commissioner.subscribe();
+                commissioner.resign().await.unwrap();
+                assert_eq!(next_event(&mut subscriber).await, None);
             }
             Self::Petition => {
                 let petition = commissioner.petition().await.unwrap();
@@ -262,11 +265,23 @@ impl PublicCommissionerMethod {
             Self::KeepAlive => {
                 assert_eq!(commissioner.keep_alive().await.unwrap(), ResultCode::Accept);
                 assert_eq!(
-                    commissioner.next_event().await.unwrap(),
+                    next_event(events).await,
                     Some(CommissionerEvent::KeepAliveResponse(ResultCode::Accept))
                 );
             }
-            Self::Resign => commissioner.resign().await.unwrap(),
+            Self::Resign => {
+                commissioner.resign().await.unwrap();
+                assert_eq!(
+                    commissioner.status(),
+                    SessionStatus::Closed {
+                        reason: CloseReason::Resigned
+                    }
+                );
+                assert!(matches!(
+                    commissioner.petition().await.unwrap_err(),
+                    Error::SessionClosed
+                ));
+            }
             Self::GetActiveDataset => {
                 let dataset = commissioner
                     .get_active_dataset(DatasetFlags::NETWORK_NAME)
@@ -390,6 +405,28 @@ impl PublicCommissionerMethod {
                     .await
                     .unwrap();
             }
+            Self::Request => {
+                let request = CoapMessage::post_request(
+                    CoapType::Confirmable,
+                    0,
+                    Vec::new(),
+                    crate::meshcop::uri::MGMT_ACTIVE_GET,
+                    Vec::new(),
+                )
+                .unwrap();
+                let response = commissioner
+                    .request(Destination::BorderAgent, request)
+                    .await
+                    .unwrap();
+                assert_eq!(response.code, CoapCode::CONTENT);
+                assert_eq!(
+                    Dataset::from_bytes(&response.payload)
+                        .unwrap()
+                        .network_name()
+                        .unwrap(),
+                    Some("active")
+                );
+            }
             Self::RequestToken => assert!(matches!(
                 commissioner
                     .request_token("127.0.0.1:49156".parse().unwrap())
@@ -401,16 +438,11 @@ impl PublicCommissionerMethod {
                 commissioner.set_token(b"token").unwrap_err(),
                 Error::Unsupported("CCM token support is deferred")
             )),
-            Self::NextEvent => {
+            Self::Events => {
                 assert_eq!(
-                    commissioner.next_event().await.unwrap(),
+                    next_event(events).await,
                     Some(CommissionerEvent::DatasetChanged)
                 );
-            }
-            Self::Disconnect => {
-                commissioner.disconnect();
-                assert_eq!(commissioner.state(), CommissionerState::Disabled);
-                assert_eq!(commissioner.session_id(), None);
             }
         }
     }
@@ -454,7 +486,9 @@ impl PublicCommissionerMethod {
                 tlv_value(request, TLV_GET),
                 Some(vec![DATASET_TLV_NETWORK_NAME])
             ),
-            Self::GetRawActiveDataset => assert_eq!(tlv_value(request, TLV_GET), None),
+            Self::GetRawActiveDataset | Self::Request => {
+                assert_eq!(tlv_value(request, TLV_GET), None);
+            }
             Self::GetPendingDataset => assert_eq!(
                 tlv_value(request, TLV_GET),
                 Some(vec![DATASET_TLV_PENDING_TIMESTAMP])
@@ -500,15 +534,14 @@ impl PublicCommissionerMethod {
                 );
             }
             Self::Connect
-            | Self::State
+            | Self::Status
             | Self::SessionId
             | Self::BorderAgent
             | Self::Config
-            | Self::Socket
+            | Self::Subscribe
             | Self::RequestToken
             | Self::SetToken
-            | Self::NextEvent
-            | Self::Disconnect => {}
+            | Self::Events => {}
         }
     }
 }
@@ -520,6 +553,52 @@ fn prefixed_dataset() -> Dataset {
         TEST_MESH_LOCAL_PREFIX,
     );
     dataset
+}
+
+const SESSION_ID: u16 = 0xcafe;
+
+fn petition_exchange() -> ScriptedExchange {
+    exchange(
+        CommissionerOperation::Petition,
+        [ScriptedResponse::petition_accept(SESSION_ID)],
+    )
+}
+
+fn active_get(name: &str) -> ScriptedExchange {
+    exchange(
+        CommissionerOperation::GetActiveDataset,
+        [ScriptedResponse::content(
+            dataset_with_name(name).to_bytes().unwrap(),
+        )],
+    )
+}
+
+/// The operations the session has sent, in order.
+fn operations(commissioner: &Commissioner) -> Vec<CommissionerOperation> {
+    commissioner
+        .scripted_transport()
+        .unwrap()
+        .observed_requests()
+        .iter()
+        .map(|request| request.operation)
+        .collect()
+}
+
+/// The `index`th request the session sent, as its recipient sees it.
+fn sent_request(transport: &ScriptedMeshcopTransport, index: usize) -> CoapMessage {
+    logical_message(&transport.observed_requests()[index])
+}
+
+/// A piggybacked answer to `request`.
+fn answer(request: &CoapMessage, code: CoapCode, payload: Vec<u8>) -> CoapMessage {
+    CoapMessage {
+        ty: CoapType::Acknowledgement,
+        code,
+        message_id: request.message_id,
+        token: request.token.clone(),
+        options: Vec::new(),
+        payload,
+    }
 }
 
 fn exchange(
@@ -536,22 +615,22 @@ fn border_agent() -> SocketAddr {
 /// Mesh-local prefix used to pre-seed proxied tests (fd00:db8::/64).
 const TEST_MESH_LOCAL_PREFIX: [u8; 8] = [0xfd, 0x00, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00];
 
+/// Starts a scripted session with manual keep-alives, so a script sees only
+/// the exchanges the test drives. Automatic keep-alives have dedicated tests.
 async fn scripted_commissioner(
     script: ScriptedMeshcopTransport,
     initial_events: impl IntoIterator<Item = CommissionerEvent>,
-) -> Commissioner {
-    let mut commissioner = Commissioner::connect_scripted(
-        CommissionerConfig::pskc("meshcop", [0x11; 16]),
-        border_agent(),
-        script,
-        initial_events,
-    )
-    .await
-    .unwrap();
+) -> (Commissioner, Events) {
+    let mut config = CommissionerConfig::pskc("meshcop", [0x11; 16]);
+    config.keep_alive = KeepAlive::Manual;
+    let (commissioner, events) =
+        Commissioner::connect_scripted(config, border_agent(), script, initial_events)
+            .await
+            .unwrap();
     // Most scripted tests exercise the MeshCoP exchanges themselves; the
     // mesh-local prefix fetch backing ALOC routing has dedicated tests.
     commissioner.set_cached_mesh_local_prefix(Some(TEST_MESH_LOCAL_PREFIX));
-    commissioner
+    (commissioner, events)
 }
 
 fn multicast_destination() -> Ipv6Addr {
@@ -630,4 +709,73 @@ fn observed(
         .iter()
         .find(|request| request.operation == operation)
         .unwrap()
+}
+
+/// Upper bound on waiting for an expected event or state change in a
+/// real-time test, so a broken session fails the test instead of hanging it.
+const EVENT_WAIT: Duration = Duration::from_secs(5);
+
+/// Waits up to [`EVENT_WAIT`] for the next event.
+async fn next_event(events: &mut Events) -> Option<CommissionerEvent> {
+    next_event_within(events, EVENT_WAIT).await
+}
+
+/// Waits up to `bound` for the next event; paused-time tests pass bounds
+/// longer than the virtual time they expect to elapse.
+async fn next_event_within(events: &mut Events, bound: Duration) -> Option<CommissionerEvent> {
+    tokio::time::timeout(bound, events.next())
+        .await
+        .expect("no event arrived in time")
+}
+
+/// Waits up to [`EVENT_WAIT`] until `condition` holds.
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(EVENT_WAIT, async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("condition did not hold in time");
+}
+
+/// Asserts that no event reaches `events` within a short window.
+async fn assert_no_event(events: &mut Events) {
+    const NO_EVENT_WINDOW: Duration = Duration::from_millis(100);
+    let next = tokio::time::timeout(NO_EVENT_WINDOW, events.next()).await;
+    assert!(next.is_err(), "unexpected event {next:?}");
+}
+
+/// Bound on a test's virtual run time: longer than any test waits, and
+/// elapsed instantly when a stalled session leaves nothing else to run. Every
+/// scripted session test runs on paused time, so a mutation that stalls the
+/// session fails the test at once instead of after a real-time deadline.
+const PAUSED_TEST_DEADLINE: Duration = Duration::from_secs(3600);
+
+/// Bound on a real-time test's run time. Only tests that run a real DTLS
+/// session over loopback sockets use real time: a paused clock jumps ahead
+/// whenever the runtime waits on a socket, which would fire their timers
+/// early.
+const SOCKET_TEST_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Runs a real-time socket test body, failing it if it exceeds
+/// [`SOCKET_TEST_DEADLINE`].
+async fn with_socket_test_deadline(body: impl std::future::Future<Output = ()>) {
+    run_with_deadline(SOCKET_TEST_DEADLINE, body).await;
+}
+
+/// Bound for the real-DTLS retransmission tests, which wait out CoAP timers
+/// (2-4 s) on real time to prove a retransmission does or does not happen.
+const SLOW_SOCKET_TEST_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Runs a real-time socket test body that waits out CoAP timers, failing it
+/// if it exceeds [`SLOW_SOCKET_TEST_DEADLINE`].
+async fn with_slow_socket_test_deadline(body: impl std::future::Future<Output = ()>) {
+    run_with_deadline(SLOW_SOCKET_TEST_DEADLINE, body).await;
+}
+
+/// Runs a paused-time test body, failing it if it exceeds
+/// [`PAUSED_TEST_DEADLINE`] of virtual time.
+async fn with_paused_test_deadline(body: impl std::future::Future<Output = ()>) {
+    run_with_deadline(PAUSED_TEST_DEADLINE, body).await;
 }

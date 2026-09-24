@@ -7,7 +7,7 @@ impl Interpreter {
         if tokens.len() < 2 {
             return CommandValue::failed(SYNTAX_FEW_ARGS);
         }
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         match tokens[1].as_str() {
@@ -38,7 +38,7 @@ impl Interpreter {
         if tokens.len() < 2 {
             return CommandValue::failed(SYNTAX_FEW_ARGS);
         }
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         match tokens[1].as_str() {
@@ -72,7 +72,7 @@ impl Interpreter {
             "set" => true,
             other => return CommandValue::failed(format!("{other} is not a valid sub-command")),
         };
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         let field = tokens[2].as_str();
@@ -122,7 +122,7 @@ impl Interpreter {
     }
 
     async fn op_dataset_field_get(&mut self, field: &str) -> CommandValue {
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         let dataset = match commissioner.get_active_dataset(DatasetFlags::ALL).await {
@@ -252,7 +252,7 @@ impl Interpreter {
         })();
         match set_result {
             Ok(true) => {
-                let Some(commissioner) = self.commissioner.as_mut() else {
+                let Some(commissioner) = self.commissioner.as_ref() else {
                     return CommandValue::failed(NOT_CONNECTED);
                 };
                 // MGMT_ACTIVE_SET requires an Active Timestamp TLV newer than

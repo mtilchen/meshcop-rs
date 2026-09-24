@@ -35,7 +35,7 @@
 //! authentication means the two sides derived different keys, so it aborts the
 //! handshake the way mbedTLS does instead of waiting for the deadline.
 
-use alloc::{format, vec::Vec};
+use alloc::{collections::VecDeque, format, vec::Vec};
 use core::{
     fmt,
     future::{Future, poll_fn},
@@ -167,6 +167,9 @@ pub(crate) struct SessionState {
     role: SessionRole,
     next_application_sequence: u64,
     application_replay: ReplayWindow,
+    /// Records received but not yet opened. One datagram may carry several
+    /// records (RFC 6347 §4.1.1), and each receive returns only one.
+    unread_records: VecDeque<DtlsRecord>,
 }
 
 impl SessionState {
@@ -190,6 +193,7 @@ impl SessionState {
             role,
             next_application_sequence,
             application_replay: ReplayWindow::new(),
+            unread_records: VecDeque::new(),
         }
     }
 
@@ -261,17 +265,20 @@ impl SessionState {
         Ok(Some(plaintext))
     }
 
-    /// Opens the protected records of one established-session datagram.
+    /// Queues the records of one established-session datagram for
+    /// [`Self::open_next_record`].
+    pub(crate) fn receive_datagram(&mut self, records: Vec<DtlsRecord>) {
+        self.unread_records.extend(records);
+    }
+
+    /// Opens the next usable record received from the peer.
     ///
-    /// Returns the first authenticated application-data plaintext, or the
-    /// error for an authenticated alert. Unauthenticated, replayed, and
-    /// non-application records are discarded, yielding `None` when nothing in
-    /// the datagram is usable.
-    pub(crate) fn open_session_datagram(
-        &mut self,
-        records: &[DtlsRecord],
-    ) -> Option<crate::Result<Vec<u8>>> {
-        for record in records {
+    /// Returns authenticated application-data plaintext, or the error for an
+    /// authenticated alert. Unauthenticated, replayed, and non-application
+    /// records are discarded, yielding `None` once no received record is
+    /// left. Records after the one returned stay queued for the next call.
+    pub(crate) fn open_next_record(&mut self) -> Option<crate::Result<Vec<u8>>> {
+        while let Some(record) = self.unread_records.pop_front() {
             if record.header.epoch != 1 {
                 continue;
             }
@@ -280,11 +287,11 @@ impl SessionState {
                 ContentType::Alert => true,
                 _ => continue,
             };
-            let Ok(Some(plaintext)) = self.open_protected_record(record) else {
+            let Ok(Some(plaintext)) = self.open_protected_record(&record) else {
                 continue;
             };
             return Some(if is_alert {
-                Err(decode_alert_error(&record.header, &plaintext))
+                Err(decode_authenticated_alert(&record.header, &plaintext))
             } else {
                 Ok(plaintext)
             });
@@ -406,13 +413,26 @@ where
 {
     let receive = async {
         loop {
-            let (records, _, _) = recv_records_from_unbounded(transport, peer).await?;
-            if let Some(result) = state.open_session_datagram(&records) {
+            if let Some(result) = state.open_next_record() {
                 return result.map_err(DriverError::from);
             }
+            let (records, _, _) = recv_records_from_unbounded(transport, peer).await?;
+            state.receive_datagram(records);
         }
     };
     with_timeout(receive, delay.clone(), duration).await
+}
+
+/// TLS `close_notify` alert description (RFC 5246 §7.2.1).
+const ALERT_CLOSE_NOTIFY: u8 = 0;
+
+/// Converts an authenticated alert from an established session into an
+/// error, reporting an orderly `close_notify` as [`Error::PeerClosed`].
+fn decode_authenticated_alert(header: &RecordHeader, payload: &[u8]) -> Error {
+    match payload {
+        [_, ALERT_CLOSE_NOTIFY, ..] => Error::PeerClosed,
+        _ => decode_alert_error(header, payload),
+    }
 }
 
 /// Converts a received alert's header and plaintext into an error.
@@ -909,6 +929,89 @@ mod tests {
             }
             other => panic!("expected a decoded alert error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recv_application_data_reports_a_protected_close_notify_as_peer_closed() {
+        const WARNING_LEVEL: u8 = 1;
+        let key_material = test_key_material();
+        let close_notify = protect_aes_128_ccm_8_record(
+            ContentType::Alert,
+            1,
+            1,
+            RecordProtectionKey::new(key_material.key_block.server_write_key),
+            &key_material.key_block.server_write_iv,
+            &[WARNING_LEVEL, ALERT_CLOSE_NOTIFY],
+        )
+        .expect("protected close_notify");
+        let mut transport = QueuedUdp {
+            queue: VecDeque::from([(
+                close_notify.encode().expect("close_notify encodes"),
+                LOCAL_ADDR,
+                PEER_ADDR,
+            )]),
+        };
+        let delay = PendingDelay;
+        let mut state = SessionState::new(key_material, SessionRole::Client);
+        let err = futures_lite_for_test::block_on(recv_application_data(
+            &mut state,
+            &mut transport,
+            &delay,
+            PEER_ADDR,
+            Duration::from_secs(1),
+        ))
+        .expect_err("close_notify must end the receive");
+        assert!(
+            matches!(err, DriverError::Protocol(Error::PeerClosed)),
+            "expected PeerClosed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn recv_application_data_returns_every_record_of_a_coalesced_datagram() {
+        const WARNING_LEVEL: u8 = 1;
+        let key_material = test_key_material();
+        let protect = |content_type, sequence, plaintext: &[u8]| {
+            protect_aes_128_ccm_8_record(
+                content_type,
+                1,
+                sequence,
+                RecordProtectionKey::new(key_material.key_block.server_write_key),
+                &key_material.key_block.server_write_iv,
+                plaintext,
+            )
+            .expect("protected record")
+            .encode()
+            .expect("record encodes")
+        };
+        let datagram = [
+            protect(ContentType::ApplicationData, 1, b"first"),
+            protect(ContentType::ApplicationData, 2, b"second"),
+            protect(ContentType::Alert, 3, &[WARNING_LEVEL, ALERT_CLOSE_NOTIFY]),
+        ]
+        .concat();
+        let mut transport = QueuedUdp {
+            queue: VecDeque::from([(datagram, LOCAL_ADDR, PEER_ADDR)]),
+        };
+        let delay = PendingDelay;
+        let mut state = SessionState::new(key_material, SessionRole::Client);
+        let mut receive = || {
+            futures_lite_for_test::block_on(recv_application_data(
+                &mut state,
+                &mut transport,
+                &delay,
+                PEER_ADDR,
+                Duration::from_secs(1),
+            ))
+        };
+
+        assert_eq!(receive().expect("first record"), b"first");
+        assert_eq!(receive().expect("second record"), b"second");
+        let err = receive().expect_err("the trailing close_notify must end the session");
+        assert!(
+            matches!(err, DriverError::Protocol(Error::PeerClosed)),
+            "expected PeerClosed, got {err:?}"
+        );
     }
 
     #[test]

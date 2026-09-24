@@ -82,35 +82,6 @@ pub(super) fn parse_u64(s: &str) -> Option<u64> {
 pub(super) fn has_multi_network_flag(tokens: &Tokens) -> bool {
     tokens.iter().any(|t| t == "--nwk" || t == "--dom")
 }
-
-/// Whether this command form may block while an active commissioner needs
-/// keep-alive service.
-///
-/// Classification stops at the command/subcommand boundary; detailed syntax
-/// validation remains with dispatch. Local, cached, unsupported, and unknown
-/// subcommands do not acquire the network merely to render their result.
-pub(super) fn command_may_wait_for_commissioner(tokens: &Tokens) -> bool {
-    let command = tokens.first().map(String::as_str);
-    let subcommand = tokens.get(1).map(String::as_str);
-    match command {
-        // Starting a replacement connection leaves any current commissioner
-        // active until the new connection and petition succeed.
-        Some("start") => true,
-        Some("borderagent") => subcommand == Some("get"),
-        Some("joiner") => matches!(
-            subcommand,
-            Some("enable" | "enableall" | "disableall" | "getport" | "setport")
-        ),
-        Some("commdataset" | "opdataset") => matches!(subcommand, Some("get" | "set")),
-        Some("bbrdataset") => subcommand == Some("get"),
-        Some("reenroll" | "domainreset" | "migrate" | "mlr" | "announce") => true,
-        Some("panid") => subcommand == Some("query"),
-        Some("energy") => subcommand == Some("scan"),
-        Some("netdiag") => matches!(subcommand, Some("query" | "reset")),
-        Some(_) | None => false,
-    }
-}
-
 /// Splits a command line into tokens, honoring single/double-quoted spans
 /// (used for JSON dataset arguments).
 pub(super) fn tokenize(line: &str) -> std::result::Result<Tokens, String> {

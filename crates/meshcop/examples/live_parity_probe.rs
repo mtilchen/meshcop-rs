@@ -31,7 +31,7 @@ use meshcop::{
 #[path = "support/mod.rs"]
 mod support;
 
-#[tokio::main]
+#[tokio::main(flavor = "local")]
 async fn main() -> meshcop::Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     let show_secrets = support::show_secrets_requested(&mut args);
@@ -50,11 +50,11 @@ async fn main() -> meshcop::Result<()> {
     let config = CommissionerConfig::from_dataset("meshcop-probe", &expected)?;
 
     println!("== connecting to {border_agent} ==");
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    let (commissioner, _events) = Commissioner::connect_only(config, border_agent).await?;
 
     // All steps after a successful petition run inside `probe` so a failure
     // still resigns the session before returning.
-    let probe_result = probe(&mut commissioner, &expected, show_secrets).await;
+    let probe_result = probe(&commissioner, &expected, show_secrets).await;
     let resign_result = commissioner.resign().await;
     match &probe_result {
         Ok(()) => println!("== probe succeeded; resigning =="),
@@ -67,7 +67,7 @@ async fn main() -> meshcop::Result<()> {
 }
 
 async fn probe(
-    commissioner: &mut Commissioner,
+    commissioner: &Commissioner,
     expected: &Dataset,
     show_secrets: bool,
 ) -> meshcop::Result<()> {

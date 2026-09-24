@@ -24,30 +24,22 @@ impl Interpreter {
 
     /// Drains commissioner events for up to `duration`, storing energy reports
     /// and PAN-ID conflicts for the later `energy report` / `panid conflict`.
-    pub(super) async fn pump_events(&mut self, duration: Duration) {
-        if self.commissioner.is_none() {
-            return;
-        }
+    /// Returns the command result: a warning when events were lost.
+    pub(super) async fn pump_events(&mut self, duration: Duration) -> CommandValue {
         let deadline = tokio::time::Instant::now() + duration;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let result = {
-                let Some(commissioner) = self.commissioner.as_mut() else {
-                    return;
-                };
-                tokio::time::timeout(remaining, commissioner.next_event()).await
-            };
-            match result {
-                Ok(Ok(Some(event))) => self.record_event(event),
-                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+        let mut warnings = Vec::new();
+        while let Some(events) = self.events.as_mut() {
+            match tokio::time::timeout_at(deadline, events.next()).await {
+                Ok(Some(event)) => warnings.extend(self.record_event(event)),
+                Ok(None) => self.events = None,
+                Err(_) => break,
             }
         }
+        CommandValue::ok(warnings.join("\n"))
     }
 
-    pub(super) fn record_event(&mut self, event: CommissionerEvent) {
+    /// Stores scan reports, and returns a warning when events were lost.
+    pub(super) fn record_event(&mut self, event: CommissionerEvent) -> Option<String> {
         match event {
             CommissionerEvent::EnergyReport {
                 peer_addr,
@@ -61,7 +53,13 @@ impl Interpreter {
                 channel_mask,
                 pan_id,
             } => self.panid_conflicts.push((peer_addr, channel_mask, pan_id)),
+            CommissionerEvent::Lagged { missed } => {
+                return Some(format!(
+                    "missed {missed} commissioner events; energy and PAN ID reports may be incomplete"
+                ));
+            }
             _ => {}
         }
+        None
     }
 }

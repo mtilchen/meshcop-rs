@@ -142,40 +142,32 @@ pub async fn run(config_path: Option<&Path>) -> meshcop::Result<()> {
 
     let mut interpreter = Interpreter::new(config);
     while !interpreter.should_exit() {
-        // Keep one blocking stdin read alive while the async side services the
-        // absolute commissioner keep-alive deadline. Reusing the same task
-        // after a timer tick avoids starting multiple readers for stdin.
+        // Keep one blocking stdin read alive while the async side records
+        // session events. Reusing the same task after an event avoids starting
+        // multiple readers for stdin.
         let mut input = tokio::task::spawn_blocking(console::read);
-        loop {
-            let input_result = match interpreter.keepalive_deadline() {
-                Some(deadline) => {
-                    tokio::select! {
-                        biased;
-                        () = tokio::time::sleep_until(deadline) => {
-                            if let Err(err) = interpreter.handle_scheduled_keepalive().await {
-                                console::write(&format!("keep-alive failed: {err}"), Color::Red);
-                            }
-                            None
-                        },
-                        result = &mut input => Some(result),
+        let input_result = loop {
+            tokio::select! {
+                biased;
+                Some(event) = interpreter.next_event() => {
+                    if let Some(message) = interpreter.handle_background_event(event) {
+                        console::write(&message, Color::Red);
                     }
                 }
-                None => Some((&mut input).await),
-            };
-
-            let Some(input_result) = input_result else {
-                continue;
-            };
-            match input_result {
-                Ok(Some(line)) => {
-                    let line = Zeroizing::new(line);
-                    interpreter.evaluate_and_print(&line).await;
-                }
-                Ok(None) | Err(_) => return Ok(()),
+                result = &mut input => break result,
             }
-            break;
+        };
+        match input_result {
+            Ok(Some(line)) => {
+                let line = Zeroizing::new(line);
+                interpreter.evaluate_and_print(&line).await;
+            }
+            Ok(None) | Err(_) => break,
         }
     }
+    // Resign here: once main returns, runtime shutdown would cancel the
+    // session task's own best-effort resignation.
+    interpreter.shutdown().await;
     Ok(())
 }
 

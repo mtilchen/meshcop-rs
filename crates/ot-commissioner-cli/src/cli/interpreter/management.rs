@@ -19,7 +19,7 @@ impl Interpreter {
         let Some(dst) = parse_addr(&tokens[1]) else {
             return CommandValue::failed(format!("invalid device address '{}'", tokens[1]));
         };
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         match command {
@@ -38,7 +38,7 @@ impl Interpreter {
             Err(_) => return CommandValue::failed("invalid timeout"),
         };
         let addresses: Vec<String> = tokens[1..tokens.len() - 1].to_vec();
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         match commissioner
@@ -62,7 +62,7 @@ impl Interpreter {
         ) else {
             return CommandValue::failed("invalid announce arguments");
         };
-        let Some(commissioner) = self.commissioner.as_mut() else {
+        let Some(commissioner) = self.commissioner.as_ref() else {
             return CommandValue::failed(NOT_CONNECTED);
         };
         commissioner
@@ -88,15 +88,14 @@ impl Interpreter {
                     return CommandValue::failed("invalid panid query arguments");
                 };
                 {
-                    let Some(commissioner) = self.commissioner.as_mut() else {
+                    let Some(commissioner) = self.commissioner.as_ref() else {
                         return CommandValue::failed(NOT_CONNECTED);
                     };
                     if let Err(err) = commissioner.pan_id_query(mask, panid, dst).await {
                         return CommandValue::failed(err.to_string());
                     }
                 }
-                self.pump_events(Duration::from_secs(3)).await;
-                CommandValue::done()
+                self.pump_events(Duration::from_secs(3)).await
             }
             "conflict" => {
                 if tokens.len() < 3 {
@@ -138,7 +137,7 @@ impl Interpreter {
                     return CommandValue::failed("invalid energy scan arguments");
                 };
                 {
-                    let Some(commissioner) = self.commissioner.as_mut() else {
+                    let Some(commissioner) = self.commissioner.as_ref() else {
                         return CommandValue::failed(NOT_CONNECTED);
                     };
                     if let Err(err) = commissioner
@@ -148,8 +147,7 @@ impl Interpreter {
                         return CommandValue::failed(err.to_string());
                     }
                 }
-                self.pump_events(Duration::from_secs(3)).await;
-                CommandValue::done()
+                self.pump_events(Duration::from_secs(3)).await
             }
             "report" => {
                 let filter = tokens

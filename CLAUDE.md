@@ -76,17 +76,24 @@ two-node OpenThread IPv6 network.
     and the dataset-flag → TLV-type mapping (`flags.rs`). The
     network-diagnostic data model lives in `diag/` (`model.rs` types,
     `decode.rs` wire decoders, `diag_flags.rs` request flags, `NetDiagData`).
-  - `commissioner/` — Async public API. `client/` holds `Commissioner`, split
-    by concern: `mod.rs` (struct, connect, lifecycle, shared helpers),
-    `datasets.rs` (operational/commissioner/BBR dataset get/set),
-    `commands.rs` (announce/scan/PAN-ID and managed-device commands),
-    `diagnostics.rs` (network-diagnostic queries), `relay.rs` (joiner relay
-    handling), and `transport.rs` (DTLS session, request/response routing,
-    mesh-local-prefix/ALOC routing, UDP-proxy encapsulation). `joiner.rs`
+  - `commissioner/` — Async public API. `client/` holds the `Commissioner`
+    handle, split by concern: `mod.rs` (handle, connect, lifecycle, shared
+    helpers), `requests.rs` (request submission, mesh-local-prefix/ALOC
+    routing, and the raw `request` escape hatch), `datasets.rs`
+    (operational/commissioner/BBR dataset get/set), `commands.rs`
+    (announce/scan/PAN-ID and managed-device commands), `diagnostics.rs`
+    (network-diagnostic queries), and `relay.rs` (joiner relay payloads).
+    `client/driver/` is the session task behind the handle: `mod.rs` (loop,
+    petition/keep-alive/resign lifecycle, session end), `exchange.rs`
+    (identity assignment, retransmission, the in-flight limit, deadlines),
+    `incoming.rs` (response matching, UDP_RX decapsulation, notifications),
+    `duplicates.rs` (replies to retransmitted confirmable messages),
+    `relay.rs` (joiner DTLS sessions), and `link.rs` (the DTLS session or the
+    scripted transport). `events.rs` is the `Events` stream, and `joiner.rs`
     holds the joiner session state machine plus `JoinerHandler` /
     `StaticJoinerHandler`. `harness.rs` is a test-only scripted MeshCoP
-    transport that exercises the production incoming-message loop, `pub`
-    behind the `test-support` feature.
+    transport that runs through the production session driver, `pub` behind
+    the `test-support` feature.
   - `error.rs` — Crate-wide `thiserror` `Error`/`Result`, including a
     transparent `Dtls` variant wrapping `meshcop_dtls::Error`.
   - `tests/` (`interop_openthread.rs`, `live_border_router.rs`) and
@@ -106,9 +113,12 @@ two-node OpenThread IPv6 network.
   dropped. Explicit raw access exposes secrets, and owned exports are
   caller-managed. Examples redact dataset fields unless `--show-secrets` is
   passed.
-- Keep-alives are application-driven: schedule `Commissioner::keep_alive()`
-  using `CommissionerConfig::keepalive_interval`. The bundled REPL and
-  `netdiag` collector do this while their sessions are active.
+- `Commissioner` is a cloneable handle to a session run by a spawned driver
+  task (`commissioner/client/driver/`), which sends keep-alives itself
+  (`KeepAlive::Automatic`, the default), matches responses, and publishes
+  `CommissionerEvent`s on `Events` streams. Tests start it over the scripted
+  transport with `Commissioner::connect_scripted`; most scripted tests use
+  `KeepAlive::Manual` so a script sees only the exchanges they drive.
 - Live border-router tests are `#[ignore]` and require a real agent plus
   `ESP_MATTER_TEST_THREAD_DATASET_HEX`; they must not leak secrets.
 - Mutating CLI/example operations are gated behind `MESHCOP_MUTATE_OK=1`.

@@ -7,21 +7,21 @@ use meshcop::{
 };
 
 #[tokio::test]
-#[ignore = "requires a Thread border agent at 192.168.4.48:49156 and ESP_MATTER_TEST_THREAD_DATASET_HEX"]
+#[ignore = "requires MESHCOP_BORDER_AGENT (resolve over mDNS; see AGENTS.md) and ESP_MATTER_TEST_THREAD_DATASET_HEX"]
 async fn live_border_router_read_only_smoke() -> meshcop::Result<()> {
     let dataset_hex = std::env::var("ESP_MATTER_TEST_THREAD_DATASET_HEX")
         .expect("ESP_MATTER_TEST_THREAD_DATASET_HEX must contain a dataset with PSKc");
     let border_agent: SocketAddr = std::env::var("MESHCOP_BORDER_AGENT")
-        .unwrap_or_else(|_| "192.168.4.48:49156".to_string())
+        .expect("MESHCOP_BORDER_AGENT must name the border agent (host:port, resolved over mDNS)")
         .parse()
         .expect("MESHCOP_BORDER_AGENT must be host:port");
 
     let dataset = Dataset::from_hex(dataset_hex)?;
     let config = CommissionerConfig::from_dataset("meshcop-live", &dataset)?;
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    let (commissioner, _events) = Commissioner::connect(config, border_agent).await?;
 
-    let petition = commissioner.petition().await?;
-    assert!(petition.session_id != 0);
+    let session_id = commissioner.session_id();
+    assert!(session_id.is_some_and(|id| id != 0), "{session_id:?}");
     let read_result = async {
         assert_eq!(
             commissioner.keep_alive().await?,
@@ -40,21 +40,21 @@ async fn live_border_router_read_only_smoke() -> meshcop::Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "requires a Thread border agent at 192.168.4.48:49156 and ESP_MATTER_TEST_THREAD_DATASET_HEX"]
+#[ignore = "requires MESHCOP_BORDER_AGENT (resolve over mDNS; see AGENTS.md) and ESP_MATTER_TEST_THREAD_DATASET_HEX"]
 async fn live_border_router_active_dataset_matches_env() -> meshcop::Result<()> {
     let dataset_hex = std::env::var("ESP_MATTER_TEST_THREAD_DATASET_HEX")
         .expect("ESP_MATTER_TEST_THREAD_DATASET_HEX must contain a dataset with PSKc");
     let border_agent: SocketAddr = std::env::var("MESHCOP_BORDER_AGENT")
-        .unwrap_or_else(|_| "192.168.4.48:49156".to_string())
+        .expect("MESHCOP_BORDER_AGENT must name the border agent (host:port, resolved over mDNS)")
         .parse()
         .expect("MESHCOP_BORDER_AGENT must be host:port");
 
     let expected = Dataset::from_hex(dataset_hex)?;
     let config = CommissionerConfig::from_dataset("meshcop-compare", &expected)?;
-    let mut commissioner = Commissioner::connect(config, border_agent).await?;
+    let (commissioner, _events) = Commissioner::connect(config, border_agent).await?;
 
-    let petition = commissioner.petition().await?;
-    assert!(petition.session_id != 0);
+    let session_id = commissioner.session_id();
+    assert!(session_id.is_some_and(|id| id != 0), "{session_id:?}");
     let live_bytes = commissioner
         .get_raw_active_dataset(DatasetFlags::EMPTY)
         .await;

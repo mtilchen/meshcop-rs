@@ -18,12 +18,16 @@ pub(crate) fn append_u32(out: &mut Vec<u8>, ty: u8, value: u32) -> Result<()> {
     append_tlv(out, ty, &value.to_be_bytes())
 }
 
+/// Appends a short-form TLV without length checks, for building test fixtures.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn append_tlv_u8_length(out: &mut Vec<u8>, ty: u8, value: &[u8]) {
     out.push(ty);
     out.push(value.len() as u8);
     out.extend_from_slice(value);
 }
 
+/// Appends a short-form `u16` TLV, for building test fixtures.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn append_u16_u8_length(out: &mut Vec<u8>, ty: u8, value: u16) {
     append_tlv_u8_length(out, ty, &value.to_be_bytes());
 }
