@@ -25,6 +25,7 @@ use crate::{
 
 mod api;
 mod driver;
+mod duplicates;
 mod joiner_sessions;
 mod lifecycle;
 mod matching;

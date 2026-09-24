@@ -507,14 +507,21 @@ Where the implementation departs from, or makes concrete, the design above:
     or a reserved code class cannot complete one even if its token matches.
   - Only a strictly empty ACK (no token, options, or payload) stops
     retransmission.
+- **Retransmitted confirmable messages are answered, not handled again.**
+  The driver remembers the reply it gave each confirmable response or
+  notification, keyed by sender (the border agent, or a device's UDP_RX
+  source address and port) and message ID (RFC 7252 §4.5). A copy that
+  arrives within the 247-second exchange lifetime gets the same reply again
+  and is otherwise dropped, so a lost ACK neither leaves the sender
+  retransmitting nor publishes the same report twice. At most 64 replies
+  are kept, oldest forgotten first, because devices on the mesh choose how
+  many confirmable messages they send. A reopened connect-only session
+  forgets the border agent's message IDs.
 - **Closing does not send `close_notify`.** Ending a session drops the DTLS
   state without telling the border agent, which then keeps its side until
   its own timeout. This predates phase 1; sending `close_notify` on close is
   a follow-up.
 - **Known limitations.**
-  - A retransmitted confirmable response is not acknowledged again once its
-    exchange has completed, and duplicate confirmable notifications are not
-    filtered, because there is no record of recently seen message IDs.
   - Message IDs count up from 1 for each driver and wrap without tracking
     RFC 7252's exchange lifetime. With one application request in flight,
     reusing an ID within its lifetime would take tens of thousands of

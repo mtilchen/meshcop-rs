@@ -87,6 +87,7 @@ two-node OpenThread IPv6 network.
     petition/keep-alive/resign lifecycle, session end), `exchange.rs`
     (identity assignment, retransmission, the in-flight limit, deadlines),
     `incoming.rs` (response matching, UDP_RX decapsulation, notifications),
+    `duplicates.rs` (replies to retransmitted confirmable messages),
     `relay.rs` (joiner DTLS sessions), and `link.rs` (the DTLS session or the
     scripted transport). `events.rs` is the `Events` stream, and `joiner.rs`
     holds the joiner session state machine plus `JoinerHandler` /

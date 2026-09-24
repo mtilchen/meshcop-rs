@@ -4,8 +4,9 @@
 //! One task owns the connection to the border agent and runs a loop over
 //! handle commands, received datagrams, and timers (retransmissions, exchange
 //! deadlines, and keep-alives). [`exchange`] tracks outstanding requests,
-//! [`incoming`] routes what arrives, [`relay`] drives joiner sessions, and
-//! [`link`] is the DTLS session (or the scripted transport in tests).
+//! [`incoming`] routes what arrives, [`duplicates`] recognizes retransmitted
+//! confirmable messages, [`relay`] drives joiner sessions, and [`link`] is
+//! the DTLS session (or the scripted transport in tests).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -26,11 +27,13 @@ use super::super::types::{
 };
 use super::{Shared, commissioner_trace, require_success_response, result_code_from_meshcop_state};
 
+mod duplicates;
 mod exchange;
 mod incoming;
 mod link;
 mod relay;
 
+use duplicates::AnsweredMessages;
 pub(super) use exchange::Outbound;
 use exchange::{Completion, Exchanges, is_transport_error};
 pub(super) use link::Link;
@@ -72,6 +75,7 @@ pub(super) struct Driver {
     status: watch::Sender<SessionStatus>,
     next_message_id: u16,
     exchanges: Exchanges,
+    answered: AnsweredMessages,
     keep_alive_at: Option<Instant>,
     joiner_handler: Option<Box<dyn JoinerHandler>>,
     joiner_sessions: HashMap<[u8; 8], JoinerSession>,
@@ -95,6 +99,7 @@ impl Driver {
             status,
             next_message_id: 0,
             exchanges: Exchanges::default(),
+            answered: AnsweredMessages::default(),
             keep_alive_at: None,
             joiner_handler: None,
             joiner_sessions: HashMap::new(),
@@ -212,6 +217,7 @@ impl Driver {
             return Ok(());
         }
         self.link.reopen().await?;
+        self.answered.forget_border_agent();
         self.set_status(SessionStatus::Connected);
         Ok(())
     }

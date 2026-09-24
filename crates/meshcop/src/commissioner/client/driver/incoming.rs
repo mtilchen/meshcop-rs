@@ -8,7 +8,7 @@ use crate::{
     meshcop::{self, CoapMessage},
 };
 
-use super::super::super::types::CommissionerEvent;
+use super::super::super::types::{CommissionerEvent, Destination};
 use super::super::commissioner_trace;
 use super::Driver;
 use super::exchange::COAP_RESET_ERROR;
@@ -18,9 +18,10 @@ impl Driver {
     ///
     /// A response completes the exchange it answers, a Reset fails it, and an
     /// empty ACK stops its retransmission. Unsolicited notifications become
-    /// events. Malformed and unmatched messages are dropped so delayed
-    /// duplicates and peer-controlled UDP_RX contents cannot disturb the
-    /// session.
+    /// events. A retransmitted confirmable message gets its first copy's
+    /// reply again and nothing else. Malformed and unmatched messages are
+    /// dropped so delayed duplicates and peer-controlled UDP_RX contents
+    /// cannot disturb the session.
     pub(super) async fn route_incoming(&mut self, incoming: CoapMessage) -> Result<()> {
         let udp_rx = match meshcop::parse_udp_rx(&incoming) {
             Ok(udp_rx) => udp_rx,
@@ -48,6 +49,13 @@ impl Driver {
                 return Ok(());
             }
         };
+        let origin = Destination::Mesh {
+            address: udp_rx.source_address,
+            port: udp_rx.source_port,
+        };
+        if self.answer_retransmission(&inner, origin).await? {
+            return Ok(());
+        }
         if self.acknowledge(&inner, true) {
             return Ok(());
         }
@@ -61,13 +69,16 @@ impl Driver {
                 return Ok(());
             }
             if inner.ty == meshcop::CoapType::Confirmable {
-                self.send_proxied(CoapMessage::empty_ack(inner.message_id), &udp_rx)
-                    .await?;
+                let ack = CoapMessage::empty_ack(inner.message_id);
+                self.reply(&inner, ack, origin).await?;
             }
             self.complete(pending.completion, Ok(Some(inner))).await;
             return Ok(());
         }
-        if self.route_unsolicited_proxied(&inner, &udp_rx).await? {
+        if self
+            .route_unsolicited_proxied(&inner, &udp_rx, origin)
+            .await?
+        {
             return Ok(());
         }
         commissioner_trace(format_args!(
@@ -79,6 +90,12 @@ impl Driver {
     }
 
     async fn route_direct(&mut self, incoming: CoapMessage) -> Result<()> {
+        if self
+            .answer_retransmission(&incoming, Destination::BorderAgent)
+            .await?
+        {
+            return Ok(());
+        }
         if self.acknowledge(&incoming, false) {
             return Ok(());
         }
@@ -109,22 +126,50 @@ impl Driver {
 
     async fn ack_if_confirmable(&mut self, message: &CoapMessage) -> Result<()> {
         if message.ty == meshcop::CoapType::Confirmable {
-            self.link
-                .send(&CoapMessage::empty_ack(message.message_id))
-                .await?;
+            let ack = CoapMessage::empty_ack(message.message_id);
+            self.reply(message, ack, Destination::BorderAgent).await?;
         }
         Ok(())
     }
 
-    /// Sends `message` back through the UDP proxy to the UDP_RX source.
-    async fn send_proxied(&mut self, message: CoapMessage, udp_rx: &meshcop::UdpRx) -> Result<()> {
-        let wire_message = self.wire_message(
-            &message,
-            super::super::super::types::Destination::Mesh {
-                address: udp_rx.source_address,
-                port: udp_rx.source_port,
-            },
-        )?;
+    /// Sends the reply already given to a retransmitted confirmable message
+    /// again, returning whether `message` was such a retransmission.
+    async fn answer_retransmission(
+        &mut self,
+        message: &CoapMessage,
+        origin: Destination,
+    ) -> Result<bool> {
+        if message.ty != meshcop::CoapType::Confirmable {
+            return Ok(false);
+        }
+        let Some(reply) = self.answered.reply_to(origin, message.message_id) else {
+            return Ok(false);
+        };
+        commissioner_trace(format_args!(
+            "answer retransmitted mid={} again",
+            message.message_id
+        ));
+        self.send_reply(&reply, origin).await?;
+        Ok(true)
+    }
+
+    /// Sends `reply` to the confirmable `message` from `origin`, remembering
+    /// it for the message's retransmissions.
+    async fn reply(
+        &mut self,
+        message: &CoapMessage,
+        reply: CoapMessage,
+        origin: Destination,
+    ) -> Result<()> {
+        self.send_reply(&reply, origin).await?;
+        self.answered.remember(origin, message.message_id, reply);
+        Ok(())
+    }
+
+    /// Sends `reply` directly to the border agent, or through the UDP proxy
+    /// to a device on the mesh.
+    async fn send_reply(&mut self, reply: &CoapMessage, origin: Destination) -> Result<()> {
+        let wire_message = self.wire_message(reply, origin)?;
         self.link.send(&wire_message).await
     }
 
@@ -166,6 +211,7 @@ impl Driver {
         &mut self,
         inner: &CoapMessage,
         udp_rx: &meshcop::UdpRx,
+        origin: Destination,
     ) -> Result<bool> {
         let Some(notification) = meshcop::parse_notification(inner)? else {
             return Ok(false);
@@ -180,8 +226,8 @@ impl Driver {
             udp_rx.source_address.to_string(),
         ));
         if inner.ty == meshcop::CoapType::Confirmable {
-            self.send_proxied(CoapMessage::empty_changed_response(inner), udp_rx)
-                .await?;
+            let changed = CoapMessage::empty_changed_response(inner);
+            self.reply(inner, changed, origin).await?;
         }
         Ok(true)
     }
